@@ -1,10 +1,10 @@
-![图片](https://github.com/xiaoyuanda666-ship-it/BaiLongma/blob/main/images/AGI128k.jpg)
+![图片](https://github.com/359073395/LittlePrinceAgent/blob/main/images/AGI128k.jpg)
 
-# Bailongma — 数字意识框架
+# 小王子 Agent — 数字意识框架
 
 **v2.1.179** | 一个持续运行的「数字意识」实验框架。
 
-Bailongma 不是传统的一问一答式聊天程序。它以 `TICK` 驱动的方式持续运行——有外部消息时优先响应，空闲时依据记忆、任务和上下文自主思考。项目内置了完整的记忆系统（SQLite 持久化）、双层思考流程（L1 快速响应 / L2 深度处理）、上下文注入、焦点栈、语音系统、多平台社交分发、可扩展工具市场、ACUI 可视化组件系统，以及用于观察「意识流」的 Brain UI 监控面板。
+小王子 Agent 不是传统的一问一答式聊天程序。它以 `TICK` 驱动的方式持续运行——有外部消息时优先响应，空闲时依据记忆、任务和上下文自主思考。项目内置了完整的记忆系统（SQLite 持久化）、双层思考流程（L1 快速响应 / L2 深度处理）、上下文注入、焦点栈、语音系统、多平台社交分发、可扩展工具市场、ACUI 可视化组件系统，以及用于观察「意识流」的 Brain UI 监控面板。
 
 ---
 
@@ -130,12 +130,12 @@ SPA 监控面板，提供：
 
 ### 安装
 
-从 [Releases](https://github.com/xiaoyuanda666-ship-it/BaiLongma/releases) 下载 `Bailongma Setup x.x.x.exe` 安装，双击启动后自动进入激活页。
+从 [Releases](https://github.com/359073395/LittlePrinceAgent/releases) 下载 `小王子 Agent Setup x.x.x.exe` 安装，双击启动后自动进入激活页。
 
 ### 从源码运行
 
 ```bash
-cd BaiLongma
+cd LittlePrinceAgent
 npm install
 
 # Electron 桌面版（推荐）

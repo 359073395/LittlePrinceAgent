@@ -28,7 +28,7 @@ function assert(cond, label) {
 }
 
 const baseSystemArgs = {
-  agentName: 'Longma',
+  agentName: '小王子',
   persona: 'Curious, brief, and a little philosophical.',
   existenceDesc: '3 hours',
   security: { execSandbox: true },
@@ -54,7 +54,7 @@ const sys2 = buildSystemPrompt({
   task: 'do thing',
 })
 assert(sys1 === sys2, 'system stays stable when only dynamic fields differ')
-assert(sys1.includes('Longma'), 'system contains agent name')
+assert(sys1.includes('小王子'), 'system contains agent name')
 assert(sys1.includes('Curious, brief'), 'system contains persona')
 assert(sys1.includes('## Top-Level Behavior Rules'), 'system contains hard floor')
 assert(!sys1.includes('round1 mem'), 'system does NOT contain dynamic memories')

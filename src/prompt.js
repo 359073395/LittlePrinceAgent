@@ -51,7 +51,7 @@ You already have a decent picture of the person. Do not dig for more.`,
 // the same shape of args and emits the <context> block.
 // =============================================================================
 export function buildSystemPrompt({
-  agentName = '小白龙',
+  agentName = '小王子',
   persona = '',
   existenceDesc = 'just awakened',
   security = null,

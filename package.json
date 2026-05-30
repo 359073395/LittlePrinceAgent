@@ -1,12 +1,12 @@
 {
-  "name": "bailongma",
-  "productName": "Bailongma",
+  "name": "littleprince-agent",
+  "productName": "小王子 Agent",
   "version": "2.1.179",
   "description": "A continuously running digital consciousness framework",
   "type": "module",
   "main": "electron/main.cjs",
   "author": {
-    "name": "xiaoyuanda666-ship-it"
+    "name": "359073395"
   },
   "scripts": {
     "start": "electron .",
@@ -36,8 +36,8 @@
     "playwright": "^1.59.1"
   },
   "build": {
-    "appId": "com.xiaoyuanda.bailongma",
-    "productName": "Bailongma",
+    "appId": "com.359073395.littleprinceagent",
+    "productName": "小王子 Agent",
     "artifactName": "${productName}-Setup-${version}.${ext}",
     "npmRebuild": false,
     "asar": true,
@@ -97,13 +97,13 @@
       "uninstallerSidebar": "build/uninstallerSidebar.bmp",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Bailongma"
+      "shortcutName": "小王子 Agent"
     },
     "publish": [
       {
         "provider": "github",
-        "owner": "xiaoyuanda666-ship-it",
-        "repo": "BaiLongma",
+        "owner": "359073395",
+        "repo": "LittlePrinceAgent",
         "releaseType": "release"
       }
     ]

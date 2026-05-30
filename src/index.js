@@ -1033,7 +1033,7 @@ async function runTurn(input, label, msg = null) {
 
     // 2. Build system prompt (stable hard-floor) + context block (per-round dynamic)
     const persona = getConfig('persona') || ''
-    const agentName = getConfig('agent_name') || '小白龙'
+    const agentName = getConfig('agent_name') || '小王子'
     const entities = getKnownEntities()
     const hasActiveTask = !!state.task
     const extraContextJoined = [presenceText, hotspotStateText, hotspotContextText, personCardStateText, personCardContextText, weatherContextText, docStateText, docContextText, prefetchText, extraContextText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n')
@@ -1589,7 +1589,7 @@ async function main() {
   }
 
   // Start HTTP API — must start regardless of activation status; the activation page depends on it
-  const apiPort = Number(process.env.BAILONGMA_PORT) || 3721
+  const apiPort = Number(process.env.LITTLE_PRINCE_AGENT_PORT) || 3721
   startAPI(apiPort, {
     getStateSnapshot: () => ({
       action: state.action,

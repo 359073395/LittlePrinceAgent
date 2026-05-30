@@ -74,7 +74,7 @@ function createServer() {
     }
 
     if (url.pathname === '/agent-profile') {
-      sendJson(res, { name: 'SmokeLongma' })
+      sendJson(res, { name: 'SmokeLittlePrince' })
       return
     }
 
@@ -134,7 +134,7 @@ function createServer() {
           card: {
             name: '马云',
             title: '人物卡片',
-            summary: '暂时没有内置资料。可以让 Longma 补充身份、代表作品和为什么被提到。',
+            summary: '暂时没有内置资料。可以让 小王子 Agent 补充身份、代表作品和为什么被提到。',
             knownFor: [],
             tags: ['待补充'],
             image: 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 640 360%22%3E%3Crect width=%22640%22 height=%22360%22 fill=%22%23112332%22/%3E%3Ccircle cx=%22320%22 cy=%22130%22 r=%2260%22 fill=%22%2382d2ff%22/%3E%3Crect x=%22205%22 y=%22210%22 width=%22230%22 height=%2280%22 rx=%2240%22 fill=%22%2382d2ff%22/%3E%3C/svg%3E',
@@ -218,7 +218,7 @@ const baseUrl = `http://127.0.0.1:${port}`
 const browser = await chromium.launch()
 const page = await browser.newPage({ viewport: { width: 1280, height: 840 } })
 await page.addInitScript(() => {
-  localStorage.setItem('bailongma-memory-graph-enabled', 'true')
+  localStorage.setItem('littleprinceagent-memory-graph-enabled', 'true')
 })
 const errors = []
 page.on('pageerror', err => errors.push(err.message))
@@ -237,7 +237,7 @@ try {
 
   await page.goto(`${baseUrl}/brain-ui`, { waitUntil: 'domcontentloaded' })
   await page.waitForSelector('#graph circle', { timeout: 5000 })
-  await page.waitForFunction(() => window.d3 && document.querySelector('#agent-brand-name')?.textContent.includes('SmokeLongma'))
+  await page.waitForFunction(() => window.d3 && document.querySelector('#agent-brand-name')?.textContent.includes('SmokeLittlePrince'))
   await page.fill('#msg-input', '马云是谁')
   await page.click('#send-btn')
   await page.waitForTimeout(300)
