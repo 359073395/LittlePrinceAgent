@@ -60,28 +60,20 @@ try {
   console.warn('[startup] 安装目录数据迁移检查失败:', err?.message || err)
 }
 
-// Cloud/VPS mode: skip desktop and local resource scanning (no desktop environment)
-const SKIP_DESKTOP_SCAN = !!process.env.LITTLE_PRINCE_AGENT_SKIP_DESKTOP_SCAN
-const SKIP_SOFTWARE_SCAN = !!process.env.LITTLE_PRINCE_AGENT_SKIP_SOFTWARE_SCAN
-const SKIP_LOCAL_RESOURCES_SCAN = !!process.env.LITTLE_PRINCE_AGENT_SKIP_LOCAL_RESOURCES_SCAN
-if (SKIP_DESKTOP_SCAN) console.log('[system] Cloud mode — skipping desktop scan')
-if (SKIP_SOFTWARE_SCAN) console.log('[system] Cloud mode — skipping installed software scan')
-if (SKIP_LOCAL_RESOURCES_SCAN) console.log('[system] Cloud mode — skipping local resources scan')
-
 // Collect host system environment info (full scan + persist on first run, then refresh dynamic fields).
 // Must complete before the main loop starts so buildSystemPrompt can inject the env block.
 await collectSystemInfo()
 
 // Scan the user's desktop (shortcuts cached by mtime, regular files scanned every time)
-if (!SKIP_DESKTOP_SCAN) collectDesktopInfo(getDesktopPath())
+collectDesktopInfo(getDesktopPath())
 
 // Scan installed software once so software/app/proxy questions can use local evidence.
-if (!SKIP_SOFTWARE_SCAN) collectInstalledSoftware()
+collectInstalledSoftware()
 
 // Scan the user's local resources (ssh hosts, keys, known_hosts, git identity)
 // for the "Self-Sufficient Execution" prompt — so the agent already knows what
 // the user has before being asked "上服务器看看".
-if (!SKIP_LOCAL_RESOURCES_SCAN) collectLocalResources()
+collectLocalResources()
 
 // Collect geo-location + live weather (refresh on IP change or after 7 days; weather refreshed every time)
 const geoResult = await collectGeoWeather()

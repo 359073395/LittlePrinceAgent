@@ -72,8 +72,7 @@ function isLoopbackAddress(address = '') {
 }
 
 function isLoopbackRequest(req) {
-  const addr = getClientAddress(req)
-  return isLoopbackAddress(addr)
+  return isLoopbackAddress(req.socket?.remoteAddress)
 }
 
 function isPrivateLanAddress(address = '') {
@@ -96,7 +95,7 @@ function isPrivateLanAddress(address = '') {
 }
 
 function isLanRequest(req) {
-  return isLanAccessEnabled() && isPrivateLanAddress(getClientAddress(req))
+  return isLanAccessEnabled() && isPrivateLanAddress(req.socket?.remoteAddress)
 }
 
 function isLoopbackOrigin(origin = '') {
@@ -114,12 +113,6 @@ function isAllowedOrigin(origin = '') {
   if (!isLanAccessEnabled()) return false
   try {
     const parsed = new URL(origin)
-    // Also allow origins listed in ALLOWED_ORIGINS env var (for cloud reverse proxy setups)
-    const allowedOrigins = process.env.LITTLE_PRINCE_AGENT_ALLOWED_ORIGINS
-    if (allowedOrigins) {
-      const origins = String(allowedOrigins).split(',').map(s => s.trim()).filter(Boolean)
-      if (origins.includes(parsed.origin) || origins.includes(parsed.hostname)) return true
-    }
     return isPrivateLanAddress(parsed.hostname)
   } catch {
     return false
@@ -128,18 +121,6 @@ function isAllowedOrigin(origin = '') {
 
 function getAuthToken() {
   return String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_API_TOKEN || '').trim()
-}
-
-// Get client IP address, respecting X-Forwarded-For when behind a reverse proxy
-function getClientAddress(req) {
-  if (process.env.LITTLE_PRINCE_AGENT_TRUST_PROXY) {
-    const forwarded = req.headers['x-forwarded-for']
-    if (forwarded) {
-      const ips = String(forwarded).split(',').map(s => s.trim()).filter(Boolean)
-      if (ips.length > 0) return ips[0]
-    }
-  }
-  return req.socket?.remoteAddress
 }
 
 function hasValidAuthToken(req, url) {
