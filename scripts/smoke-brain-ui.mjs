@@ -74,7 +74,7 @@ function createServer() {
     }
 
     if (url.pathname === '/agent-profile') {
-      sendJson(res, { name: 'SmokeLittlePrince' })
+      sendJson(res, { name: 'SmokePrince' })
       return
     }
 
@@ -237,7 +237,7 @@ try {
 
   await page.goto(`${baseUrl}/brain-ui`, { waitUntil: 'domcontentloaded' })
   await page.waitForSelector('#graph circle', { timeout: 5000 })
-  await page.waitForFunction(() => window.d3 && document.querySelector('#agent-brand-name')?.textContent.includes('SmokeLittlePrince'))
+  await page.waitForFunction(() => window.d3 && document.querySelector('#agent-brand-name')?.textContent.includes('SmokePrince'))
   await page.fill('#msg-input', '马云是谁')
   await page.click('#send-btn')
   await page.waitForTimeout(300)

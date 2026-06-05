@@ -1,5 +1,6 @@
 import fs from 'fs'
 import { paths } from './paths.js'
+import { nowTimestamp } from './time.js'
 
 export const DEEPSEEK_PROVIDER = 'deepseek'
 export const MINIMAX_PROVIDER = 'minimax'
@@ -7,13 +8,15 @@ export const OPENAI_PROVIDER = 'openai'
 export const QWEN_PROVIDER = 'qwen'
 export const MOONSHOT_PROVIDER = 'moonshot'
 export const ZHIPU_PROVIDER = 'zhipu'
+export const MIMO_PROVIDER = 'mimo'
 
-export const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-flash'
+export const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-pro'
 export const DEFAULT_MINIMAX_MODEL = 'MiniMax-M2.7'
 export const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini'
 export const DEFAULT_QWEN_MODEL = 'qwen-turbo'
 export const DEFAULT_MOONSHOT_MODEL = 'moonshot-v1-8k'
 export const DEFAULT_ZHIPU_MODEL = 'glm-4-flash'
+export const DEFAULT_MIMO_MODEL = 'mimo-v2.5'
 
 export const DEEPSEEK_MODELS = [
   {
@@ -103,6 +106,29 @@ export const ZHIPU_MODELS = [
   },
 ]
 
+export const MIMO_MODELS = [
+  {
+    id: 'mimo-v2.5',
+    label: 'MiMo-V2.5',
+    deprecated: false,
+  },
+  {
+    id: 'mimo-v2.5-pro',
+    label: 'MiMo-V2.5-Pro',
+    deprecated: false,
+  },
+  {
+    id: 'mimo-v2-pro',
+    label: 'MiMo-V2-Pro',
+    deprecated: false,
+  },
+  {
+    id: 'mimo-v2-flash',
+    label: 'MiMo-V2-Flash',
+    deprecated: false,
+  },
+]
+
 const PROVIDER_CONFIG = {
   [DEEPSEEK_PROVIDER]: {
     label: 'DeepSeek',
@@ -145,6 +171,13 @@ const PROVIDER_CONFIG = {
     envVar: 'ZHIPU_API_KEY',
     models: ZHIPU_MODELS,
     defaultModel: DEFAULT_ZHIPU_MODEL,
+  },
+  [MIMO_PROVIDER]: {
+    label: '小米 MiMo',
+    baseURL: 'https://api.xiaomimimo.com/v1',
+    envVar: 'MIMO_API_KEY',
+    models: MIMO_MODELS,
+    defaultModel: DEFAULT_MIMO_MODEL,
   },
 }
 
@@ -258,6 +291,13 @@ function writeStoredConfig(obj) {
   fs.renameSync(tmp, paths.configFile)
 }
 
+// 读出 config.json 现有内容（失败返回空对象）。
+// activate() 等写操作必须基于它合并，否则会抹掉 voice/tts/security 等其它字段。
+function readExistingStoredConfig() {
+  try { return JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) || {} }
+  catch { return {} }
+}
+
 function shouldAllowEnvFallback() {
   return !process.versions?.electron
 }
@@ -322,6 +362,7 @@ export const config = {
     fileSandbox: true,
     execSandbox: true,
     blockedTools: [],
+    updatedAt: null,
   },
 }
 
@@ -335,6 +376,7 @@ if (stored) {
     if (typeof stored.security.fileSandbox === 'boolean') config.security.fileSandbox = stored.security.fileSandbox
     if (typeof stored.security.execSandbox === 'boolean') config.security.execSandbox = stored.security.execSandbox
     if (Array.isArray(stored.security.blockedTools)) config.security.blockedTools = stored.security.blockedTools
+    if (typeof stored.security.updatedAt === 'string') config.security.updatedAt = stored.security.updatedAt
   }
 } else if (shouldAllowEnvFallback()) {
   const fromEnv = loadFromEnv()
@@ -385,6 +427,7 @@ export async function activate({ provider = AUTO_PROVIDER, apiKey, model, baseUR
 
     applyConfig('custom', normalizedKey, normalizedModel, normalizedBaseURL)
     writeStoredConfig({
+      ...readExistingStoredConfig(),   // 保留 voice/tts/security 等其它字段
       provider: 'custom',
       apiKey: normalizedKey,
       model: normalizedModel,
@@ -414,9 +457,11 @@ export async function activate({ provider = AUTO_PROVIDER, apiKey, model, baseUR
     const detected = await detectProvider(OpenAI, normalizedKey, model)
     applyConfig(detected.provider, normalizedKey, detected.model)
     writeStoredConfig({
+      ...readExistingStoredConfig(),   // 保留其它字段
       provider: detected.provider,
       apiKey: normalizedKey,
       model: detected.model,
+      baseURL: undefined,              // 非 custom：清掉可能残留的旧 baseURL
       activatedAt: new Date().toISOString(),
     })
     return {
@@ -444,9 +489,11 @@ export async function activate({ provider = AUTO_PROVIDER, apiKey, model, baseUR
 
   applyConfig(p, normalizedKey, normalizedModel)
   writeStoredConfig({
+    ...readExistingStoredConfig(),   // 保留 voice/tts/security 等其它字段
     provider: p,
     apiKey: normalizedKey,
     model: normalizedModel,
+    baseURL: undefined,              // 非 custom：清掉可能残留的旧 baseURL
     activatedAt: new Date().toISOString(),
   })
 
@@ -530,15 +577,21 @@ export function getSecurity() {
     fileSandbox: config.security.fileSandbox,
     execSandbox: config.security.execSandbox,
     blockedTools: [...config.security.blockedTools],
+    updatedAt: config.security.updatedAt || null,
   }
 }
 
 export function setSecurity(updates) {
+  const before = getSecurity()
   if (typeof updates.fileSandbox === 'boolean') config.security.fileSandbox = updates.fileSandbox
   if (typeof updates.execSandbox === 'boolean') config.security.execSandbox = updates.execSandbox
   if (Array.isArray(updates.blockedTools)) {
     config.security.blockedTools = updates.blockedTools.filter(t => typeof t === 'string')
   }
+  const changed = before.fileSandbox !== config.security.fileSandbox
+    || before.execSandbox !== config.security.execSandbox
+    || JSON.stringify(before.blockedTools) !== JSON.stringify(config.security.blockedTools)
+  if (changed) config.security.updatedAt = nowTimestamp()
   try {
     const existing = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))
     writeStoredConfig({ ...existing, security: { ...config.security } })
@@ -564,6 +617,75 @@ export function setMinimaxKey(key) {
     const { minimax_api_key: _removed, ...rest } = existing
     writeStoredConfig(rest)
   }
+}
+
+// ── Seedance AI 视频生成（火山方舟 Ark）配置 ──
+// 存于 config.json 的 seedance 字段：{ apiKey, model, baseURL }
+// 中国区默认走 ark.cn-beijing.volces.com；model 是 doubao-* 形态的模型 ID 或推理接入点 ep-xxx，
+// 因不同账号开通的版本号不同，做成可配置，给一个合理默认值，错了由调用错误回传引导用户改。
+const SEEDANCE_DEFAULT_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
+const SEEDANCE_DEFAULT_MODEL = 'doubao-seedance-2-0-260128'
+
+// seedance.json 读写（独立文件，只放 seedance 配置，谁都不会全量覆盖它）
+function readSeedanceFile() {
+  try { return JSON.parse(fs.readFileSync(paths.seedanceConfigFile, 'utf-8')) || {} }
+  catch { return {} }
+}
+function writeSeedanceFile(obj) {
+  const tmp = paths.seedanceConfigFile + '.tmp'
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf-8')
+  fs.renameSync(tmp, paths.seedanceConfigFile)
+}
+
+// 一次性迁移：旧版把 seedance 存在 config.json 里。若独立文件尚无、而 config.json 里还有，
+// 就搬过去并从 config.json 删除该字段，之后只认独立文件。
+function migrateLegacySeedance() {
+  if (fs.existsSync(paths.seedanceConfigFile)) return
+  let mainCfg
+  try { mainCfg = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8')) } catch { return }
+  const legacy = mainCfg?.seedance
+  if (!legacy || typeof legacy !== 'object') return
+  try {
+    writeSeedanceFile(legacy)
+    const { seedance: _removed, ...rest } = mainCfg
+    writeStoredConfig(rest)
+    console.log('[config] 已把旧的 seedance 配置从 config.json 迁移到 seedance.json')
+  } catch (e) {
+    console.warn('[config] seedance 迁移失败:', e.message)
+  }
+}
+
+export function getSeedanceConfig() {
+  // 环境变量优先（ARK_API_KEY），方便开发/部署注入
+  const envKey = String(process.env.ARK_API_KEY || process.env.SEEDANCE_API_KEY || '').trim()
+  migrateLegacySeedance()
+  const stored = readSeedanceFile()
+  const apiKey = envKey || String(stored.apiKey || '').trim()
+  return {
+    apiKey,
+    model: String(stored.model || '').trim() || SEEDANCE_DEFAULT_MODEL,
+    baseURL: String(stored.baseURL || '').trim() || SEEDANCE_DEFAULT_BASE_URL,
+    configured: Boolean(apiKey),
+  }
+}
+
+export function isSeedanceConfigured() {
+  return getSeedanceConfig().configured
+}
+
+export function setSeedanceConfig({ apiKey, model, baseURL } = {}) {
+  migrateLegacySeedance()
+  const next = { ...readSeedanceFile() }
+  if (apiKey !== undefined) next.apiKey = String(apiKey || '').trim()
+  if (model !== undefined) next.model = String(model || '').trim()
+  if (baseURL !== undefined) next.baseURL = String(baseURL || '').trim()
+  // 没有 key 时删掉独立文件，保持干净
+  if (!next.apiKey) {
+    try { fs.rmSync(paths.seedanceConfigFile, { force: true }) } catch {}
+    return getSeedanceConfig()
+  }
+  writeSeedanceFile(next)
+  return getSeedanceConfig()
 }
 
 // ── Social media platform config ──
@@ -628,17 +750,33 @@ export function setSocialConfig(updates) {
   writeStoredConfig({ ...existing, social: next })
 }
 
-const VOICE_CONFIG_KEYS = ['aliyunApiKey', 'tencentSecretId', 'tencentSecretKey', 'tencentAppId', 'xunfeiAppId', 'xunfeiApiKey', 'xunfeiApiSecret']
+const VOICE_CONFIG_KEYS = [
+  'voiceProvider',
+  'aliyunApiKey',
+  'tencentSecretId', 'tencentSecretKey', 'tencentAppId',
+  'xunfeiAppId', 'xunfeiApiKey', 'xunfeiApiSecret',
+  'volcAsrApiKey', 'volcAsrAppKey', 'volcAsrAccessKey', 'volcAsrResourceId',
+]
 
 function isValidAliyunAsrKey(value) {
   return /^sk-[A-Za-z0-9_\-.]{20,}$/.test(String(value || '').trim())
 }
 
+const CHAT_PROVIDERS_WITH_AMBIGUOUS_SK_KEYS = new Set([
+  DEEPSEEK_PROVIDER,
+  MINIMAX_PROVIDER,
+  OPENAI_PROVIDER,
+  MOONSHOT_PROVIDER,
+  ZHIPU_PROVIDER,
+  MIMO_PROVIDER,
+])
+
 export function getVoiceConfig() {
   let stored = {}
   try { stored = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))?.voice || {} } catch {}
-  const result = {}
+  const result = { voiceProvider: stored.voiceProvider || 'aliyun' }
   for (const key of VOICE_CONFIG_KEYS) {
+    if (key === 'voiceProvider') continue
     result[key] = { configured: !!(stored[key]) }
     if (key === 'aliyunApiKey' && stored[key]) {
       result[key] = {
@@ -662,6 +800,16 @@ export function setVoiceConfig(updates) {
       console.warn('[voice-config] Ignoring invalid Aliyun ASR key format; expected DashScope sk-* API key')
       continue
     }
+    if (
+      key === 'aliyunApiKey' &&
+      trimmed &&
+      existing.apiKey &&
+      trimmed === existing.apiKey &&
+      CHAT_PROVIDERS_WITH_AMBIGUOUS_SK_KEYS.has(existing.provider)
+    ) {
+      console.warn('[voice-config] Ignoring Aliyun ASR key because it matches the active chat provider API key')
+      continue
+    }
     if (trimmed) next[key] = trimmed
     else delete next[key]
   }
@@ -672,7 +820,7 @@ export function setVoiceConfig(updates) {
 const TTS_CONFIG_KEYS = [
   'ttsProvider', 'ttsVoiceId',
   'minimaxKey',
-  'doubaoKey', 'doubaoAppId', 'doubaoAccessKey', 'doubaoResourceId',
+  'doubaoKey', 'doubaoAppId', 'doubaoAccessKey', 'doubaoResourceId', 'doubaoStyle', 'doubaoSpeechRate',
   'openaiTtsKey', 'openaiTtsBaseURL',
   'elevenLabsKey',
   'volcanoAppId', 'volcanoToken',
@@ -689,6 +837,8 @@ export function getTTSConfig() {
     doubaoAppId:     { configured: !!(stored.doubaoAppId), value: stored.doubaoAppId || '' },
     doubaoAccessKey: { configured: !!(stored.doubaoAccessKey) },
     doubaoResourceId: stored.doubaoResourceId || '',
+    doubaoStyle:     stored.doubaoStyle || '',
+    doubaoSpeechRate: Number(stored.doubaoSpeechRate || 0) || 0,
     openaiTtsBaseURL: stored.openaiTtsBaseURL || '',
     openaiTtsKey:    { configured: !!(stored.openaiTtsKey) },
     elevenLabsKey:   { configured: !!(stored.elevenLabsKey) },
@@ -708,6 +858,8 @@ export function getTTSCredentials() {
     doubaoAppId:    stored.doubaoAppId  || process.env.DOUBAO_TTS_APP_ID || '',
     doubaoAccessKey: stored.doubaoAccessKey || process.env.DOUBAO_TTS_ACCESS_KEY || '',
     doubaoResourceId: stored.doubaoResourceId || process.env.DOUBAO_TTS_RESOURCE_ID || '',
+    doubaoStyle:    stored.doubaoStyle || process.env.DOUBAO_TTS_STYLE || '',
+    doubaoSpeechRate: Number(stored.doubaoSpeechRate ?? process.env.DOUBAO_TTS_SPEECH_RATE ?? 0) || 0,
     minimaxKey:     process.env.MINIMAX_API_KEY || stored.minimaxKey || getMinimaxKey() || (config.provider === 'minimax' ? config.apiKey : '') || '',
     openaiKey:      stored.openaiTtsKey  || '',
     openaiBaseURL:  stored.openaiTtsBaseURL || '',
@@ -838,6 +990,8 @@ const WEB_SEARCH_KEY_MAP = {
   serperKey:  'serper_api_key',
   searxngUrl: 'searxng_url',
   jinaKey:    'jina_api_key',
+  braveKey:   'brave_api_key',
+  tavilyKey:  'tavily_api_key',
 }
 
 function readWebSearchBlock() {
@@ -847,9 +1001,11 @@ function readWebSearchBlock() {
       serperKey:  typeof raw.serper_api_key === 'string' ? raw.serper_api_key : '',
       searxngUrl: typeof raw.searxng_url    === 'string' ? raw.searxng_url    : '',
       jinaKey:    typeof raw.jina_api_key   === 'string' ? raw.jina_api_key   : '',
+      braveKey:   typeof raw.brave_api_key  === 'string' ? raw.brave_api_key  : '',
+      tavilyKey:  typeof raw.tavily_api_key === 'string' ? raw.tavily_api_key : '',
     }
   } catch {
-    return { serperKey: '', searxngUrl: '', jinaKey: '' }
+    return { serperKey: '', searxngUrl: '', jinaKey: '', braveKey: '', tavilyKey: '' }
   }
 }
 
@@ -861,15 +1017,21 @@ export function getWebSearchConfig() {
   const envSerper  = process.env.SERPER_API_KEY || ''
   const envJina    = process.env.JINA_API_KEY   || ''
   const envSearxng = process.env.SEARXNG_URL    || ''
+  const envBrave   = process.env.BRAVE_API_KEY  || ''
+  const envTavily  = process.env.TAVILY_API_KEY || ''
   return {
     serperConfigured: !!(stored.serperKey  || envSerper),
     jinaConfigured:   !!(stored.jinaKey    || envJina),
+    braveConfigured:  !!(stored.braveKey   || envBrave),
+    tavilyConfigured: !!(stored.tavilyKey  || envTavily),
     // 输入框只回显 stored 值，避免用户以为能编辑 env 值
     searxngUrl:       stored.searxngUrl,
     // effective URL（含 env 兜底），UI 可显示在状态行
     effectiveSearxngUrl: stored.searxngUrl || envSearxng,
     serperFromEnv:    !stored.serperKey  && !!envSerper,
     jinaFromEnv:      !stored.jinaKey    && !!envJina,
+    braveFromEnv:     !stored.braveKey   && !!envBrave,
+    tavilyFromEnv:    !stored.tavilyKey  && !!envTavily,
     searxngFromEnv:   !stored.searxngUrl && !!envSearxng,
   }
 }
@@ -881,6 +1043,8 @@ export function getWebSearchCredentials() {
     serperKey:  stored.serperKey  || process.env.SERPER_API_KEY || '',
     searxngUrl: stored.searxngUrl || process.env.SEARXNG_URL    || '',
     jinaKey:    stored.jinaKey    || process.env.JINA_API_KEY   || '',
+    braveKey:   stored.braveKey   || process.env.BRAVE_API_KEY  || '',
+    tavilyKey:  stored.tavilyKey  || process.env.TAVILY_API_KEY || '',
   }
 }
 
@@ -908,6 +1072,7 @@ export const __internals = {
   QWEN_MODELS,
   MOONSHOT_MODELS,
   ZHIPU_MODELS,
+  MIMO_MODELS,
   normalizeModel,
   isThinkingEnabledForModel,
   buildPingParams,

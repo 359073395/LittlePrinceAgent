@@ -37,7 +37,7 @@ function detectDocTopic(text) {
   const t = text.toLowerCase()
 
   // 模型 / LLM 配置
-  if (/(模型|model|llm|provider|api.?key|密钥|激活|切换模型|配置.*(deepseek|minimax|qwen|openai|moonshot|zhipu|claude|gemini)|deepseek|minimax.*配置|qwen.*配置|自定义.*端点|base.?url)/.test(t)) {
+  if (/(模型|model|llm|provider|api.?key|密钥|激活|切换模型|配置.*(deepseek|minimax|qwen|openai|moonshot|zhipu|claude|gemini|mimo|小米)|deepseek|minimax.*配置|qwen.*配置|mimo.*配置|小米.*配置|自定义.*端点|base.?url)/.test(t)) {
     return 'model_config'
   }
 
@@ -105,7 +105,7 @@ export function buildDocPanelStateContext(detectedTopic = null) {
     `open_doc_panel tool rules. Follow strictly:`,
     `- Do not proactively ask the user for API keys. If the user provides a key, help configure it directly and mention that they can test it.`,
     `- Highest priority: when the user explicitly asks to open or view docs, immediately call open_doc_panel(action: "open", topic: "${state.topicId || 'voice_config'}"). No extra condition is required and you must not refuse.`,
-    `- When the user needs voice, model, WeChat, or social-platform configuration help, choose the matching topic and open the panel: voice_asr, voice_tts, voice_config, model_config, or wechat_config. When the user asks about how 小王子 Agent works, its code architecture, or its internal mechanisms, open self_architecture.`,
+    `- When the user needs voice, model, WeChat, or social-platform configuration help, choose the matching topic and open the panel: voice_asr, voice_tts, voice_config, model_config, or wechat_config. When the user asks about how Bai小王子 Agent works, its code architecture, or its internal mechanisms, open self_architecture.`,
     `- If the document panel is open but the current turn is unrelated to any configuration topic, immediately call open_doc_panel(topic: "${state.topicId || 'voice_config'}", action: "close") to close it.`,
   ]
 

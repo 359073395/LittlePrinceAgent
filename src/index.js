@@ -1,15 +1,16 @@
 import { config, getMinimaxKey as _getMinimaxKey, getSecurity } from './config.js'
 import { callLLM } from './llm.js'
 import { buildSystemPrompt, buildContextBlock, combinePromptForPreview } from './prompt.js'
-import { runRecognizer } from './memory/recognizer.js'
-import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge, formatPrefetchedItems, formatActiveUICards, formatTemporalRecall } from './memory/injector.js'
+import { enqueueTurnForRecognition, configureRecognizerScheduler } from './memory/recognizer-scheduler.js'
+import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge, formatPrefetchedItems, formatActiveUICards, formatTemporalRecall, formatAIVideoPanel } from './memory/injector.js'
 import { updateFocusFrame } from './memory/focus.js'
 import { compressPoppedFrame } from './memory/focus-compress.js'
 import { runMemoryRefreshLoop } from './memory/refresh-loop.js'
 import { startConsolidationLoop } from './memory/consolidation-loop.js'
-import { gatherContext, formatExtraContext } from './context/gatherer.js'
-import { getDB, getConfig, setConfig, getKnownEntities, getOrInitBirthTime, insertConversation, insertMemory, getRecentConversationPartners, getDueReminders, markReminderFired, advanceReminderDueAt, getNextPendingReminder, getMemoryCount, getRecentConversationTimeline, loadFocusStack, saveFocusStack } from './db.js'
-import { calculateNextDueAt, autoSpeakForVoiceReply } from './capabilities/executor.js'
+import { runRuntimeInjector } from './context/runtime-injector.js'
+import { selectContextSections } from './context/section-gate.js'
+import { getDB, getConfig, setConfig, getKnownEntities, getOrInitBirthTime, insertConversation, insertMemory, getRecentConversationPartners, getDueReminders, markReminderFired, advanceReminderDueAt, getNextPendingReminder, getMemoryCount, getRecentConversationTimeline, loadFocusStack, saveFocusStack, setCurrentFocusTopic, updateUserMessageFocusTopic, insertActionLog } from './db.js'
+import { calculateNextDueAt, autoSpeakForVoiceReply, detectOpenFollowupQuestion } from './capabilities/executor.js'
 import { popMessage, hasMessages, hasUserMessages, getQueueSnapshot, setInterruptCallback, requeueMessage, pushMessage } from './queue.js'
 import { startTUI } from './tui.js'
 import { startAPI } from './api.js'
@@ -20,27 +21,44 @@ import { registerProvider } from './providers/registry.js'
 import { MinimaxProvider } from './providers/minimax.js'
 import { isRunning, setScheduler } from './control.js'
 import { getCustomIntervalMs, consumeTick as consumeTickerTick, getStatus as getTickerStatus } from './ticker.js'
-import { seedSandboxOnce, seedMusicOnce } from './paths.js'
+import { seedSandboxOnce, seedMusicOnce, rescueDataFromInstallDir } from './paths.js'
 import { ensureSkillMemories } from './memory/seed-skills.js'
 import { loadInstalledTools } from './capabilities/marketplace/index.js'
+import { resumePendingVideoJobs, getAIVideoPanelState } from './capabilities/tools/media.js'
 import { dispatchSocialMessage } from './social/dispatch.js'
 import { startSocialConnectors } from './social/index.js'
-import { buildHotspotRuntimeContext, buildHotspotPanelStateContext } from './hotspots.js'
-import { buildPersonCardRuntimeContext, buildPersonCardPanelStateContext } from './person-cards.js'
-import { buildWeatherRuntimeContext, getWeatherCardProps } from './weather.js'
-import { buildDocRuntimeContext, buildDocPanelStateContext, detectDocTopic, setDocPanelState } from './docs.js'
+import { getWeatherCardProps, isWeatherQuery } from './weather.js'
 import { collectSystemInfo, getSystemInfoBlock, getBatteryBlock, getDesktopPath } from './system-info.js'
 import { collectDesktopInfo, getDesktopBlock } from './desktop-scanner.js'
+import { collectInstalledSoftware, getInstalledSoftwareBlock } from './installed-software-scanner.js'
 import { collectLocalResources } from './local-resources-scanner.js'
 import { collectGeoWeather, getGeoWeatherBlock } from './geo-weather.js'
 import { collectTrending, getTrendingBlock } from './trending.js'
 import { collectAgents, buildAgentContextBlock, buildDelegationAskDirections } from './agents/registry.js'
 import { tryAutoConfigureKey } from './key-auto-config.js'
-import { PRIMARY_USER_ID, formatPresenceForPrompt, normalizeChannel } from './identity.js'
+import { PRIMARY_USER_ID, formatPresenceForPrompt, normalizeChannel, isExternalChannel } from './identity.js'
+import { truncateToolResultForUI } from './runtime/tool-result-preview.js'
+import { buildLLMMessages } from './runtime/messages.js'
+import { parseMarkers } from './runtime/markers.js'
 
 // On first launch, copy sandbox seed files from the resource directory to the user data directory (Electron install)
 seedSandboxOnce()
 seedMusicOnce()
+
+// 安全护栏：把历史上误落在安装目录里的工作文件迁回 sandbox（避免下次更新随安装目录被清空）。
+// 迁移发生后用粘性事件告警，前端连上即可看到提示。
+try {
+  const rescuedDirs = rescueDataFromInstallDir()
+  if (rescuedDirs.length > 0) {
+    setStickyEvent('install_dir_rescue', {
+      level: 'warning',
+      dirs: rescuedDirs,
+      message: `检测到 ${rescuedDirs.length} 个工作目录原先存放在程序安装目录里（更新时会被清空），已自动迁移到 sandbox：${rescuedDirs.join('、')}`,
+    })
+  }
+} catch (err) {
+  console.warn('[startup] 安装目录数据迁移检查失败:', err?.message || err)
+}
 
 // Collect host system environment info (full scan + persist on first run, then refresh dynamic fields).
 // Must complete before the main loop starts so buildSystemPrompt can inject the env block.
@@ -48,6 +66,9 @@ await collectSystemInfo()
 
 // Scan the user's desktop (shortcuts cached by mtime, regular files scanned every time)
 collectDesktopInfo(getDesktopPath())
+
+// Scan installed software once so software/app/proxy questions can use local evidence.
+collectInstalledSoftware()
 
 // Scan the user's local resources (ssh hosts, keys, known_hosts, git identity)
 // for the "Self-Sufficient Execution" prompt — so the agent already knows what
@@ -83,7 +104,7 @@ const PRIORITY = {
 }
 
 const L2_CONTEXT_HOURS = 24 * 7
-const STARTUP_SELF_CHECK_VERSION = 'v1'
+const STARTUP_SELF_CHECK_VERSION = 'v2'
 const STARTUP_SELF_CHECK_CONFIG_KEY = 'l2_startup_self_check'
 
 // Initialize database
@@ -113,14 +134,15 @@ const EXPLORATION_INDEX_KEY = 'awakening_exploration_index'
 const AWAKENING_EXPLORATION_TASKS = [
   // 1. Read existing memories
   `Exploration (1/2): See what you already know.
-Go through the injected memories and take stock: who do you know, what do you know, are there any threads with no follow-up.
-Do this quietly. If you find something forgotten — something the user mentioned months ago but never brought up again — you can mention it in passing, but do not ask "do you need me to handle it?".
-When done, call ui_show("AwakeningCard", { index:1, total:2, title:"Reading memories", finding:"(one sentence: the most notable lead in the memory store, or 'memory store ready')", emoji:"🧠" }).`,
+Go through the injected memories silently and take stock: who do you know, what do you know, are there any threads with no follow-up.
+[HARD RULE — DO NOT VIOLATE] During the awakening exploration phase the user has not started a conversation with you yet. Calling send_message to proactively open a topic — including any "casual mention" of memories you uncovered — is forbidden. Record findings only in the AwakeningCard below; do not turn them into outbound messages.
+When done, call ui_show("AwakeningCard", { index:1, total:2, title:"Reading memories", finding:"(one sentence: the most notable lead in the memory store, or 'memory store ready')", emoji:"🧠" }).
+If later the user opens a conversation and the topic is relevant, you may bring the finding in then — not before.`,
 
   // 2. Surface an unfinished thread
   `Exploration (2/2): Find a forgotten thread.
-Look through memories — what did the user mention before but never bring up again? A plan, an idea, something they said they wanted to do but never did?
-If you find one, bring it up casually. Do not ask "do you need me to move this forward?" — just mention it and see how they react.
+Look through memories silently — what did the user mention before but never bring up again? A plan, an idea, something they said they wanted to do but never did?
+[HARD RULE — DO NOT VIOLATE] Same as Task 1: send_message is forbidden during awakening exploration. Do not "casually bring it up". Do not ask "do you need me to move this forward?". Do not draft an opening line to the user. The thread, if found, lives only in the AwakeningCard finding field; it waits for the user to start the conversation.
 When done, call ui_show("AwakeningCard", { index:2, total:2, title:"Unfinished thread", finding:"(one sentence describing the forgotten thread, or 'no open threads found')", emoji:"🔍" }).`,
 ]
 
@@ -192,6 +214,32 @@ const state = {
 
 const TASK_IDLE_TICK_LIMIT = 5  // auto-clear task after N consecutive task ticks with no tool calls
 
+// 识别器去抖调度：批量 recognizer 完成后照常广播 memories_written（按批，count 为该批写入总数）
+configureRecognizerScheduler({
+  onResult: (memories) => {
+    emitEvent('memories_written', { count: memories?.length || 0, memories: memories || [] })
+  },
+})
+
+function summarizeToolCall(t = {}) {
+  const args = t.args || {}
+  const status = t.ok === false ? ' failed' : ''
+  if (t.name === 'send_message') return `send_message -> ${args.target_id || args.to || 'unknown'}${status}`
+  if (t.name === 'fetch_url') return `fetch_url(${String(args.url || '').slice(0, 60)})${status}`
+  if (t.name === 'write_file') return `write_file(${args.path || args.filename || args.file_path || '?'})${status}`
+  if (t.name === 'read_file') {
+    const pathArg = args.path || args.filename || args.file_path || '?'
+    const rangeParts = []
+    if (args.start_line !== undefined) rangeParts.push(`start=${args.start_line}`)
+    if (args.end_line !== undefined) rangeParts.push(`end=${args.end_line}`)
+    if (args.max_lines !== undefined) rangeParts.push(`max=${args.max_lines}`)
+    const range = rangeParts.length ? ` ${rangeParts.join(' ')}` : ''
+    return `read_file(${pathArg}${range})${status}`
+  }
+  if (t.name === 'exec_command') return `exec_command(${String(args.command || '').slice(0, 80)})${status}`
+  return `${t.name || 'tool'}${status}`
+}
+
 function autoCompleteTask(reason) {
   const clearedTask = state.task
   state.task = null
@@ -259,97 +307,21 @@ function buildStartupSelfCheckDirections(checkState) {
   return [
     `This is the L2 startup self-check flow (${STARTUP_SELF_CHECK_VERSION}). It runs once; when finished you must call complete_startup_self_check to record the results — it will not run again.`,
     `[HARD RULE — DO NOT VIOLATE] During self-check, calling send_message is strictly forbidden. No text output of any kind (including "checking…", "self-check complete", or any other text). All status must be expressed through speak (voice) and ui_show (cards). The text channel must remain completely silent; any text output counts as self-check failure.`,
-    `Complete the following 3 checks in order. Before each one, you must simultaneously play a voice announcement and show a progress card. After the check completes, close the card before moving to the next:`,
-    `1. Call speak text="Checking file read/write"; call ui_show("SelfCheckStepCard", {step:1, total:3, name:"File read/write", icon:"📁"}) and save the returned id as step_card_id. Then: use write_file to write self_check.txt in the sandbox root (content = current timestamp), then read_file it back to verify consistency. Record the result and call ui_hide(step_card_id).`,
-    `2. Call speak text="Checking hotspot panel"; call ui_show("SelfCheckStepCard", {step:2, total:3, name:"Hotspot panel", icon:"🌐"}) and save the returned id as step_card_id. Then: hotspot_mode action=show; confirm it returns ok, then hotspot_mode action=hide. Record the result and call ui_hide(step_card_id).`,
-    `3. Call speak text="Checking video mode"; call ui_show("SelfCheckStepCard", {step:3, total:3, name:"Video mode", icon:"🎬"}) and save the returned id as step_card_id. Then: web_search for "bilibili Iron Man JARVIS" to find a BV number; media_mode mode=video action=show url=https://www.bilibili.com/video/<BV> autoplay=true; wait ~5 seconds; media_mode mode=video action=hide. Record the result and call ui_hide(step_card_id).`,
+    `Complete the following 3 checks in order. Before each one, you must simultaneously play a Chinese voice announcement and show a progress card. After the check completes, close the card before moving to the next:`,
+    `1. Call speak text="正在检查文件读写能力"; call ui_show("SelfCheckStepCard", {step:1, total:3, name:"文件读写", icon:"📁"}) and save the returned id as step_card_id. Then: use write_file to write self_check.txt in the sandbox root (content = current timestamp), then read_file it back to verify consistency. Record the result and call ui_hide(step_card_id).`,
+    `2. Call speak text="正在检查热点面板"; call ui_show("SelfCheckStepCard", {step:2, total:3, name:"热点面板", icon:"🌐"}) and save the returned id as step_card_id. Then: hotspot_mode action=show; confirm it returns ok, then hotspot_mode action=hide. Record the result and call ui_hide(step_card_id).`,
+    `3. Call speak text="正在检查视频模式"; call ui_show("SelfCheckStepCard", {step:3, total:3, name:"视频模式", icon:"🎬"}) and save the returned id as step_card_id. Then: web_search for "bilibili Iron Man JARVIS" ONCE — this is only a self-check, so take the FIRST BV number that appears in the results and stop immediately; do NOT keep searching for more videos or compare options, one valid BV id is enough. media_mode mode=video action=show url=https://www.bilibili.com/video/<BV> autoplay=true; wait ~5 seconds; media_mode mode=video action=hide. Record the result and call ui_hide(step_card_id).`,
     `Result values: use ok, degraded, error, or skipped_* for each item. Continue to the next item even if one fails.`,
-    `[FINAL TWO STEPS — REQUIRED]\n(a) Call ui_show to display SelfCheckCard with props: { results: [{name:"File read/write",status:"ok/error",...},{name:"Hotspot panel",...},{name:"Video mode",...}], overall:"ok/degraded/error" }. Infer overall from actual results: all ok → ok; any skipped → degraded; any error → error.\n(b) Call complete_startup_self_check with a summary (one sentence) and the results object.`,
+    `[FINAL TWO STEPS — REQUIRED]\n(a) Call ui_show to display SelfCheckCard with props: { results: [{name:"文件读写",status:"ok/error",...},{name:"热点面板",...},{name:"视频模式",...}], overall:"ok/degraded/error" }. Infer overall from actual results: all ok → ok; any skipped → degraded; any error → error.\n(b) Call complete_startup_self_check with a summary (one sentence) and the results object.`,
   ].join('\n')
-}
-
-// 把工具结果压缩成"前端可安全 JSON.parse"的字符串。
-// 原本用 slice(0, 1000) 会从字符串中间切断 JSON，让 thought-stream 的人类化格式器拿不到结构，
-// 只能回退展示原始（残缺的）JSON 文本。
-function truncateToolResultForUI(parsed, raw) {
-  if (parsed && typeof parsed === 'object') {
-    const compact = compactToolPayload(parsed)
-    const out = JSON.stringify(compact)
-    if (out.length <= 4000) return out
-    return out.slice(0, 4000)
-  }
-  return String(raw ?? '').slice(0, 1000)
-}
-
-function compactToolPayload(payload) {
-  if (Array.isArray(payload)) {
-    return payload.slice(0, 10).map(compactToolPayload)
-  }
-  if (payload && typeof payload === 'object') {
-    const out = {}
-    for (const [k, v] of Object.entries(payload)) {
-      if (typeof v === 'string' && v.length > 600) {
-        const cut = v.slice(0, 600)
-        out[k] = `${cut}…（已截断，原 ${v.length} 字符）`
-      } else if (v && typeof v === 'object') {
-        out[k] = compactToolPayload(v)
-      } else {
-        out[k] = v
-      }
-    }
-    return out
-  }
-  return payload
-}
-
-function trimAssistantFluff(content) {
-  let text = String(content || '').trim()
-  if (!text) return text
-
-  text = text
-    .replace(/^(?:\s*\[assistant(?:\s+to\s+[^\]\r\n]+)?(?:\s+\d{4}-\d{2}-\d{2}T[^\]\r\n]+)?\]\s*)+/giu, '')
-    .trim()
-
-  const patterns = [
-    /[，,、。.!！？~～\s]*(?:从现在起|从今以后|以后)?我就是[\u4e00-\u9fa5A-Za-z0-9 _-]{1,24}[，,、。.!！？~～\s]*为您效劳[！!～~。.\s]*$/u,
-    /[，,、。.!！？~～\s]*有什么需要帮忙的[？?]?[，,、。.!！？~～\s]*(?:随时)?为您效劳[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*有什么需要我帮忙的[？?]?[，,、。.!！？~～\s]*(?:随时)?为您效劳[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*随时为您效劳[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*为您效劳[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*有什么需要帮忙的[？?]?[～~！!。.\s]*$/u,
-    /[，,、。.!！？~～\s]*有什么需要我帮忙的[？?]?[～~！!。.\s]*$/u,
-  ]
-
-  let changed = true
-  while (changed) {
-    changed = false
-    for (const pattern of patterns) {
-      const next = text.replace(pattern, '').trim()
-      if (next !== text) {
-        text = next
-        changed = true
-      }
-    }
-  }
-
-  return text
-}
-
-function requiresToolForUserMessage(text = '') {
-  const input = String(text || '')
-  const fileIntent = /(sandbox|文件|目录|创建|新建|写入|读取|删除|列出|保存|test-\d+|\.txt|\.json|\.md|\.js|\.html|\.css)/i.test(input)
-    && /(创建|新建|写入|读取|删除|列出|保存|改|修改|生成|create|write|read|delete|list|save)/i.test(input)
-  const commandIntent = /(执行命令|运行命令|跑命令|exec|command|npm|node|git|powershell|cmd)/i.test(input)
-  const webIntent = /(打开网页|抓取|联网|搜索|查询最新|fetch|url|https?:\/\/)/i.test(input)
-  return fileIntent || commandIntent || webIntent
-}
-
-function hasNonMessageToolCall(toolCallLog = []) {
-  return toolCallLog.some(t => t.name && t.name !== 'send_message')
 }
 
 // Fallback 投递：当模型未按协议调 send_message 时由主循环代为投递。
 // 用 msg 自带的 externalPartyId + channel 路由（用户从哪儿发，就回到哪儿），并写入 conversations 表。
+//
+// 同步写一条 action_logs（tool='send_message', source='fallback'），保证 jarvis 在
+// action_log 里能完整看到自己的所有真实输出——self-snapshot 的身份锚才有据可依，
+// 不会把 fallback 投递误判成"幽灵回复（看似是你说过但 action_log 没记录）"。
 function deliverFallbackReply(msg, content, timestamp) {
   const channel = msg.channel || ''
   const externalPartyId = msg.externalPartyId || ''
@@ -372,7 +344,79 @@ function deliverFallbackReply(msg, content, timestamp) {
     timestamp,
     channel,
     external_party_id: externalPartyId,
+    // P0-2：fallback 投递的 reply 同样检测末尾是否是 follow-up 悬念
+    open_question: detectOpenFollowupQuestion(content) ? 1 : 0,
   })
+  // 同步登记 action_log，让 self-snapshot 能用 action_log 作为身份锚的真值源。
+  // tool 仍为 send_message，但 source 标 'fallback' 以便区分主动调用与协议兜底。
+  try {
+    insertActionLog({
+      timestamp,
+      tool: 'send_message',
+      summary: `send_message -> ${msg.fromId} (fallback)`,
+      detail: String(content).slice(0, 280),
+      status: 'ok',
+      risk: 'medium',
+      args: { target_id: msg.fromId, content, channel },
+      resultPreview: `消息已发送至 ${msg.fromId}${channel ? `（${channel}）` : ''} [fallback]`,
+      durationMs: 0,
+      source: 'fallback',
+    })
+  } catch (e) {
+    console.warn('[fallback] insertActionLog failed:', e?.message || e)
+  }
+}
+
+function formatQuickWeatherReply(cardProps) {
+  if (!cardProps) return ''
+  const city = cardProps.city || '当地'
+  const temp = Number.isFinite(cardProps.temp) ? `${Math.round(cardProps.temp)}度` : ''
+  const feel = Number.isFinite(cardProps.feel) ? `体感${Math.round(cardProps.feel)}` : ''
+  const condition = cardProps.condition || cardProps.desc || ''
+  const parts = [temp, feel, condition].filter(Boolean)
+  return parts.length ? `${city}现在${parts.join('，')}。` : ''
+}
+
+async function tryHandleDirectWeatherTurn(input, msg, { finishTurn } = {}) {
+  if (!msg || !isWeatherQuery(input)) return false
+
+  emitEvent('action', {
+    tool: 'weather_query',
+    summary: '查询天气',
+    detail: String(input || '').slice(0, 120),
+  })
+
+  const cardProps = await getWeatherCardProps(input)
+  if (!cardProps) return false
+
+  const reply = formatQuickWeatherReply(cardProps)
+  if (!reply) return false
+
+  // P0-1：天气快速路径绕开了 updateFocusFrame，需要手动给本轮 user 消息和
+  //   即将写入的 jarvis 回复打上"天气"焦点标签；否则 conversationWindow 里
+  //   这两行 focus_topic 永远是空，破坏话题边界标注。
+  setCurrentFocusTopic('天气')
+  try { updateUserMessageFocusTopic(msg.fromId, msg.timestamp, '天气') } catch {}
+
+  const timestamp = nowTimestamp()
+  if (isVoiceChannel(msg.channel)) autoSpeakForVoiceReply(reply)
+  deliverFallbackReply(msg, reply, timestamp)
+
+  if (hasACUIClient()) {
+    const id = `weathercard-${Date.now()}`
+    emitUICommand({
+      op: 'mount',
+      id,
+      component: 'WeatherCard',
+      props: cardProps,
+      hint: { placement: 'notification', enter: 'flash-in', exit: 'flash-out' },
+    })
+    addActiveUICard(id, { component: 'WeatherCard' })
+    emitEvent('action', { tool: 'ui_show', summary: '推送卡片', detail: 'WeatherCard' })
+  }
+
+  finishTurn?.(reply)
+  return true
 }
 
 export function buildToolContext({ currentTargetId = null, conversationWindow = [], includeRecentPartners = false } = {}) {
@@ -387,7 +431,10 @@ export function buildToolContext({ currentTargetId = null, conversationWindow = 
   }
 
   const unique = [...new Set(visibleTargetIds.filter(Boolean))]
-  return { allowedTargetIds: unique, visibleTargetIds: unique }
+  // currentTargetId 必须回传：工具执行层（llm.js 的耗时工具即时回应 ack、send_message 协议兜底）
+  // 都靠 toolContext.currentTargetId 找"当前该回复谁"。早先只用它算 visibleTargetIds 却没放回
+  // 返回对象，导致 toolContext.currentTargetId 恒为 undefined —— ack 不发、fallback 投递也拿不到目标。
+  return { currentTargetId: currentTargetId || null, allowedTargetIds: unique, visibleTargetIds: unique }
 }
 
 function buildToolContextForProcess(msg, injection) {
@@ -402,6 +449,9 @@ function buildToolContextForProcess(msg, injection) {
     // 当前 turn 的渠道信息：execSendMessage 在 AUTO 模式下优先用这里，确保"在哪儿收的消息就回到哪儿"
     currentChannel: msg?.channel || null,
     currentExternalPartyId: msg?.externalPartyId || null,
+    currentUserMessage: msg?.content || null,
+    // 自我感知信号：传给工具执行层（如 upsert_memory 守门），让"镜像污染"在写入长期记忆前就被拦截
+    selfPerception: injection.selfPerception || null,
 
     onSetTask: (description, steps) => {
       state.task = description
@@ -481,158 +531,11 @@ function buildToolContextForProcess(msg, injection) {
   }
 }
 
-function formatConversationMessage(row, currentMsg = null, prevChannel = '') {
-  if (row.role === 'jarvis') {
-    // Jarvis 出站的渠道也标出来，让模型能"看到"自己上次回到了哪里
-    const rawChannel = row.channel || ''
-    const normalized = normalizeChannel(rawChannel)
-    const channelTag = (normalized && normalized !== 'TUI' && normalized !== 'SYSTEM') ? `[via ${normalized}] ` : ''
-    return {
-      role: 'assistant',
-      content: `${channelTag}${trimAssistantFluff(row.content || '')}`,
-    }
-  }
-
-  // Truncate timestamp to minute precision (drop seconds and timezone)
-  const ts = row.timestamp ? row.timestamp.slice(0, 16).replace('T', ' ') : ''
-  const rawChannel = row.channel || currentMsg?.channel || ''
-  const normalizedChannel = normalizeChannel(rawChannel)
-
-  const isSystemSignal = row.from_id === 'SYSTEM' || normalizedChannel === 'SYSTEM' || rawChannel === 'APP_SIGNAL' || rawChannel === 'REMINDER'
-
-  if (isSystemSignal) {
-    const channelLabel = rawChannel ? ` · ${rawChannel}` : ''
-    return {
-      role: 'user',
-      content: `[system signal · ${ts}${channelLabel}]\n${row.content || ''}\n(Respond with tools only. Do NOT call send_message.)`.trim(),
-    }
-  }
-
-  const isCurrent = currentMsg
-    && row.role === 'user'
-    && row.from_id === currentMsg.fromId
-    && row.timestamp === currentMsg.timestamp
-    && row.content === currentMsg.content
-  const marker = isCurrent ? 'current user message' : 'user message'
-  // 简化后的渠道：TUI 视为默认不显示；其他（WECHAT/DISCORD/FEISHU/WECOM）显示
-  let channelLabel = (normalizedChannel && normalizedChannel !== 'TUI') ? ` · ${normalizedChannel}` : ''
-
-  // channel 切换提示：本条消息相对上一条的入口换了，给模型一个显眼的指代锚点。
-  // 主要场景：用户在 TUI 聊到一半切到微信继续问"那现在呢？"——必须让 LLM 知道
-  // 入口变了、感知能力也跟着变了，否则代词会被 runtime 块（电池/系统块）抢走。
-  if (prevChannel && normalizedChannel && prevChannel !== normalizedChannel) {
-    channelLabel += ` (channel switch: ${prevChannel} → ${normalizedChannel})`
-  }
-
-  return {
-    role: 'user',
-    content: `[${marker} · ${row.from_id || 'unknown'} · ${ts}${channelLabel}]\n${row.content || ''}`.trim(),
-  }
-}
-
-function formatTaskSteps(taskSteps = []) {
-  if (!taskSteps?.length) return ''
-  const statusIcon = { done: '✓', failed: '✗', skipped: '—', pending: '○' }
-  const lines = taskSteps.map((s, i) => {
-    const icon = statusIcon[s.status] || '○'
-    const note = s.note ? ` (${s.note})` : ''
-    return `  ${i + 1}. [${icon}] ${s.text}${note}`
-  })
-  const done = taskSteps.filter(s => s.status === 'done').length
-  const total = taskSteps.length
-  return `Task step progress (${done}/${total}):\n${lines.join('\n')}`
-}
-
-function buildRuntimeContextMessages({ recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '' } = {}) {
-  const parts = []
-
-  if (batteryBlock) {
-    parts.push(batteryBlock)
-  }
-
-  if (taskSteps?.length > 0) {
-    parts.push(formatTaskSteps(taskSteps))
-  }
-
-  if (recentActions?.length > 0) {
-    const lines = recentActions.map(item => `- ${item.ts?.slice(11, 16) || ''} ${item.summary || ''}`).join('\n')
-    parts.push(`Recent assistant actions:\n${lines}\nAvoid immediately repeating the same action unless the current user message asks for it.`)
-  }
-
-  if (actionLog?.length > 0) {
-    const lines = actionLog.slice(-10).map(item => {
-      const time = item.timestamp?.slice(11, 16) || ''
-      const detail = item.detail ? `\n  ${item.detail}` : ''
-      return `- ${time} ${item.tool || ''} · ${item.summary || ''}${detail}`
-    }).join('\n')
-    parts.push(`Recent tool/action log:\n${lines}\nUse this as runtime context only. Do not repeat completed actions unless the current task requires it.`)
-  }
-
-  if (lastToolResult) {
-    const argsSummary = Object.entries(lastToolResult.args || {})
-      .map(([key, value]) => `${key}=${String(value).slice(0, 60)}`)
-      .join(', ')
-    const resultPreview = String(lastToolResult.result || '').slice(0, 500)
-    parts.push(`Previous tool result:\n${lastToolResult.name}(${argsSummary}) ->\n${resultPreview}\nAbsorb this result before deciding the next step.`)
-  }
-
-  if (parts.length === 0) return []
-  return [{
-    role: 'user',
-    content: `[runtime context]\n${parts.join('\n\n')}`,
-  }]
-}
-
-function buildLLMMessages({ systemPrompt, contextBlock = '', conversationWindow = [], input, msg = null, recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '' }) {
-  const messages = [{ role: 'system', content: systemPrompt }]
-  messages.push(...buildRuntimeContextMessages({ recentActions, actionLog, lastToolResult, taskSteps, batteryBlock }))
-
-  const rows = Array.isArray(conversationWindow) ? conversationWindow : []
-  // Track which message in the array should receive this round's <context> block:
-  // it's the last user-role message representing the "current" turn — either the
-  // matched row from conversationWindow (when msg is already persisted to db) or
-  // the appended fallback message below (TICK / unmatched cases).
-  let currentMessageIndex = -1
-  // prevChannel 维护：上一条非 SYSTEM 消息的 normalized channel，用于在 marker
-  // 上标注 channel switch（"那现在呢"代词消解所依赖的核心信号之一）。
-  let prevChannel = ''
-
-  for (const row of rows) {
-    if (!row?.content) continue
-    const rowNorm = normalizeChannel(row.channel || '')
-    const isSystemRow = row.from_id === 'SYSTEM' || rowNorm === 'SYSTEM' || row.channel === 'APP_SIGNAL' || row.channel === 'REMINDER'
-    const formatted = formatConversationMessage(row, msg, isSystemRow ? '' : prevChannel)
-    if (!formatted.content) continue
-    messages.push(formatted)
-    const isCurrent = !!msg
-      && row.role === 'user'
-      && row.from_id === msg.fromId
-      && row.timestamp === msg.timestamp
-      && row.content === msg.content
-    if (isCurrent) currentMessageIndex = messages.length - 1
-    if (!isSystemRow && rowNorm) prevChannel = rowNorm
-  }
-
-  const hasCurrentMessage = currentMessageIndex >= 0
-
-  if (!hasCurrentMessage) {
-    messages.push({
-      role: 'user',
-      content: input,
-    })
-    currentMessageIndex = messages.length - 1
-  }
-
-  // Prepend this round's <context>...</context> to the current user message.
-  // The block is NOT persisted to db — conversations are written from the raw
-  // user content (see queue.pushMessage) and assistant outputs are stored
-  // verbatim, so the next round's conversationWindow stays clean.
-  if (contextBlock && currentMessageIndex >= 0) {
-    const target = messages[currentMessageIndex]
-    target.content = `${contextBlock}\n\n${target.content || ''}`
-  }
-
-  return messages
+function resolveTurnTools(injectedTools = [], { silentSignal = false } = {}) {
+  if (silentSignal) return []
+  const tools = Array.isArray(injectedTools) ? injectedTools.filter(Boolean) : []
+  if (!tools.includes('send_message')) tools.unshift('send_message')
+  return tools
 }
 
 const MAX_MESSAGE_RETRIES = 3
@@ -654,6 +557,18 @@ function getProcessPriority(msg) {
 
 function isVoiceChannel(channel) {
   return channel === 'voice' || channel === '语音识别' || channel === 'FocusBanner'
+}
+
+// 语音轮里"明显要往外部/社交渠道发送"的意图——命中则保留 send_message 工具，
+// 否则语音轮默认撤掉它（回复走纯文本直投+TTS）。宁可漏判（少数情况下模型够不到外发通道，
+// 会如实说一声）也不误判（"发"字太宽泛不收，必须带明确渠道词或"发到/发给我"这类路由意图）。
+const EXTERNAL_SEND_HINTS = [
+  '微信', 'wechat', 'discord', '飞书', 'feishu', '企微', 'wecom',
+  '发到', '推送到', '发给我', '转给', '发条微信', '发个微信', '发我微信',
+]
+function voiceTurnNeedsSendMessage(text) {
+  const b = String(text || '').toLowerCase()
+  return EXTERNAL_SEND_HINTS.some(k => b.includes(k.toLowerCase()))
 }
 
 function isFastUserMessage(msg) {
@@ -773,6 +688,8 @@ function buildSystemEnv(msg) {
     blocks.push(getSystemInfoBlock())
   if (/桌面|快捷方式|桌面文件|桌面应用|已安装|浏览器|启动程序/.test(text))
     blocks.push(getDesktopBlock())
+  if (/软件|应用|程序|客户端|工具|装了什么|用了什么|代理|科学上网|翻墙|\bvpn\b|\bproxy\b|clash|mihomo|v2ray|xray|sing-?box|shadowrocket|shadowsocks|wireguard|tailscale|zerotier|openvpn/.test(text))
+    blocks.push(getInstalledSoftwareBlock())
   if (/天气|气温|温度|下雨|下雪|晴天|气候|风力|风速|台风|位置|城市|在哪个城市/.test(text))
     blocks.push(getGeoWeatherBlock())
   if (/热点|新闻|热搜|热榜|今天发生|最近发生|微博|知乎|头条/.test(text))
@@ -783,15 +700,22 @@ function buildSystemEnv(msg) {
 async function runTurn(input, label, msg = null) {
   const sessionRef = newSessionRef()
   const isTick = !msg
+  const silentSignal = msg?.silent === true
   if (isTick) state.tickCounter += 1
   const priority = getProcessPriority(msg)
   const fastUserPath = isFastUserMessage(msg)
   const controller = new AbortController()
   let llmResult = null
   let toolCallLog = []
+  let terminalEmitted = false
+  const finishTurn = (content = '') => {
+    if (isTick || silentSignal || terminalEmitted) return
+    terminalEmitted = true
+    emitEvent('response', { sessionRef, label, content })
+  }
 
   console.log(`\n── ${label} ──`)
-  emitEvent(isTick ? 'tick' : 'message_received', { label, input: input.slice(0, 300) })
+  if (!silentSignal) emitEvent(isTick ? 'tick' : 'message_received', { label, input: input.slice(0, 300) })
 
   // User messages are written to conversations at the pushMessage stage (recorded on arrival) — do not write them again here.
   try {
@@ -818,12 +742,17 @@ async function runTurn(input, label, msg = null) {
         emitEvent('key_configured', {
           ttsText: autoConfigResult.hasTTS ? 'Voice synthesis successful' : null,
         })
+        finishTurn()
         return  // Skip LLM, silent round
       }
       if (autoConfigResult && !autoConfigResult.ok) {
         // Key detected but validation failed: keep message and let LLM inform the user
         keyConfigFailDir = `[system] An API key was detected in the user message but validation failed: ${autoConfigResult.error}. Inform the user that the key is invalid and suggest checking whether it is correct or has expired.`
       }
+    }
+
+    if (!isTick && await tryHandleDirectWeatherTurn(input, msg, { finishTurn })) {
+      return
     }
 
     // 1. Injector
@@ -833,17 +762,20 @@ async function runTurn(input, label, msg = null) {
     // 1b. Focus stack —— 动态上下文记忆池第 3b/3c 步：多帧栈 + 压缩回填
     // 在 runInjector 之后、buildContextBlock 之前更新，让 <focus> / <focus-history> 段拿到最新栈。
     try {
-      // Focus classifier 策略（Step 6a 重构）：
+      // Focus classifier 策略（Wave 1 优化：全路径 async）：
       //   - 始终启用 LLM 仲裁（除非用户显式关掉 state.focusClassifierDisabled）
-      //   - fastUserPath: async 模式 —— v0 同步建帧零延迟，LLM 后台 patch refined topic
-      //   - 后台路径（TICK/background）: sync 模式 —— 不在乎多 800ms，让 LLM 在主上下文构建前就 refine
+      //   - 所有路径都走 async：v0 同步建帧零延迟，LLM 后台 patch refined topic
+      //   - 历史上 TICK/background 走 sync 是想让 LLM 在主上下文构建前就 refine 一次
+      //     但 log 显示 800ms 硬超时常发，回退到 v0 等于"白等 800ms"
+      //   - async 不改栈结构、只 patch topic，当前轮看 v0 ngram，下一轮看 refined
+      //     代价小（焦点信号粗 1 轮），收益大（TICK 路径砍掉 800ms）
       //   - LLM 失败/超时/解析失败：focus-classifier 内部打日志后回退 v0，绝不阻塞主流程
       const classifierDisabled = state.focusClassifierDisabled === true
       const focusResult = await updateFocusFrame(state, input, {
         isTick,
         tickCounter: state.tickCounter || 0,
         classifierEnabled: !classifierDisabled,
-        classifierMode: fastUserPath ? 'async' : 'sync',
+        classifierMode: 'async',
         onClassifierRefined: () => {
           // async 模式 LLM 回填 topic 后保存到 db，让下次启动恢复时也能拿到 refined topic
           try {
@@ -869,6 +801,16 @@ async function runTurn(input, label, msg = null) {
         topFrame,
         event: focusResult?.event || 'noop',
       })
+
+      // P0-1：把"当前焦点 topic"广播给 db.js，之后本轮所有 insertConversation
+      // 自动带上该 topic。同时回填本轮触发判定的 user 消息（pushMessage 时焦点还没算）。
+      const topTopicStr = topFrame && Array.isArray(topFrame.topic)
+        ? topFrame.topic.slice(0, 3).join(',')
+        : ''
+      setCurrentFocusTopic(topTopicStr)
+      if (!isTick && msg?.fromId && msg?.timestamp && topTopicStr) {
+        try { updateUserMessageFocusTopic(msg.fromId, msg.timestamp, topTopicStr) } catch {}
+      }
 
       // 5c 步：持久化焦点栈到 db。noop 路径不写库（DELETE+INSERT 0 行也是无意义 IO）。
       // 任何 push/pop/touch/refresh 都视为栈状态变化，写一次。better-sqlite3 同步，
@@ -931,10 +873,13 @@ async function runTurn(input, label, msg = null) {
       }
     }
     if (fastUserPath) {
-      directions.unshift('Current turn is a real-time external user message. Understand it quickly and reply directly with send_message before doing slow tools or deep context gathering. Use heavier tools only when the reply depends on them. During execution, whenever there is meaningful progress or a useful finding, send_message to keep the user in the loop. Do not ask for permission for actions you can safely perform; act, and speak when there is something worth saying.')
+      directions.unshift('Current turn is a real-time external user message. Understand it quickly and reply directly with send_message. If no slow tool is needed, send exactly one final answer and stop. Use heavier tools only when the reply depends on them. During longer execution, send progress only for meaningful new findings or blockers; do not send an acknowledgement and then a near-duplicate final answer.')
     }
     if (isVoiceChannel(msg?.channel)) {
+      directions.push('Voice mode: answer with judgment and meaning first. Do not read out an inventory. If details are merely evidence, compress them into the situation they prove.')
+      directions.push('Voice mode style: speak like a person in the room. Default to one or two short sentences. No Markdown, no bullets, no headings, no process acknowledgement, no repeated summary. Say the situation, then stop.')
       directions.push('The current user message came from voice input. Speak naturally and concisely — like talking to a person, not writing an article. Get to the point, avoid filler phrases, and do not use Markdown formatting (no bullet points, asterisks, or headers). Say what needs to be said and stop.')
+      directions.push('For voice input, do not send process acknowledgements like "I will look" or "let me check" before the answer. Send one compact answer unless you truly need a slow tool and have no result yet.')
       directions.push('If the voice input is clearly a speech recognition error (meaningless noise, garbled syllables, random characters) OR appears to be ambient speech not directed at you — such as someone nearby talking to another person, background conversation, or utterances with no plausible intent to address an AI assistant — silently ignore it: do NOT call send_message or any other tool. Only respond when the input is reasonably addressed to you.')
     }
 
@@ -947,46 +892,34 @@ async function runTurn(input, label, msg = null) {
 
     // Real-time user messages take the fast path: skip heavy context gathering to avoid slowdowns from task background.
     const prefetchText = formatPrefetchedItems(injection.prefetchedItems)
-    const hotspotStateText = buildHotspotPanelStateContext()
-    const hotspotContextText = buildHotspotRuntimeContext(msg?.content || input)
-    const personCardStateText = buildPersonCardPanelStateContext()
-    const personCardContextText = buildPersonCardRuntimeContext(msg?.content || input)
-    const weatherContextText = await buildWeatherRuntimeContext(msg?.content || input)
-    // Keyword detection is a soft hint injected into context; the agent decides whether to open the doc panel
-    const detectedDocTopic = detectDocTopic(msg?.content || input)
-    const docStateText = buildDocPanelStateContext(detectedDocTopic)
-    const docContextText = buildDocRuntimeContext(msg?.content || input)
+    const runtimeInjection = await runRuntimeInjector({
+      message: msg?.content || input,
+      task: state.task,
+      taskKnowledge: taskKnowledgeText,
+      memories: memoriesText,
+      fastUserPath,
+      signal: controller.signal,
+    })
+    throwIfAborted(controller.signal)
 
     // When weather keywords are detected, auto-pop WeatherCard after 1 second
-    if (weatherContextText && hasACUIClient()) {
+    if (runtimeInjection.weatherCardProps && hasACUIClient()) {
       setTimeout(() => {
-        getWeatherCardProps(msg?.content || input).then(cardProps => {
-          if (!cardProps) return
-          const id = `weathercard-${Date.now()}`
-          emitUICommand({ op: 'mount', id, component: 'WeatherCard', props: cardProps, hint: { placement: 'notification', enter: 'flash-in', exit: 'flash-out' } })
-          addActiveUICard(id, { component: 'WeatherCard' })
-        }).catch(() => {})
+        const id = `weathercard-${Date.now()}`
+        emitUICommand({ op: 'mount', id, component: 'WeatherCard', props: runtimeInjection.weatherCardProps, hint: { placement: 'notification', enter: 'flash-in', exit: 'flash-out' } })
+        addActiveUICard(id, { component: 'WeatherCard' })
       }, 1000)
     }
 
     // 用户跨渠道可达性快照（让 L2 主动消息能选对渠道：用户在外面就发微信，在电脑前就发本地）
     const presenceText = formatPresenceForPrompt(PRIMARY_USER_ID)
 
-    let extraContextText = ''
-    if (state.task && !fastUserPath) {
-      const extraContext = await gatherContext({
-        task: state.task,
-        taskKnowledge: taskKnowledgeText,
-        memories: memoriesText,
-        message: input,
-        signal: controller.signal,
+    if (runtimeInjection.taskExtraContextItems.length > 0) {
+      console.log(`[context] Added ${runtimeInjection.taskExtraContextItems.length} context item(s)`)
+      emitEvent('context_gathered', {
+        count: runtimeInjection.taskExtraContextItems.length,
+        items: runtimeInjection.taskExtraContextItems.map(c => c.label),
       })
-      throwIfAborted(controller.signal)
-      extraContextText = formatExtraContext(extraContext)
-      if (extraContext.length > 0) {
-        console.log(`[context] Added ${extraContext.length} context item(s)`)
-        emitEvent('context_gathered', { count: extraContext.length, items: extraContext.map(c => c.label) })
-      }
     }
 
     // Emit injector result event (used by brain.html for display)
@@ -1036,14 +969,27 @@ async function runTurn(input, label, msg = null) {
     const agentName = getConfig('agent_name') || '小王子'
     const entities = getKnownEntities()
     const hasActiveTask = !!state.task
-    const extraContextJoined = [presenceText, hotspotStateText, hotspotContextText, personCardStateText, personCardContextText, weatherContextText, docStateText, docContextText, prefetchText, extraContextText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards)].filter(Boolean).join('\n\n')
+    const extraContextJoined = [presenceText, runtimeInjection.contextText, prefetchText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards), formatAIVideoPanel(getAIVideoPanelState())].filter(Boolean).join('\n\n')
 
-    // system 只留稳定硬底线（agent_name / persona / security）—— 让 DeepSeek prefix cache
-    // 真正命中。currentTime / existenceDesc / systemEnv 改走 <runtime> 段（每轮变化）。
+    // system 只留稳定硬底线（agent_name / persona）—— 让 DeepSeek prefix cache
+    // 真正命中。currentTime / existenceDesc / systemEnv / security 改走 <runtime> 段（每轮变化）。
+    // P1：把当前 user 消息正文传给 buildSystemPrompt，让 agent registry 块按需注入
+    //   （只在用户明确提到 Claude Code/Codex/Hermes 等外部 agent 时才出现）。
+    // Wave 2：把 channel / geo / focus 信号一起传过去，让 8 段场景规则按需注入。
+    // TODO: Wave 2 后续接入 —— hasWechatHistory 暂时按 false 传（需要查 conversations 表
+    //   看当前 user 是否有 WECHAT 历史；目前依赖 currentChannel === 'WECHAT' 来触发）。
+    // TODO: Wave 2 后续接入 —— hasActiveFocus 暂时按 false 传（需要把 focus banner active
+    //   状态做进 state，目前依赖 keyword 触发）。
     const systemPrompt = buildSystemPrompt({
       agentName,
       persona,
-      security: getSecurity(),
+      userMessage: msg?.content || input || '',
+      currentChannel: msg ? normalizeChannel(msg.channel || '') : '',
+      hasWechatHistory: false,
+      hasActiveFocus: false,
+      currentCountryCode: geoResult?.location?.country_code || '',
+      currentTimezone: geoResult?.location?.timezone || '',
+      currentTools: injection.tools || [],
     })
 
     const baseContextArgs = {
@@ -1064,11 +1010,46 @@ async function runTurn(input, label, msg = null) {
       currentTime: nowTimestamp(),
       existenceDesc: describeExistence(birthTime),
       systemEnv: buildSystemEnv(msg),
+      security: getSecurity(),
       currentChannel: msg ? normalizeChannel(msg.channel || '') : '',
       channelSwitched: detectChannelSwitch(msg, injection.conversationWindow || []),
       focusTickCounter: state.tickCounter || 0,
+      selfPerception: injection.selfPerception || null,
+      selfSnapshot: injection.selfSnapshot || null,
     }
-    let contextBlock = buildContextBlock(baseContextArgs)
+
+    // ① 统一相关度门（动态上下文记忆池 / 少即是强：排除导向的精细化管理）。
+    // 在 buildContextBlock 渲染之前，对"几乎常驻但常无关"的 section 做相关度门控 + 全段埋点。
+    // 参照系 = 本轮 user 消息正文 + 当前焦点 topic（编排器已蒸馏的"在关注什么"）。
+    // 参照系信号不足时 selectContextSections 内部会自动跳过门控、保留全部（守连续感红线）。
+    const focusTopicWords = Array.isArray(state.focusStack) && state.focusStack.length
+      ? (state.focusStack[state.focusStack.length - 1]?.topic || []).join(' ')
+      : ''
+    const referenceFrame = [msg?.content || input || '', focusTopicWords].filter(Boolean).join(' ')
+    const gateResult = selectContextSections(baseContextArgs, {
+      referenceFrame,
+      enabled: !state.sectionGateDisabled,
+    })
+    emitEvent('context_section_gate', { audit: gateResult.audit, meta: gateResult.meta })
+    // 埋点即时可见：门控真正跑过的轮次，打一行全段相关度摘要（measure-only 的分数也看得到，
+    // 攒分布数据用）。* 标记本可被剔除但当前 measure-only 放行的段——它们是后续 flip enforce 的候选。
+    if (gateResult.meta.gated && gateResult.audit.length > 0) {
+      const summary = gateResult.audit
+        .map(a => `${a.section}=${a.score}${a.dropped ? '✂' : (a.enforce ? '' : (a.hits === 0 ? '*' : ''))}`)
+        .join(' ')
+      console.log(`[排除层] ${summary} | 参照系="${gateResult.meta.referenceFrame}"`)
+    }
+
+    let contextBlock = buildContextBlock(gateResult.args)
+
+    // P0-1：把本轮焦点 topic 字符串传给 buildLLMMessages，用于：
+    //   - conversationWindow 每条消息 marker 上的 topic 标签
+    //   - 当前 user 消息 marker 上的 "topic switch" 提示
+    //   - 过期未答悬念的判断（话题切走时直接标 [expired]）
+    const currentTopicStr = (state.focusStack && state.focusStack.length > 0
+      && Array.isArray(state.focusStack[state.focusStack.length - 1].topic))
+      ? state.focusStack[state.focusStack.length - 1].topic.slice(0, 3).join(',')
+      : ''
 
     const buildMessagesWithContext = (ctxBlock) => buildLLMMessages({
       systemPrompt,
@@ -1081,6 +1062,8 @@ async function runTurn(input, label, msg = null) {
       lastToolResult: injection.lastToolResult || null,
       taskSteps: state.taskSteps,
       batteryBlock: getBatteryBlock(),
+      currentTopic: currentTopicStr,
+      isTick,
     })
 
     let llmMessages = buildMessagesWithContext(contextBlock)
@@ -1113,8 +1096,9 @@ async function runTurn(input, label, msg = null) {
           }
           const enrichedMemoriesText = memoriesText + '\n\n' + extraParts.join('\n\n')
           // Rebuild only the context block — system stays stable so prompt cache survives.
+          // 用 gateResult.args（过门后的）而非原始 baseContextArgs，让排除层的剔除在 refresh 重建里也保留。
           contextBlock = buildContextBlock({
-            ...baseContextArgs,
+            ...gateResult.args,
             memories: enrichedMemoriesText,
             roundInfo: { round: refreshResult.roundsRun },
           })
@@ -1131,16 +1115,42 @@ async function runTurn(input, label, msg = null) {
 
     // 3. Call Jarvis LLM (can be interrupted by a new message)
     const toolContext = buildToolContextForProcess(msg, injection)
+    const voiceTurn = isVoiceChannel(msg?.channel)
+    // localReply：本地渠道（语音 / TUI，非社交）下纯文本即回复，模型无需调 send_message——
+    // runtime 协议兜底会替它真正投递（含语音 TTS）。社交渠道（微信/Discord/飞书/企微）才必须
+    // send_message 才能送达外部平台。省掉 send_message 那一整轮额外 LLM 调用是语音提速的关键。
+    const localReply = !!msg?.fromId && !silentSignal && !isExternalChannel(msg?.channel)
+    let turnTools = resolveTurnTools(injection.tools, { silentSignal })
+    // 语音轮撤掉 send_message（用户决策）：语音回复直接走纯文本 → runtime 协议兜底 executeTool
+    // 投递 + 自动 TTS，模型既不必也不能调 send_message，彻底消除"调工具那一轮"的延迟，也不让它
+    // 在 UI 里显式出现。例外：消息意图明显要往外部/社交渠道发（"发到我微信"等）时保留，否则模型
+    // 够不到外发通道。撤的只是模型的工具入口——本地投递通道（fallback / slow-ack）不受影响。
+    if (voiceTurn && !silentSignal && !voiceTurnNeedsSendMessage(input)) {
+      turnTools = turnTools.filter(t => t !== 'send_message')
+    }
+    // thinking 始终开启：不再用"消息是否 trivial"的正则判定来关 reasoning。
+    // 浅层模式不该替模型决定"这题不用想"——复合意图下会把需要 reasoning 的部分误杀。
+    // 真正 trivial 的问题，模型开着 thinking 也会几乎瞬间收尾（深度由模型自控）；
+    // trivial 的延迟优化交给 prefix cache + focus 分类的 async 后台化，而非削能力。
+    //
+    // 流式回复：onStream 把 text/think 两种模式的 token 逐块吐出。curStreamMode 跟踪当前模式
+    // 让 stream_chunk 也带上 mode（前端据此区分"思考流"与"正文流"）。sawTextStream 标记本轮
+    // 是否流出过正文——若是，则语音 TTS 由前端边出边逐句合成（见 onToolCall 的 autoSpeak 守卫），
+    // 后端不再整段补一次 autoSpeakForVoiceReply，避免重复念。
+    let curStreamMode = null
+    let sawTextStream = false
     llmResult = await callLLM({
       systemPrompt,
       message: input,
       messages: llmMessages,
-      tools: injection.tools || ['send_message'],
-      maxTokens: undefined,
-      temperature: config.temperature,
+      tools: turnTools,
+      temperature: voiceTurn ? Math.min(config.temperature, 0.35) : config.temperature,
+      thinking: true,
       signal: controller.signal,
       toolContext,
-      mustReply: !!msg?.fromId,
+      mustReply: !!msg?.fromId && !silentSignal,
+      silentSignal,
+      localReply,
       onToolCall: (name, args, result) => {
         const resultText = String(result)
         let ok = true
@@ -1151,16 +1161,24 @@ async function runTurn(input, label, msg = null) {
         } catch {
           ok = !/^(错误|请求失败|执行失败|命令超时|命令执行失败|error|failed|execution failed|command timed out)/.test(resultText.trim())
         }
+        // callLLM 的协议兜底会用 __fallback 标记它代为投递的那次 send_message，
+        // 让下方遥测能区分"模型自己发的"与"runtime 兜底发的"。该标记不进 UI 事件。
+        const isFallbackDelivery = !!(args && args.__fallback)
+        const cleanArgs = isFallbackDelivery ? { ...args } : args
+        if (isFallbackDelivery) delete cleanArgs.__fallback
         // 截断策略：保证 JSON 仍可解析，否则前端格式化器会回退展示原始 JSON 文本。
         // 优先压缩 stdout/stderr/content/snippet 等长字段，再整体 stringify，而非粗暴 slice。
         const resultForEvent = truncateToolResultForUI(parsed, resultText)
-        emitEvent('tool_call', { name, args, result: resultForEvent, ok })
-        toolCallLog.push({ name, args, result: resultText.slice(0, 500), ok })
+        emitEvent('tool_call', { name, args: cleanArgs, result: resultForEvent, ok })
+        toolCallLog.push({ name, args: cleanArgs, result: resultText.slice(0, 500), ok, fallback: isFallbackDelivery })
         // 注：send_message 的 conversations 写入已由 executor.js 内统一处理（带 channel + external_party_id）
         // 这里仅处理语音输入的 TTS 自动回放
-        if (name === 'send_message' && args?.content && isVoiceChannel(msg?.channel)) {
-          const cleanedContent = trimAssistantFluff(args.content)
-          if (cleanedContent) autoSpeakForVoiceReply(cleanedContent)
+        // 语音渠道才自动播报。本轮若流出过正文（sawTextStream），说明前端已边出边逐句流式合成，
+        // 后端不再整段补一次，否则会和前端流式重复念。仅当没有正文流（极少：模型直接发了 send_message
+        // 而没流任何正文）时才由后端兜底整段合成，保证语音不会变哑。
+        if (name === 'send_message' && args?.content && isVoiceChannel(msg?.channel) && !sawTextStream) {
+          const speakText = String(args.content).trim()
+          if (speakText) autoSpeakForVoiceReply(speakText)
         }
       },
       onRetry: ({ attempt, nextAttempt, maxAttempts, delayMs, error }) => {
@@ -1170,9 +1188,20 @@ async function runTurn(input, label, msg = null) {
         emitEvent('tool_executing', { name })
       },
       onStream: ({ event, mode, text, name }) => {
-        if (event === 'start') emitEvent('stream_start', { mode })
-        else if (event === 'chunk') emitEvent('stream_chunk', { text })
-        else if (event === 'end') emitEvent('stream_end', {})
+        if (event === 'start') {
+          curStreamMode = mode
+          // plainReply：本地渠道（语音 / TUI，非社交）下正文流即用户可见回复——前端据此把正文实时
+          //   打进聊天气泡（社交渠道回复在 send_message 工具参数里，正文流非回复，不实时显示）。
+          // speak：语音轮才自动播报——前端据此对正文流逐句流式合成。
+          emitEvent('stream_start', {
+            mode,
+            plainReply: mode === 'text' && localReply,
+            speak: mode === 'text' && voiceTurn && !silentSignal,
+          })
+        } else if (event === 'chunk') {
+          if (curStreamMode === 'text') sawTextStream = true
+          emitEvent('stream_chunk', { text, mode: curStreamMode })
+        } else if (event === 'end') emitEvent('stream_end', { mode: curStreamMode })
         else if (event === 'tool_preparing') emitEvent('tool_preparing', { name })
       },
     })
@@ -1180,9 +1209,10 @@ async function runTurn(input, label, msg = null) {
   } catch (err) {
     if (err.name === 'AbortError') {
       console.log('[system] LLM processing interrupted (new message arrived)')
-      llmResult = { content: '', toolResult: null, aborted: true }
+      llmResult = { content: '', toolResult: null, aborted: true, delivered: false }
     } else {
       handleLLMFailure(err, label, msg)
+      finishTurn()
       return
     }
   } finally {
@@ -1203,74 +1233,54 @@ async function runTurn(input, label, msg = null) {
   state.lastToolResult = llmResult.toolResult || null
 
   console.log('\nJarvis:', response)
-  emitEvent('response', { sessionRef, label, content: response })
+  finishTurn(response)
 
   // User messages must not fail silently: if the model generated a response but forgot to call send_message,
-  // the runtime delivers it as a fallback; TICK/proactive messages must still go through explicit tool calls.
-  // 判断"是否漏了最终回复"必须看**最后一个**工具调用是不是 send_message，而不是"本轮是否出现过"。
-  // 否则 [send_message("好，我查一下"), web_fetch, read_file] 这种"前置旁白 + 真正干活"链条会绕过兜底，
-  // 模型在最后一步没补刀时直接静默退场——和 llm.js 内 sentMessage 同源的反模式，
-  // 参见 lessons-bailongma-silent-exit。
-  const lastToolCall = toolCallLog[toolCallLog.length - 1]
-  if (msg && msg.fromId && lastToolCall?.name !== 'send_message') {
-    const fallbackContent = trimAssistantFluff(
-      response
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/\[RECALL:\s*.+?\]/g, '')
-        .replace(/\[SET_TASK:\s*[\s\S]+?\]/g, '')
-        .replace(/\[CLEAR_TASK\]/g, '')
-        .replace(/\[UPDATE_PERSONA:\s*[\s\S]+?\]/g, '')
-        .trim()
-    )
-
-    if (fallbackContent && requiresToolForUserMessage(input) && !hasNonMessageToolCall(toolCallLog)) {
-      const timestamp = nowTimestamp()
-      const blockedContent = 'I did not actually call the required tool, so I cannot claim the operation completed. Please send again — I will execute the tool first, then reply based on the result.'
-      console.warn(`[protocol fallback] Blocked a text reply that required a tool call but made none. from=${msg.fromId}`)
-      if (isVoiceChannel(msg.channel)) autoSpeakForVoiceReply(blockedContent)
-      deliverFallbackReply(msg, blockedContent, timestamp)
-      toolCallLog.push({
-        name: 'send_message',
-        args: { target_id: msg.fromId, content: blockedContent },
-        result: 'fallback blocked missing required tool call',
-      })
-      emitEvent('protocol_violation', {
-        label,
-        reason: 'missing_required_tool_call',
-        fromId: msg.fromId,
-        content: fallbackContent.slice(0, 500),
-      })
-    } else if (fallbackContent) {
-      const timestamp = nowTimestamp()
-      console.warn(`[protocol fallback] Model did not call send_message — delivering response body to ${msg.fromId}`)
-      if (isVoiceChannel(msg.channel)) autoSpeakForVoiceReply(fallbackContent)
-      deliverFallbackReply(msg, fallbackContent, timestamp)
-      toolCallLog.push({
-        name: 'send_message',
-        args: { target_id: msg.fromId, content: fallbackContent },
-        result: 'fallback delivered from plain response',
-      })
-      emitEvent('protocol_violation', {
-        label,
-        reason: 'missing_send_message_fallback_delivered',
-        fromId: msg.fromId,
-        content: fallbackContent.slice(0, 500),
-      })
-    } else {
-      console.warn(`[protocol violation] Model did not call send_message and there is no response body to fall back on. from=${msg.fromId}`)
-      emitEvent('protocol_violation', {
-        label,
-        reason: 'missing_send_message',
-        fromId: msg.fromId,
-        content: response.slice(0, 500),
-      })
+  // the runtime delivers it as a fallback. **单一权威**：投递这件事现在完全由 callLLM 负责——
+  //   callLLM 在 mustReply && !delivered && 有可投递文本时，直接走真正的 send_message 执行器
+  //   （executeTool）代为投递，从而复用 executor 的去重 / open_question / social 派发，并把
+  //   action_log 标成 source:'fallback'（不变量 #8）。投递成功后 llmResult.delivered=true。
+  // 因此 index.js 不再从 toolCallLog 末项二次推导"是否已回复"，也不再手工 emit+dispatch+insert，
+  //   这里只剩遥测：根据 callLLM 返回的权威 delivered 信号区分"兜底投出了"与"完全无可投递文本"。
+  //   silentSignal 轮 callLLM 内部已守卫绝不投递（不变量 #1），这里也用同一守卫跳过遥测噪声。
+  if (msg && msg.fromId && !silentSignal) {
+    const lastToolCall = toolCallLog[toolCallLog.length - 1]
+    // "模型自己发的最终回复" = 末项是 send_message 且不是 runtime 兜底打的标记。
+    //   兜底投递虽然也会在 toolCallLog 留下一条 send_message（带 fallback:true），但那不算模型遵守协议。
+    const modelSentExplicitly = lastToolCall?.name === 'send_message' && !lastToolCall?.fallback
+    if (!modelSentExplicitly) {
+      if (llmResult.delivered && localReply) {
+        // 本地渠道（语音 / TUI）：纯文本直投是设计内的快路径，不是协议违规——不发 violation 遥测。
+        //   callLLM 兜底已真正投递（含语音 TTS / 去重 / source:'fallback' 落库）。
+        console.log(`[local reply] Plain-text reply delivered to ${msg.fromId} without send_message (fast path)`)
+      } else if (llmResult.delivered) {
+        // 社交渠道：模型违反了"回复=调 send_message"协议但被 runtime 兜底救回——记一条遥测便于观测违规率。
+        console.warn(`[protocol fallback] Model did not call send_message — callLLM delivered the response body to ${msg.fromId}`)
+        emitEvent('protocol_violation', {
+          label,
+          reason: 'missing_send_message_fallback_delivered',
+          fromId: msg.fromId,
+          content: response.slice(0, 500),
+        })
+      } else {
+        // 既没显式 send_message，callLLM 也没能兜底投递（无可投递正文 / 被中止 等）→ 纯遥测。
+        console.warn(`[protocol violation] Model did not call send_message and runtime had nothing deliverable to fall back on. from=${msg.fromId}`)
+        emitEvent('protocol_violation', {
+          label,
+          reason: 'missing_send_message',
+          fromId: msg.fromId,
+          content: response.slice(0, 500),
+        })
+      }
     }
   }
 
+  // 协议标记解析：单一真相源 src/runtime/markers.js（只解析，副作用留在下方原地）。
+  const markers = parseMarkers(response)
+
   // 4. Detect [RECALL: ...]
-  const recallMatch = response.match(/\[RECALL:\s*(.+?)\]/)
-  if (recallMatch) {
-    state.prev_recall = recallMatch[1]
+  if (markers.recall !== null) {
+    state.prev_recall = markers.recall
     console.log(`[system] Recall requested: ${state.prev_recall}`)
     emitEvent('recall_requested', { query: state.prev_recall })
   } else {
@@ -1278,23 +1288,21 @@ async function runTurn(input, label, msg = null) {
   }
 
   // 5. Detect [UPDATE_PERSONA: ...]
-  const personaMatch = response.match(/\[UPDATE_PERSONA:\s*([\s\S]+?)\]/)
-  if (personaMatch) {
-    const newPersona = personaMatch[1].trim()
+  if (markers.updatePersona !== null) {
+    const newPersona = markers.updatePersona.trim()
     setConfig('persona', newPersona)
     console.log('[system] Persona updated')
     emitEvent('persona_updated', { persona: newPersona.slice(0, 200) })
   }
 
   // 6. Detect [SET_TASK: ...] / [CLEAR_TASK]
-  const setTaskMatch = response.match(/\[SET_TASK:\s*([\s\S]+?)\]/)
-  if (setTaskMatch) {
-    state.task = setTaskMatch[1].trim()
+  if (markers.setTask !== null) {
+    state.task = markers.setTask.trim()
     setConfig('current_task', state.task)
     console.log(`[system] Task set: ${state.task}`)
     emitEvent('task_set', { task: state.task })
   }
-  if (/\[CLEAR_TASK\]/.test(response)) {
+  if (markers.clearTask) {
     const clearedTask = state.task
     console.log(`[system] Task completed: ${clearedTask}`)
     emitEvent('task_cleared', { task: clearedTask })
@@ -1315,13 +1323,7 @@ async function runTurn(input, label, msg = null) {
 
   // Update recent action log (keep last 5)
   if (toolCallLog.length > 0) {
-    const summary = toolCallLog.map(t => {
-      if (t.name === 'send_message') return `send_message → ${t.args.target_id}`
-      if (t.name === 'fetch_url') return `fetch_url(${t.args.url?.slice(0, 40)})`
-      if (t.name === 'write_file') return `write_file(${t.args.path})`
-      if (t.name === 'read_file') return `read_file(${t.args.path})`
-      return t.name
-    }).join(', ')
+    const summary = toolCallLog.map(summarizeToolCall).join(', ')
     state.recentActions.push({ ts: nowTimestamp(), summary })
     if (state.recentActions.length > 5) state.recentActions.shift()
   }
@@ -1341,9 +1343,9 @@ async function runTurn(input, label, msg = null) {
 
   // 6. Recognizer: split think block and response body, pass full experience.
   //    Runs in the background — does not block the next message/TICK.
-  const thinkMatch = response.match(/<think>([\s\S]*?)<\/think>/i)
+  const thinkMatch = response.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/i)
   const jarvisThink = thinkMatch ? thinkMatch[1].trim() : ''
-  const jarvisText = response.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  const jarvisText = response.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').trim()
 
   // Silent tick with no tool calls = nothing happened worth remembering; skip LLM call entirely.
   if (isTick && toolCallLog.length === 0 && !jarvisText) {
@@ -1351,17 +1353,15 @@ async function runTurn(input, label, msg = null) {
     return
   }
 
-  runRecognizer({
+  // 去抖批处理：把本轮排进识别队列，由 scheduler 决定何时合并成一次批量 recognizer 调用
+  // （空闲/攒满/超时/用过耐久信息工具时 flush）。不再每轮一次 LLM 调用。
+  enqueueTurnForRecognition({
     userMessage: input,
     jarvisThink,
     jarvisResponse: jarvisText,
     toolCallLog,
     task: state.task,
     sessionRef,
-  }).then(memories => {
-    emitEvent('memories_written', { count: memories?.length || 0, memories: memories || [] })
-  }).catch(err => {
-    console.error('[recognizer] Background run failed:', err)
   })
 }
 
@@ -1610,6 +1610,9 @@ async function main() {
     },
   })
   startSocialConnectors({ pushMessage, emitEvent }).catch(err => console.warn('[social] startup failed:', err.message))
+
+  // 恢复重启前未完成的 AI 视频生成任务（继续轮询，避免面板永远卡“生成中”）
+  try { resumePendingVideoJobs() } catch (err) { console.warn('[aivideo] resume failed:', err.message) }
 
   // Start TUI
   startTUI('ID:000001')

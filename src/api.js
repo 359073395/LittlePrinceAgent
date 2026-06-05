@@ -5,7 +5,7 @@ import net from 'net'
 import { fileURLToPath } from 'url'
 import { WebSocketServer } from 'ws'
 import { pushMessage } from './queue.js'
-import { getDB, getConfig, setConfig, insertUISignal, upsertMediaHistory, getMediaHistory, updateLastJarvisConversationContent } from './db.js'
+import { getDB, getConfig, setConfig, insertUISignal, upsertMediaHistory, getMediaHistory, updateLastJarvisConversationContent, getRecentRecallAudits, getRecentExtractAudits, getRecallAuditStats, getExtractAuditStats } from './db.js'
 import { emitEvent, addSSEClient, removeSSEClient, addACUIClient, removeACUIClient, removeActiveUICard, emitUICommand, flushStickyEvents, setStickyEvent } from './events.js'
 import { getQuotaStatus } from './quota.js'
 import { isRunning, stopLoop, startLoop } from './control.js'
@@ -17,6 +17,7 @@ import { restartConnector } from './social/index.js'
 // manager.js (Whisper local server) removed
 import { replaceProvider } from './providers/registry.js'
 import { persistAppState } from './capabilities/executor.js'
+import { execGenerateVideo, saveGeneratedVideo, setAIVideoPanelState, getVideoHistory } from './capabilities/tools/media.js'
 import { MinimaxProvider } from './providers/minimax.js'
 import { handleSocialWebhook, isSocialWebhookPath } from './social/webhooks.js'
 import { getClawbotQR, logoutClawbot } from './social/wechat-clawbot.js'
@@ -187,6 +188,13 @@ function contentTypeFor(filePath) {
       return 'application/json; charset=utf-8'
     case '.svg':
       return 'image/svg+xml'
+    case '.png':
+      return 'image/png'
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg'
+    case '.webp':
+      return 'image/webp'
     default:
       return 'text/plain; charset=utf-8'
   }
@@ -194,6 +202,11 @@ function contentTypeFor(filePath) {
 
 function getAgentName() {
   return (getConfig('agent_name') || '').trim() || DEFAULT_AGENT_NAME
+}
+
+function safeJsonParse(value, fallback) {
+  if (value === null || value === undefined) return fallback
+  try { return JSON.parse(value) } catch { return fallback }
 }
 
 function stripAssistantHistoryLabels(content) {
@@ -323,19 +336,60 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return
     }
 
+    // GET /audit/recall?limit=50 — recent recall_audit rows (Memory-Optimization v0.1 Phase 0)
+    if (req.method === 'GET' && url.pathname === '/audit/recall') {
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 500)
+      const rows = getRecentRecallAudits(limit).map(r => ({
+        ...r,
+        matched_mem_ids: safeJsonParse(r.matched_mem_ids, []),
+        event_type_dist: safeJsonParse(r.event_type_dist, {}),
+      }))
+      jsonResponse(res, 200, rows)
+      return
+    }
+
+    // GET /audit/extract?limit=50 — recent extract_audit rows
+    if (req.method === 'GET' && url.pathname === '/audit/extract') {
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 500)
+      const rows = getRecentExtractAudits(limit).map(r => ({
+        ...r,
+        extracted_mem_ids: safeJsonParse(r.extracted_mem_ids, []),
+        event_type_dist: safeJsonParse(r.event_type_dist, {}),
+        skipped: !!r.skipped,
+      }))
+      jsonResponse(res, 200, rows)
+      return
+    }
+
+    // GET /audit/stats?hours=168 — aggregate over last N hours (default 7 days)
+    if (req.method === 'GET' && url.pathname === '/audit/stats') {
+      const hours = Math.max(1, Math.min(parseInt(url.searchParams.get('hours') || '168'), 24 * 30))
+      const sinceIso = new Date(Date.now() - hours * 3600_000).toISOString().replace('T', ' ').slice(0, 19)
+      jsonResponse(res, 200, {
+        windowHours: hours,
+        sinceIso,
+        recall: getRecallAuditStats({ sinceIso }) || {},
+        extract: getExtractAuditStats({ sinceIso }) || {},
+      })
+      return
+    }
+
     // GET /conversations?limit=60 — chat history (ascending by time, most recent last)
-    // Admin/debug endpoint: returns FULL history including focus_absorbed rows.
+    // Internal SYSTEM/APP_SIGNAL rows are hidden by default so UI-only signals
+    // do not render as chat bubbles. Use includeSystemSignals=true for debugging.
     // The absorbed flag (dynamic memory pool 3.5) only filters main-line injection
     // in injector.js; here the operator needs to see everything for debugging.
     if (req.method === 'GET' && url.pathname === '/conversations') {
       const db = getDB()
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '60'), 500)
+      const includeSystemSignals = url.searchParams.get('includeSystemSignals') === 'true'
       const rows = db.prepare(`
-        SELECT id, role, from_id, to_id, content, timestamp, channel, external_party_id, focus_absorbed
+        SELECT id, role, from_id, to_id, content, timestamp, channel, external_party_id, focus_absorbed, focus_topic, open_question
         FROM conversations
+        WHERE (? OR NOT (from_id = 'SYSTEM' AND channel = 'APP_SIGNAL'))
         ORDER BY id DESC
         LIMIT ?
-      `).all(limit)
+      `).all(includeSystemSignals ? 1 : 0, limit)
       jsonResponse(res, 200, rows.reverse().map(row => (
         row.role === 'jarvis'
           ? { ...row, content: stripAssistantHistoryLabels(row.content) }
@@ -502,6 +556,95 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return
     }
 
+    // POST /aivideo/generate — 面板内“生成”按钮直连后端，绕开 LLM。
+    // body: { prompt, images?[url1,url2](data:base64/http；1 张=图生、2 张=首尾帧), image_url?(单图兼容), ratio?, resolution?, duration? }
+    // execGenerateVideo 会 emit aivideo_mode 事件并后台轮询，面板自行更新。
+    if (req.method === 'POST' && url.pathname === '/aivideo/generate') {
+      const chunks = []
+      let size = 0
+      let responded = false
+      const respond = (code, payload) => { if (responded) return; responded = true; jsonResponse(res, code, payload) }
+      req.on('data', c => {
+        size += c.length
+        if (size > 30 * 1024 * 1024) {  // 30MB 上限（含 base64 图片）
+          respond(413, { ok: false, error: '请求体过大（图片请控制在约 18MB 以内）' })
+          req.destroy()
+          return
+        }
+        chunks.push(c)
+      })
+      req.on('end', async () => {
+        if (responded) return
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
+          const result = await execGenerateVideo({
+            action: 'generate',
+            prompt: body.prompt,
+            images: Array.isArray(body.images) ? body.images : undefined,
+            image_url: body.image_url || body.image,
+            ratio: body.ratio,
+            resolution: body.resolution,
+            duration: body.duration,
+          })
+          const parsed = typeof result === 'string' ? JSON.parse(result) : result
+          respond(parsed.ok ? 200 : 400, parsed)
+        } catch (e) {
+          respond(400, { ok: false, error: e.message })
+        }
+      })
+      req.on('error', () => respond(400, { ok: false, error: 'request error' }))
+      return
+    }
+
+    // POST /aivideo/draft — 面板把当前「开关状态 + 提示词草稿」实时同步给后端（感知通道）。
+    // 后端只存内存状态，供注入器每轮贴进 agent 上下文。极轻量、不落库。
+    if (req.method === 'POST' && url.pathname === '/aivideo/draft') {
+      const chunks = []
+      let size = 0
+      req.on('data', c => {
+        size += c.length
+        if (size > 256 * 1024) { req.destroy(); return }  // 草稿是纯文本，256KB 足够
+        chunks.push(c)
+      })
+      req.on('end', () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
+          setAIVideoPanelState({ open: body.open, prompt: body.prompt })
+          jsonResponse(res, 200, { ok: true })
+        } catch (e) {
+          jsonResponse(res, 400, { ok: false, error: e.message })
+        }
+      })
+      req.on('error', () => { try { jsonResponse(res, 400, { ok: false, error: 'request error' }) } catch {} })
+      return
+    }
+
+    // POST /aivideo/save — 把生成的视频复制到「下载\AI视频生成保存的视频\日期\」
+    if (req.method === 'POST' && url.pathname === '/aivideo/save') {
+      const chunks = []
+      req.on('data', c => chunks.push(c))
+      req.on('end', () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
+          const result = saveGeneratedVideo(body.jobId)
+          jsonResponse(res, result.ok ? 200 : 400, result)
+        } catch (e) {
+          jsonResponse(res, 400, { ok: false, error: e.message })
+        }
+      })
+      return
+    }
+
+    // GET /aivideo/history — 面板打开时拉取已完成视频历史，重建生成栏队列（修复关闭重开后历史丢失）
+    if (req.method === 'GET' && url.pathname === '/aivideo/history') {
+      try {
+        jsonResponse(res, 200, { ok: true, jobs: getVideoHistory() })
+      } catch (e) {
+        jsonResponse(res, 200, { ok: false, jobs: [], error: e.message })
+      }
+      return
+    }
+
     // GET /favicon.ico ? silence the browser's automatic favicon request
     if (req.method === 'GET' && url.pathname === '/favicon.ico') {
       res.writeHead(204)
@@ -582,6 +725,50 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         }
       } catch {
         res.writeHead(404); res.end('music file not found')
+      }
+      return
+    }
+
+    // GET /media/video/:filename — serve AI-generated video files from sandbox/videos (range-enabled)
+    if (req.method === 'GET' && url.pathname.startsWith('/media/video/')) {
+      const raw = url.pathname.slice('/media/video/'.length)
+      const filename = path.basename(decodeURIComponent(raw))
+      const videoDir = path.join(SANDBOX_PATH, 'videos')
+      const filePath = path.join(videoDir, filename)
+      const resolvedFile = path.resolve(filePath)
+      const resolvedDir  = path.resolve(videoDir)
+      if (!resolvedFile.startsWith(resolvedDir + path.sep) && resolvedFile !== resolvedDir) {
+        res.writeHead(403); res.end('forbidden'); return
+      }
+      const mimeMap = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime' }
+      const contentType = mimeMap[path.extname(filename).toLowerCase()] || 'video/mp4'
+      try {
+        const stat = fs.statSync(filePath)
+        const total = stat.size
+        const rangeHeader = req.headers.range
+        if (rangeHeader) {
+          const m = rangeHeader.match(/bytes=(\d*)-(\d*)/)
+          const start = m[1] ? parseInt(m[1]) : 0
+          const end   = m[2] ? parseInt(m[2]) : total - 1
+          res.writeHead(206, {
+            'Content-Type': contentType,
+            'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': end - start + 1,
+            'Cache-Control': 'no-cache',
+          })
+          fs.createReadStream(filePath, { start, end }).pipe(res)
+        } else {
+          res.writeHead(200, {
+            'Content-Type': contentType,
+            'Content-Length': total,
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-cache',
+          })
+          fs.createReadStream(filePath).pipe(res)
+        }
+      } catch {
+        res.writeHead(404); res.end('video file not found')
       }
       return
     }
@@ -1185,6 +1372,8 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
               doubaoAppId:   creds.doubaoAppId,
               doubaoAccessKey: creds.doubaoAccessKey,
               doubaoResourceId: creds.doubaoResourceId,
+              doubaoStyle:   creds.doubaoStyle,
+              doubaoSpeechRate: creds.doubaoSpeechRate,
               minimaxKey:    creds.minimaxKey,
               openaiKey:     creds.openaiKey,
               openaiBaseURL: creds.openaiBaseURL,
@@ -1274,10 +1463,11 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
           // Read raw credentials from config.json
           let rawCfg = {}
           try { rawCfg = JSON.parse(fs.readFileSync(paths.configFile, 'utf-8'))?.voice || {} } catch {}
+          const provider = rawCfg.voiceProvider || msg.provider || 'aliyun'
           session = createCloudASRSession(
-            { provider: msg.provider || 'aliyun', lang: msg.lang || 'zh', ...rawCfg },
-            (text, isFinal) => {
-              try { ws.send(JSON.stringify({ type: 'transcript', text, is_final: isFinal })) } catch {}
+            { provider, lang: msg.lang || 'zh', ...rawCfg },
+            (text, isFinal, seg) => {
+              try { ws.send(JSON.stringify({ type: 'transcript', text, is_final: isFinal, seg })) } catch {}
             },
             (errMsg) => {
               try { ws.send(JSON.stringify({ type: 'error', message: errMsg })) } catch {}
@@ -1338,16 +1528,21 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
               const updates = {}
               if (payload.file_sandbox !== undefined) updates.fileSandbox = String(payload.file_sandbox) === 'true'
               if (payload.exec_sandbox !== undefined) updates.execSandbox = String(payload.exec_sandbox) === 'true'
-              if (Object.keys(updates).length > 0) setSecurity(updates)
+              const result = Object.keys(updates).length > 0 ? setSecurity(updates) : getSecurity()
               emitUICommand({ op: 'unmount', id: appId })
               removeActiveUICard(appId)
               const desc = Object.entries(updates).map(([k, v]) => `${k}=${v}`).join(', ')
-              pushMessage('SYSTEM', `[security settings updated] User confirmed changes: ${desc}`, 'APP_SIGNAL')
+              pushMessage(
+                'SYSTEM',
+                `[security settings updated] User confirmed changes: ${desc}. changed_at=${result.updatedAt || 'not recorded'}\n(Internal context refresh only. Do NOT call send_message.)`,
+                'APP_SIGNAL',
+                { queue: 'background', persist: false, silent: true },
+              )
             } else if (action === 'cancel_security_change') {
               // User cancelled — close the card, do not apply changes
               emitUICommand({ op: 'unmount', id: appId })
               removeActiveUICard(appId)
-              pushMessage('SYSTEM', '[security settings change] User cancelled — settings unchanged', 'APP_SIGNAL')
+              pushMessage('SYSTEM', '[security settings change] User cancelled — settings unchanged\n(Internal context refresh only. Do NOT call send_message.)', 'APP_SIGNAL', { queue: 'background', persist: false, silent: true })
             } else if (action.startsWith('app:') || SILENT_CARD_ACTIONS.has(action)) {
               // app: prefix = system-internal signal; SILENT_CARD_ACTIONS = lifecycle signals.
               // Both are already written to DB by insertUISignal; injector picks them up passively on the next tick.
@@ -1403,6 +1598,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     console.log(`[API]   POST /message  — send message to agent`)
     console.log(`[API]   GET  /events   — SSE real-time stream (receive agent messages)`)
     console.log(`[API]   GET  /memories — query memories`)
+    console.log(`[API]   GET  /audit/recall, /audit/extract, /audit/stats — memory observability (Phase 0)`)
     console.log(`[API]   GET  /status   — status`)
     console.log(`[API]   WS   /acui     — ACUI bidirectional channel (control + perception)`)
   })

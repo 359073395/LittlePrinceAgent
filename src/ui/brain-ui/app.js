@@ -9,6 +9,7 @@ import { initHotspot, toggleHotspot, setHotspotMode, moveVoicePanelToBody, resto
 import { enrichVisiblePersonCardFromText, initPersonCard, setPersonCardMode, showPersonCardByName } from "./person-card.js";
 import { initDocPanel, setDocPanelMode } from "./doc.js";
 import { initWechatPopup, showWechatPopup } from "./wechat-popup.js";
+import { attachJarvisFx, isFxEnabledForVoice, setFxEnabledForVoice, getJarvisFxParams, setJarvisFxParams, resetJarvisFxParams, isFxUnlocked, tryUnlockFx } from "./tts-fx.js";
 renderBrainUiApp(document.body);
 const THEME_KEY = "jarvis-brain-ui-theme";
 const PHYSICS_STORAGE_KEY = "jarvis-brain-ui-physics";
@@ -46,6 +47,8 @@ const SUPPRESS_UPDATES_KEY = "littleprinceagent_suppress_update_notifications";
 let agentName = DEFAULT_AGENT_NAME;
 let currentUiZoom = DEFAULT_UI_ZOOM;
 let chat = null;
+// 由 initSettings() 内部赋值，供 chat.js 的斜杠命令打开设置面板
+let openSettingsRef = null;
 
 function addMsg(...args) { return chat?.addMsg(...args); }
 function openChat(...args) { return chat?.openChat(...args); }
@@ -145,7 +148,7 @@ function setAgentName(nextName) {
   if (brandNameEl) brandNameEl.textContent = `${normalized} AI Agent`;
   if (graphEl) graphEl.setAttribute("aria-label", `${normalized} memory graph`);
   const input = document.getElementById("msg-input");
-  if (input && !chat?.isComposerLocked?.()) input.placeholder = defaultInputPlaceholder();
+  if (input && !chat?.isComposerLocked?.() && document.activeElement === input) input.placeholder = defaultInputPlaceholder();
   document.querySelectorAll(".msg-jarvis .msg-label").forEach((el) => {
     el.textContent = normalized;
   });
@@ -1007,6 +1010,114 @@ let tokenAccum = 0;
 let tokenWindow = Date.now();
 const tokRateEl = document.getElementById("tok-rate");
 
+// 记忆系统观测（Memory-Optimization v0.1 Phase 0）：每 60s 拉一次近 1 小时的 audit stats。
+// 显示"N 次（平均 K 条）"——次数代表系统活跃度，平均条数代表召回/抽取的健康度。
+// 0 命中数会让数字变橙提醒（命中率低 = 可能有召回漏）；纯网络/服务失败保持 — 不告警。
+const memRecallEl = document.getElementById("mem-recall-rate");
+const memExtractEl = document.getElementById("mem-extract-rate");
+
+// ── AI 当前正在做什么：派生展示 ────────────────────────────────
+// 北极星（[[feedback-ai-be-itself]]）：通信问题靠界面侧派生可视化解决，不逼 AI 学人开口。
+// 工作方式：纯被动接收 tool_call 事件流，按工具名归类统计最近 60s 活动，自动推导当前活动标签。
+// AI 完全不需要为此多做任何动作；它只管干活，UI 自己把"在干什么"翻译给用户看。
+const AI_ACTIVITY_WINDOW_MS = 60_000;
+const AI_ACTIVITY_IDLE_AFTER_MS = 15_000;
+const AI_TOOL_GROUPS = {
+  "扫描文件": new Set(["read_file", "list_dir"]),
+  "改动文件": new Set(["write_file", "make_dir", "delete_file"]),
+  "执行命令": new Set(["exec_command", "kill_process", "list_processes"]),
+  "上网": new Set(["fetch_url", "web_search", "browser_read"]),
+  "调取记忆": new Set(["search_memory", "recall_memory", "probe_memory", "upsert_memory", "merge_memories", "downgrade_memory"]),
+  "推送界面": new Set(["ui_show", "ui_update", "ui_hide", "ui_patch", "ui_register", "focus_banner"]),
+  "处理多媒体": new Set(["speak", "generate_lyrics", "generate_music", "generate_image", "music", "media_mode"]),
+  "回复用户": new Set(["send_message", "express"]),
+};
+const aiActivityLog = [];
+let aiActivityFirstTs = 0;
+let aiActivityTimer = null;
+const aiActivityEl = document.getElementById("ai-activity");
+const aiActivityLabelEl = document.getElementById("ai-activity-label");
+const aiActivityDetailEl = document.getElementById("ai-activity-detail");
+
+function classifyTool(name) {
+  for (const [label, set] of Object.entries(AI_TOOL_GROUPS)) {
+    if (set.has(name)) return label;
+  }
+  return "处理事务";
+}
+
+function recordAiActivity(name) {
+  if (!name) return;
+  const now = Date.now();
+  if (aiActivityLog.length === 0) aiActivityFirstTs = now;
+  aiActivityLog.push({ name, ts: now, group: classifyTool(name) });
+  refreshAiActivity();
+}
+
+function refreshAiActivity() {
+  if (!aiActivityEl) return;
+  const now = Date.now();
+  while (aiActivityLog.length && now - aiActivityLog[0].ts > AI_ACTIVITY_WINDOW_MS) {
+    aiActivityLog.shift();
+  }
+  if (aiActivityLog.length === 0) {
+    aiActivityEl.dataset.state = "idle";
+    aiActivityLabelEl.textContent = "空闲";
+    aiActivityDetailEl.textContent = "";
+    aiActivityFirstTs = 0;
+    return;
+  }
+  const lastTs = aiActivityLog[aiActivityLog.length - 1].ts;
+  if (now - lastTs > AI_ACTIVITY_IDLE_AFTER_MS) {
+    aiActivityEl.dataset.state = "idle";
+    aiActivityLabelEl.textContent = "刚完成";
+    const ago = Math.round((now - lastTs) / 1000);
+    aiActivityDetailEl.textContent = `${ago}s 前停止`;
+    return;
+  }
+  const counts = {};
+  for (const e of aiActivityLog) counts[e.group] = (counts[e.group] || 0) + 1;
+  let domGroup = "处理事务";
+  let domCount = 0;
+  for (const [g, c] of Object.entries(counts)) {
+    if (c > domCount) { domCount = c; domGroup = g; }
+  }
+  aiActivityEl.dataset.state = "busy";
+  aiActivityLabelEl.textContent = `正在${domGroup}`;
+  const elapsed = Math.round((now - (aiActivityFirstTs || lastTs)) / 1000);
+  aiActivityDetailEl.textContent = `· ${aiActivityLog.length} 次工具 · ${elapsed}s`;
+}
+
+if (aiActivityEl) {
+  aiActivityEl.dataset.state = "idle";
+  aiActivityTimer = setInterval(refreshAiActivity, 1000);
+}
+
+async function refreshMemoryAuditStats() {
+  if (!memRecallEl || !memExtractEl) return;
+  try {
+    const res = await fetch("/audit/stats?hours=1", { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    const r = data?.recall || {};
+    const e = data?.extract || {};
+    const rTotal = Number(r.total || 0);
+    const rAvg = Number(r.avg_chosen || 0);
+    const rZero = Number(r.zero_match_count || 0);
+    const eTotal = Number(e.total || 0);
+    const eAvg = Number(e.avg_extracted || 0);
+    const eSkip = Number(e.skipped_count || 0);
+    memRecallEl.textContent = rTotal ? `${rTotal}·${rAvg.toFixed(1)}` : "0";
+    memExtractEl.textContent = eTotal ? `${eTotal}·${eAvg.toFixed(1)}` : "0";
+    memRecallEl.style.color = (rTotal > 0 && rZero / rTotal > 0.2) ? "var(--warn, #e8a23a)" : "";
+    memExtractEl.style.color = (eTotal > 0 && eSkip / eTotal > 0.5) ? "var(--warn, #e8a23a)" : "";
+  } catch {
+    // 静默：dev/build 早期 audit 表可能还没数据，保持 — 即可
+  }
+}
+refreshMemoryAuditStats();
+setInterval(refreshMemoryAuditStats, 60_000);
+
 function bumpTokens(text) {
   tokenAccum += (text || "").length / 3.4;
   const now = Date.now();
@@ -1142,6 +1253,13 @@ function handle({ type, data = {} }) {
   switch (type) {
     case "message_received": {
       currentPath = "l1";
+      // 兜底：上一轮若被打断、message/response 均未到达，实时气泡会成孤儿、流式会话可能还挂着麦克风
+      // ——定稿气泡、收尾流式会话（恢复麦克风）、复位状态，再开新一轮。
+      if (sttsActive) endStreamingTTS();
+      if (chat.hasLiveJarvisMsg()) chat.finalizeLiveJarvisMsg(null);
+      liveReplyActive = false;
+      liveRawText = "";
+      liveTurnSpeak = false;
       L1.beginRound();
       const parsed = parseUserMessageInput(data.input);
       L1.newLine("user message received", {
@@ -1161,14 +1279,33 @@ function handle({ type, data = {} }) {
       break;
     case "stream_start":
       currentStream().startThinkingSession();
+      // 正文流（plainReply）：把 token 实时打进聊天气泡。一轮可能有多段正文（正文→工具→正文），
+      // 只在尚未开始时建气泡，后续段累积进同一个。speak 轮（语音）额外开启逐句流式合成。
+      if (data.mode === "text" && data.plainReply) {
+        if (data.speak) liveTurnSpeak = true;
+        if (!liveReplyActive) {
+          liveReplyActive = true;
+          liveRawText = "";
+          chat.beginLiveJarvisMsg({ alert: true });
+          if (liveTurnSpeak && isTTSStreamingEnabled()) beginStreamingTTS();
+        }
+      }
       break;
     case "stream_chunk":
-      // No longer rendering thought content — only drives the token-rate indicator
+      // 思考流：只驱动 token 速率指示器，不进聊天（保持 dashboard 纯净）
       currentStream().clearStatus();
       bumpTokens(data.text);
+      // 正文流：累积 + 实时重渲染气泡（剥离协议标记 / 藏半截标记）；语音轮喂给逐句合成队列
+      if (data.mode === "text" && liveReplyActive) {
+        liveRawText += data.text;
+        chat.updateLiveJarvisMsg(cleanStreamText(liveRawText));
+        if (sttsActive) feedStreamingTTS(liveRawText);
+      }
       break;
     case "stream_end":
       currentStream().stopThinking();
+      // 正文段结束：把残句先送去合成，降低尾句延迟（不结束会话，可能还有后续正文段）
+      if (data.mode === "text" && sttsActive) flushStreamingTTSBuf();
       break;
     case "tool_preparing": {
       // 思考动画已停，但工具尚未真正执行 —— 给一个占位状态避免 UI 死寂
@@ -1180,14 +1317,27 @@ function handle({ type, data = {} }) {
     case "tool_executing": {
       const stream = currentStream();
       const label = data.name ? stream.toolLabel(data.name) : "工具";
-      stream.setStatus(`正在执行 ${label}…`, "busy");
+      stream.setTimedStatus(`正在执行 ${label}…`, "busy", {
+        staleAfterMs: 45000,
+        staleText: `执行 ${label} 时间偏长，仍在等结果…`,
+      });
       break;
     }
     case "tool_call":
       currentStream().tool(data.name, data.args, data.result, data.ok);
+      recordAiActivity(data.name);
       break;
     case "response":
       // Round complete — stop all animations
+      currentStream().end();
+      // 兜底：本轮结束时（response 必在 message 之后发）若流式合成会话仍开着——极少见，模型只调了工具
+      // 没产出可投递正文、message 未到达——标记正文已尽让队列放完即恢复麦克风，避免麦克风一直挂起。
+      // 正常情况 message 已 finalize 过，此处幂等无副作用，不会打断仍在播放的尾句。
+      if (sttsActive) finalizeStreamingTTS();
+      if (chat.hasLiveJarvisMsg()) chat.finalizeLiveJarvisMsg(null);
+      liveReplyActive = false; liveRawText = ""; liveTurnSpeak = false;
+      break;
+    case "processing_preempted":
       currentStream().end();
       break;
     case "llm_retry": {
@@ -1211,7 +1361,13 @@ function handle({ type, data = {} }) {
       if (isBusyErrorMessage(data.error)) {
         currentStream().startThinkingSession();
         currentStream().setStatus("LLM 繁忙，请稍后重试", "busy");
+      } else {
+        currentStream().stopThinking();
+        currentStream().setStatus(data.error || "处理失败", "failed");
       }
+      break;
+    case "protocol_violation":
+      currentStream().end();
       break;
     case "injector_result": {
       const nids = [...extractNids(data.matchedMemories), ...extractNids(data.recallMemories)];
@@ -1259,7 +1415,20 @@ function handle({ type, data = {} }) {
         lastJarvisContent = data.content;
         const viaLabel = friendlyChannelLabel(data.channel);
         const content = viaLabel ? `_→ ${viaLabel}_  \n${data.content}` : data.content;
-        addMsg("jarvis", content);
+        // 若本轮正文已流式进了实时气泡：用权威全文定稿同一个气泡，避免新建重复气泡
+        if (chat.hasLiveJarvisMsg()) {
+          chat.finalizeLiveJarvisMsg(content);
+        } else {
+          addMsg("jarvis", content);
+        }
+        // 语音轮的 TTS 收尾：逐句会话进行中 → flush 尾句并收尾；若未走逐句（流式合成关闭）→ 整段播一次
+        if (liveTurnSpeak) {
+          if (sttsActive) finalizeStreamingTTS();
+          else playTTSReply(toPlainSpeech(data.content));
+        }
+        liveReplyActive = false;
+        liveRawText = "";
+        liveTurnSpeak = false;
         enrichVisiblePersonCardFromText(data.content, { source: 'assistant_message' });
         openChat(true);
       }
@@ -1282,6 +1451,9 @@ function handle({ type, data = {} }) {
       break;
     case "media_mode":
       window.dispatchEvent(new CustomEvent("littleprinceagent:media", { detail: data }));
+      break;
+    case "aivideo_mode":
+      window.dispatchEvent(new CustomEvent("littleprinceagent:aivideo", { detail: data }));
       break;
     case "hotspot_mode":
       setHotspotMode(!!data.active || data.action === "show" || data.action === "open", { source: "agent_event" });
@@ -1314,7 +1486,7 @@ function handle({ type, data = {} }) {
       break;
     case "startup_self_check_started":
       playJarvisStartupSound();
-      setTimeout(() => playTTSReply("System starting, running self-check"), 1500);
+      setTimeout(() => playTTSReply("系统启动中，正在运行自检"), 1500);
       break;
     default:
       break;
@@ -1390,11 +1562,52 @@ function playJarvisStartupSound() {
 // ── TTS reply playback ────────────────────────────────────────────────────────
 let ttsAudioEl = null;
 let ttsCurrentText = '';
+let activeTTSVoiceId = null; // 后端当前配置的 TTS 音色，用于决定播放时是否叠加机器人音效
 let ttsInterruptedRemaining = '';
 let lastJarvisContent = '';
 let ttsInterruptedOriginalContent = '';
 let ttsInterruptionApplied = false;
 let ttsInterruptionDbTimer = null;
+let ttsStreamReader = null; // 当前流式合成的网络读取器；打断/重播时取消，避免旧流继续占用
+
+// ── 边出文字边逐句流式合成（streaming sentence TTS）─────────────────────────────
+// 正文 token 边到边按句末标点切句入队，一个顺序播放队列逐句 /tts/stream 播放——第一句在
+// 后面还在生成时就出声。麦克风的挂起/恢复由队列在首段/末段统一各做一次（不可每段反复，
+// 否则 ttsStartTime/bargein 缓冲会被反复重置）。
+let ttsStreamingMode = false; // 本轮 TTS 走逐句队列（true）还是单段整段（false）；stopTTS 据此分支
+let sttsActive = false;       // 逐句会话进行中
+let sttsConsumed = 0;         // liveRawText 已喂入切句器的「干净文本」长度
+let sttsBuf = '';             // 尚未凑成整句的残句缓冲
+let sttsQueue = [];           // 已切出、待合成播放的句子
+let sttsPlaying = false;      // 当前有一段正在 fetch / 播放
+let sttsSpoken = '';          // 已完整播放过的句子拼接（打断时算"已说到哪"）
+let sttsCurSeg = '';          // 当前正在播放的句子文本
+let sttsStreamDone = false;   // 正文已全部到达（message 定稿），队列放完即收尾
+let sttsMicSuspended = false; // 已对麦克风做过一次 suspendForTTS
+
+const STTS_SENTENCE_RE = /[^。！？!?\n]*[。！？!?\n]+/g;
+function sttsHasReadable(s) { return /[\p{L}\p{N}]/u.test(s); }
+
+// 本轮流式回复状态：是否正在把正文打进实时气泡 / 累积的原始正文 / 本轮是否语音播报
+let liveReplyActive = false;
+let liveRawText = '';
+let liveTurnSpeak = false;
+
+// 流式语音合成：边下边播，首包到达即出声（后端 /tts/stream 本就分块返回，
+// 这里用 MediaSource 消费，省去"等整段下载完再播"的延迟）。默认开启，可在设置关闭。
+const TTS_STREAMING_KEY = 'littleprinceagent.tts.streaming';
+function isTTSStreamingEnabled() {
+  try { return localStorage.getItem(TTS_STREAMING_KEY) !== '0'; } catch { return true; } // 默认开启
+}
+function setTTSStreamingEnabled(on) {
+  try { localStorage.setItem(TTS_STREAMING_KEY, on ? '1' : '0'); } catch {}
+}
+// 仅当开启 + 浏览器支持 MSE 流式 MP3 时才走流式，否则退回整段 blob 播放（绝不让声音变哑）
+function ttsCanStream() {
+  if (!isTTSStreamingEnabled()) return false;
+  if (typeof window.MediaSource === 'undefined') return false;
+  try { return MediaSource.isTypeSupported('audio/mpeg'); } catch { return false; }
+}
 
 // Estimate spoken char count from audio progress, snapping to a sentence boundary
 function calcRemainingText(text, currentTime, duration) {
@@ -1456,6 +1669,7 @@ function applyTTSInterruption(spokenUpTo) {
 
 // Called by voice-panel interruption detection: stop current TTS and record cut point
 window.stopTTS = () => {
+  if (ttsStreamingMode && sttsActive) { stopStreamingTTS(); return; }
   if (!ttsAudioEl) return;
   const { remaining, spokenUpTo } = calcRemainingText(
     ttsCurrentText,
@@ -1467,6 +1681,7 @@ window.stopTTS = () => {
   applyTTSInterruption(spokenUpTo);
   ttsAudioEl.pause();
   try { URL.revokeObjectURL(ttsAudioEl.src); } catch {}
+  if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
   ttsAudioEl = null;
 };
 
@@ -1495,11 +1710,77 @@ window.resumeTTSIfNoSpeech = () => {
   playTTSReply(text);
 };
 
+// 接管一个 <audio> 元素开始播放：叠加音色音效、挂起 ASR、注册结束/出错清理。
+// revokeUrl 为该元素 src 的 objectURL（播放结束/出错时回收）。多条播放路径共用。
+// opts.manageMic：是否由本函数挂起/恢复麦克风（单段播放=true；逐句队列由队列在首尾统一管，传 false）。
+// opts.onComplete：播放正常/出错收尾时的回调（队列用它推进下一段）；不传则走默认收尾（恢复麦克风）。
+function startTTSAudio(audioEl, revokeUrl, opts = {}) {
+  const { manageMic = true, onComplete = null } = opts;
+  ttsAudioEl = audioEl;
+  audioEl.volume = 1.0; // ensure full volume (avoid residual duck state from previous play)
+  attachJarvisFx(audioEl, activeTTSVoiceId); // 仅当该音色开启了机器人音效才叠加；否则原生播放
+  // Suspend cloud ASR but keep the mic hardware open for interruption detection
+  if (manageMic) window.littleprinceagentVoice?.suspendForTTS?.();
+  // 结束/出错收尾。注意：被新一轮播放替换掉的旧元素，其 onerror 可能在 pause/revoke 后迟到触发；
+  // 此时全局已指向新元素，必须用 ttsAudioEl===audioEl 守卫，否则会误杀新播放的流读取器和状态。
+  const finish = () => {
+    if (revokeUrl) { try { URL.revokeObjectURL(revokeUrl); } catch {} } // 释放本元素 URL（无论是否当前）
+    if (ttsAudioEl !== audioEl) return; // 已不是当前播放对象：仅回收 URL，不动全局
+    if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
+    ttsAudioEl = null;
+    if (onComplete) { onComplete(); return; } // 队列段：交回队列推进，麦克风/收尾由队列统一管
+    ttsCurrentText = '';
+    if (manageMic) window.littleprinceagentVoice?.resumeAfterMedia();
+  };
+  audioEl.onended = finish;
+  audioEl.onerror = finish;
+  audioEl.play().catch(() => {
+    if (ttsAudioEl !== audioEl) return;
+    if (onComplete) { ttsAudioEl = null; onComplete(); return; }
+    if (manageMic) window.littleprinceagentVoice?.resumeAfterMedia();
+  });
+}
+
+// 流式播放：把 /tts/stream 的分块响应喂进 MediaSource，首包到达即出声。
+function playTTSViaMediaSource(resp, opts = {}) {
+  const mediaSource = new MediaSource();
+  const url = URL.createObjectURL(mediaSource);
+  startTTSAudio(new Audio(url), url, opts); // play() 会在缓冲到首包后自动开始
+  mediaSource.addEventListener('sourceopen', () => {
+    let sb;
+    try { sb = mediaSource.addSourceBuffer('audio/mpeg'); }
+    catch { try { mediaSource.endOfStream(); } catch {} return; }
+    const reader = resp.body.getReader();
+    ttsStreamReader = reader;
+    const queue = [];
+    let finished = false;
+    // appendBuffer 是异步的，更新中不能再次 append；用队列在 updateend 时串行送入
+    const flush = () => {
+      if (sb.updating) return;
+      if (queue.length) { try { sb.appendBuffer(queue.shift()); } catch {} return; }
+      if (finished && mediaSource.readyState === 'open') { try { mediaSource.endOfStream(); } catch {} }
+    };
+    sb.addEventListener('updateend', flush);
+    (async () => {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) { finished = true; flush(); break; }
+          if (value && value.byteLength) { queue.push(value); flush(); }
+        }
+      } catch { finished = true; flush(); } // 被取消/网络中断：收尾，已播部分照常结束
+    })();
+  }, { once: true });
+}
+
 async function playTTSReply(text) {
+  ttsStreamingMode = false; // 单段整段播放：stopTTS 走原有进度估算分支
   ttsCurrentText = text;
   ttsInterruptedRemaining = '';
   ttsInterruptionApplied = false;
   ttsInterruptedOriginalContent = '';
+  // 取消上一段仍在进行的流式读取，避免旧网络流继续占用
+  if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
   try {
     const resp = await fetch(`${API}/tts/stream`, {
       method: "POST",
@@ -1511,31 +1792,165 @@ async function playTTSReply(text) {
       try { const j = await resp.json(); errMsg = j.error || errMsg; } catch {}
       throw new Error(errMsg);
     }
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    if (ttsAudioEl) { ttsAudioEl.pause(); URL.revokeObjectURL(ttsAudioEl.src); }
-    ttsAudioEl = new Audio(url);
-    ttsAudioEl.volume = 1.0; // ensure full volume (avoid residual duck state from previous play)
-    // Suspend cloud ASR but keep the mic hardware open for interruption detection
-    window.littleprinceagentVoice?.suspendForTTS?.();
-    ttsAudioEl.onended = () => {
-      URL.revokeObjectURL(url);
-      ttsAudioEl = null;
-      ttsCurrentText = '';
-      window.littleprinceagentVoice?.resumeAfterMedia();
-    };
-    ttsAudioEl.onerror = () => {
-      ttsAudioEl = null;
-      ttsCurrentText = '';
-      window.littleprinceagentVoice?.resumeAfterMedia();
-    };
-    ttsAudioEl.play().catch(() => {
-      window.littleprinceagentVoice?.resumeAfterMedia();
-    });
+    if (ttsAudioEl) { ttsAudioEl.pause(); try { URL.revokeObjectURL(ttsAudioEl.src); } catch {} }
+    // 默认流式：边下边播；不支持 MSE / 已关闭流式 → 退回整段 blob 播放
+    if (ttsCanStream() && resp.body) {
+      playTTSViaMediaSource(resp);
+    } else {
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      startTTSAudio(new Audio(url), url);
+    }
   } catch {
     ttsCurrentText = '';
     window.littleprinceagentVoice?.resumeAfterMedia();
   }
+}
+
+// ── 流式回复文本工具 ───────────────────────────────────────────────────────────
+// 协议标记（[RECALL:…]/[SET_TASK:…]/[CLEAR_TASK]/[UPDATE_PERSONA:…]）剥离。与后端 markers.js 等价；
+// 流式场景额外把"末尾尚未闭合的标记起始"整段藏起，避免半截标记被显示或念出来（等 ] 到了再放出）。
+const MARKER_STRIP_RE = /\[(?:RECALL:[\s\S]*?|SET_TASK:[\s\S]*?|CLEAR_TASK|UPDATE_PERSONA:[\s\S]*?)\]/g;
+function cleanStreamText(raw) {
+  let s = String(raw || '').replace(MARKER_STRIP_RE, '');
+  const lastOpen = s.lastIndexOf('[');
+  if (lastOpen >= 0 && s.indexOf(']', lastOpen) === -1) {
+    // 仅当 '[' 后看起来是协议标记关键字（全大写/下划线，可带 ":..."）才藏；不误伤 [链接](url) 等普通括号
+    if (/^\[[A-Z_]*(:[\s\S]*)?$/.test(s.slice(lastOpen))) s = s.slice(0, lastOpen);
+  }
+  return s;
+}
+
+// markdown → 朗读用纯文本（与后端 autoSpeakForVoiceReply 的剥离一致）
+function toPlainSpeech(md) {
+  return String(md || '').trim()
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/\*(.+?)\*/g, '$1')
+    .replace(/`(.+?)`/g, '$1')
+    .replace(/#{1,6}\s+/g, '')
+    .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1')
+    .replace(/!\[[^\]]*\]\([^\)]+\)/g, '')
+    .replace(/\n+/g, ' ')
+    .trim();
+}
+
+// ── 逐句流式 TTS 队列 ──────────────────────────────────────────────────────────
+function beginStreamingTTS() {
+  // 停掉上一段仍在进行的单段播放 / 流读取
+  if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
+  if (ttsAudioEl) { try { ttsAudioEl.pause(); URL.revokeObjectURL(ttsAudioEl.src); } catch {} ttsAudioEl = null; }
+  ttsStreamingMode = true;
+  sttsActive = true;
+  sttsConsumed = 0; sttsBuf = ''; sttsQueue = []; sttsPlaying = false;
+  sttsSpoken = ''; sttsCurSeg = ''; sttsStreamDone = false; sttsMicSuspended = false;
+  ttsCurrentText = '';
+}
+
+// 喂入到目前为止的全部原始正文，内部只取新增的干净尾巴做切句
+function feedStreamingTTS(rawFull) {
+  if (!sttsActive) return;
+  const cleaned = cleanStreamText(rawFull);
+  if (cleaned.length <= sttsConsumed) return;
+  sttsBuf += cleaned.slice(sttsConsumed);
+  sttsConsumed = cleaned.length;
+  extractSttsSentences({});
+}
+
+function extractSttsSentences({ flushPartial = false, markDone = false } = {}) {
+  let lastIdx = 0, m;
+  STTS_SENTENCE_RE.lastIndex = 0;
+  while ((m = STTS_SENTENCE_RE.exec(sttsBuf)) !== null) {
+    const s = m[0].trim();
+    lastIdx = STTS_SENTENCE_RE.lastIndex;
+    if (s && sttsHasReadable(s)) sttsQueue.push(s);
+  }
+  sttsBuf = sttsBuf.slice(lastIdx);
+  if (flushPartial) {
+    const tail = sttsBuf.trim();
+    sttsBuf = '';
+    if (tail && sttsHasReadable(tail)) sttsQueue.push(tail);
+  }
+  if (markDone) sttsStreamDone = true;
+  pumpSttsQueue();
+}
+
+async function pumpSttsQueue() {
+  if (!sttsActive || sttsPlaying) return;
+  const seg = sttsQueue.shift();
+  if (!seg) {
+    if (sttsStreamDone) endStreamingTTS(); // 正文已尽且队列放完 → 收尾
+    return;
+  }
+  sttsPlaying = true;
+  sttsCurSeg = seg;
+  // 麦克风只在首段挂起一次（后续段之间保持挂起，避免反复重置 bargein 缓冲/预热计时）
+  if (!sttsMicSuspended) { sttsMicSuspended = true; window.littleprinceagentVoice?.suspendForTTS?.(); }
+  const onComplete = () => {
+    sttsSpoken += seg;
+    sttsCurSeg = '';
+    sttsPlaying = false;
+    pumpSttsQueue();
+  };
+  try {
+    const resp = await fetch(`${API}/tts/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: seg }),
+    });
+    if (!sttsActive) return; // 期间被打断/收尾
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (ttsCanStream() && resp.body) {
+      playTTSViaMediaSource(resp, { manageMic: false, onComplete });
+    } else {
+      const blob = await resp.blob();
+      if (!sttsActive) return;
+      const url = URL.createObjectURL(blob);
+      startTTSAudio(new Audio(url), url, { manageMic: false, onComplete });
+    }
+  } catch {
+    onComplete(); // 本句合成失败：跳过，继续下一句，绝不卡住队列
+  }
+}
+
+// 正文段落结束（stream_end text）：把残句也凑成一段送出，但不结束会话（可能还有后续正文段）
+function flushStreamingTTSBuf() {
+  if (sttsActive) extractSttsSentences({ flushPartial: true });
+}
+
+// message 定稿：flush 残句并标记正文已尽，队列放完即收尾
+function finalizeStreamingTTS() {
+  if (sttsActive) extractSttsSentences({ flushPartial: true, markDone: true });
+}
+
+function endStreamingTTS() {
+  sttsActive = false;
+  ttsStreamingMode = false;
+  if (sttsMicSuspended) { sttsMicSuspended = false; window.littleprinceagentVoice?.resumeAfterMedia(); }
+  sttsQueue = []; sttsBuf = ''; sttsCurSeg = ''; sttsSpoken = ''; sttsPlaying = false;
+}
+
+// 打断（barge-in）：停当前句、清队列，算出"已说到哪"标 ✋，并把剩余文本留给 resumeTTSIfNoSpeech 续播。
+// 麦克风的恢复由 voice-panel 在调用 stopTTS 后自己 resumeVoiceInputFromMedia(true) 负责（与单段路径一致），
+// 这里只置 sttsMicSuspended=false 防止重复恢复。
+function stopStreamingTTS() {
+  let curSpoken = '', curRemain = '';
+  if (ttsAudioEl && sttsCurSeg) {
+    const r = calcRemainingText(sttsCurSeg, ttsAudioEl.currentTime, ttsAudioEl.duration);
+    curSpoken = sttsCurSeg.slice(0, r.spokenUpTo);
+    curRemain = r.remaining || sttsCurSeg; // duration 未加载(NaN) → 整句视为未说
+  }
+  const spokenPlain = sttsSpoken + curSpoken;
+  const remainingPlain = [curRemain, sttsQueue.join(''), sttsBuf].filter(Boolean).join('').trim();
+  const fullPlain = (spokenPlain + remainingPlain) || (lastJarvisContent || '');
+  ttsCurrentText = fullPlain;                       // 让 ✋/续播的文本计算有一致的全文基准
+  ttsInterruptedRemaining = remainingPlain || fullPlain;
+  applyTTSInterruption(spokenPlain.length);
+  if (ttsAudioEl) { try { ttsAudioEl.pause(); URL.revokeObjectURL(ttsAudioEl.src); } catch {} }
+  if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
+  ttsAudioEl = null;
+  sttsActive = false; ttsStreamingMode = false;
+  sttsQueue = []; sttsBuf = ''; sttsCurSeg = ''; sttsSpoken = ''; sttsPlaying = false;
+  sttsMicSuspended = false; // 麦克风恢复交给 voice-panel 的 resumeVoiceInputFromMedia(true)
 }
 
 resetViewBtn.addEventListener("click", resetZoom);
@@ -1598,6 +2013,7 @@ chat = initChat({
   activationWarmupKey: ACTIVATION_WARMUP_KEY,
   getAgentName: () => agentName,
   defaultInputPlaceholder,
+  openSettings: (tab) => openSettingsRef?.(tab),
   onUserMessage: (text) => {
     if (document.body.classList.contains('hotspot-mode') && /关闭|退出|关掉|隐藏/.test(text)) {
       toggleHotspot();
@@ -1641,9 +2057,106 @@ function initTTSSettings() {
   const voiceSel    = document.getElementById("tts-voice-select");
   const testBtn     = document.getElementById("tts-test-btn");
   const testStatus  = document.getElementById("tts-test-status");
+  const fxToggle    = document.getElementById("tts-fx-toggle");
   if (!providerSel) return;
 
+  // 流式合成开关（默认开）：纯播放行为，存在 localStorage
+  const streamingToggle = document.getElementById("tts-streaming-toggle");
+  if (streamingToggle) {
+    streamingToggle.checked = isTTSStreamingEnabled();
+    streamingToggle.addEventListener("change", () => setTTSStreamingEnabled(streamingToggle.checked));
+  }
+
   let allVoices = {};
+
+  // ── 机器人音效：开关 + 滑块面板 ──
+  const fxSlidersBox = document.getElementById("tts-fx-sliders");
+  // 滑块对应的参数键，及数值显示精度
+  const FX_SLIDERS = [
+    { key: "wet",              digits: 2 },
+    { key: "reverbSeconds",    digits: 1 },
+    { key: "driveMix",         digits: 2 },
+    { key: "metallic",         digits: 2 },
+    { key: "ring",             digits: 2 },
+    { key: "chorus",           digits: 2 },
+    { key: "metallicFeedback", digits: 2 },
+    { key: "metallicDelayMs",  digits: 1 },
+    { key: "ringHz",           digits: 0 },
+  ];
+
+  function loadFxSliders() {
+    const p = getJarvisFxParams();
+    for (const s of FX_SLIDERS) {
+      const el = document.getElementById(`tts-fx-${s.key}`);
+      const val = document.getElementById(`tts-fx-${s.key}-val`);
+      const v = Number(p[s.key] ?? 0);
+      if (el) el.value = v;
+      if (val) val.textContent = v.toFixed(s.digits);
+    }
+  }
+
+  for (const s of FX_SLIDERS) {
+    const el = document.getElementById(`tts-fx-${s.key}`);
+    const val = document.getElementById(`tts-fx-${s.key}-val`);
+    if (!el) continue;
+    el.addEventListener("input", () => {
+      const v = parseFloat(el.value);
+      setJarvisFxParams({ [s.key]: v });
+      if (val) val.textContent = v.toFixed(s.digits);
+    });
+  }
+
+  const fxReset = document.getElementById("tts-fx-reset");
+  if (fxReset) {
+    fxReset.addEventListener("click", () => { resetJarvisFxParams(); loadFxSliders(); });
+  }
+
+  // 语速滑块（豆包 speech_rate，-50~100，0=正常）：显示更新；存档走保存/试听
+  const fmtRate = (r) => (r === 0 ? "正常" : (r > 0 ? "+" + r : String(r)));
+  const doubaoRateEl = document.getElementById("tts-doubao-rate");
+  const doubaoRateVal = document.getElementById("tts-doubao-rate-val");
+  if (doubaoRateEl) {
+    doubaoRateEl.addEventListener("input", () => {
+      if (doubaoRateVal) doubaoRateVal.textContent = fmtRate(parseInt(doubaoRateEl.value, 10) || 0);
+    });
+  }
+
+  // 付费解锁
+  const fxLockBox = document.getElementById("tts-fx-lock");
+  const fxPwInput = document.getElementById("tts-fx-pw");
+  const fxUnlockBtn = document.getElementById("tts-fx-unlock");
+  const fxUnlockMsg = document.getElementById("tts-fx-unlock-msg");
+
+  // 机器人音效开关跟随当前选中的音色；未解锁则禁用开关+显示付费提示；解锁且开启时展开滑块
+  function syncFxToggle() {
+    const unlocked = isFxUnlocked();
+    const on = unlocked && isFxEnabledForVoice(voiceSel?.value);
+    if (fxToggle) { fxToggle.checked = on; fxToggle.disabled = !unlocked; }
+    if (fxSlidersBox) fxSlidersBox.style.display = on ? "flex" : "none";
+    if (fxLockBox) fxLockBox.style.display = unlocked ? "none" : "flex";
+  }
+  if (fxToggle) {
+    fxToggle.addEventListener("change", () => {
+      if (!isFxUnlocked()) { fxToggle.checked = false; syncFxToggle(); return; }
+      setFxEnabledForVoice(voiceSel?.value, fxToggle.checked);
+      if (fxSlidersBox) fxSlidersBox.style.display = fxToggle.checked ? "flex" : "none";
+    });
+  }
+  if (fxUnlockBtn) {
+    fxUnlockBtn.addEventListener("click", () => {
+      const res = tryUnlockFx(fxPwInput?.value?.trim() || "");
+      if (fxUnlockMsg) {
+        fxUnlockMsg.textContent = res.ok ? "已解锁 ✓ 现在可以开启机器人音效了" : res.reason;
+        fxUnlockMsg.style.color = res.ok ? "#3ba55d" : "#e05050";
+      }
+      if (res.ok) syncFxToggle();
+    });
+  }
+  if (voiceSel) {
+    voiceSel.addEventListener("change", syncFxToggle);
+  }
+  loadFxSliders();
+  syncFxToggle();
 
   const credSections = {
     doubao:     document.getElementById("tts-creds-doubao"),
@@ -1668,6 +2181,7 @@ function initTTSSettings() {
     if (savedId && voices.some(v => v.id === savedId)) {
       voiceSel.value = savedId;
     }
+    syncFxToggle();
   }
 
   providerSel.addEventListener("change", () => {
@@ -1681,8 +2195,22 @@ function initTTSSettings() {
     if (tts?.ttsProvider) providerSel.value = tts.ttsProvider;
     else providerSel.value = "doubao";
     updateVoiceOptions(provider, tts?.ttsVoiceId);
+    activeTTSVoiceId = voiceSel?.value || tts?.ttsVoiceId || null;
     const appidEl = document.getElementById("tts-volcano-appid");
     if (appidEl && tts?.volcanoAppId?.value) appidEl.value = tts.volcanoAppId.value;
+    const doubaoAppIdEl = document.getElementById("tts-doubao-appid");
+    if (doubaoAppIdEl && tts?.doubaoAppId?.value) doubaoAppIdEl.value = tts.doubaoAppId.value;
+    const doubaoResourceEl = document.getElementById("tts-doubao-resource");
+    if (doubaoResourceEl && tts?.doubaoResourceId) doubaoResourceEl.value = tts.doubaoResourceId;
+    const doubaoStyleEl = document.getElementById("tts-doubao-style");
+    if (doubaoStyleEl && tts?.doubaoStyle) doubaoStyleEl.value = tts.doubaoStyle;
+    const rateEl = document.getElementById("tts-doubao-rate");
+    if (rateEl) {
+      const r = Number(tts?.doubaoSpeechRate || 0) || 0;
+      rateEl.value = r;
+      const rv = document.getElementById("tts-doubao-rate-val");
+      if (rv) rv.textContent = r === 0 ? "正常" : (r > 0 ? "+" + r : String(r));
+    }
     const baseurlEl = document.getElementById("tts-openai-baseurl");
     if (baseurlEl && tts?.openaiTtsBaseURL) baseurlEl.value = tts.openaiTtsBaseURL;
     showCredSection(provider);
@@ -1695,11 +2223,21 @@ function initTTSSettings() {
     origSaveBtn.addEventListener("click", () => {
       const ttsBody = { ttsProvider: providerSel.value };
       const voiceId  = voiceSel?.value?.trim();
-      if (voiceId) ttsBody.ttsVoiceId = voiceId;
+      if (voiceId) { ttsBody.ttsVoiceId = voiceId; activeTTSVoiceId = voiceId; }
       const minimaxKey = document.getElementById("tts-minimax-key")?.value?.trim();
       if (minimaxKey) ttsBody.minimaxKey = minimaxKey;
       const doubaoKey = document.getElementById("tts-doubao-key")?.value?.trim();
       if (doubaoKey) ttsBody.doubaoKey = doubaoKey;
+      const doubaoResource = document.getElementById("tts-doubao-resource")?.value?.trim();
+      if (doubaoResource) ttsBody.doubaoResourceId = doubaoResource;
+      const doubaoStyleEl2 = document.getElementById("tts-doubao-style");
+      if (doubaoStyleEl2) ttsBody.doubaoStyle = doubaoStyleEl2.value.trim(); // 空＝清除（回中性）
+      const rateEl2 = document.getElementById("tts-doubao-rate");
+      if (rateEl2) ttsBody.doubaoSpeechRate = rateEl2.value;
+      const doubaoAppId = document.getElementById("tts-doubao-appid")?.value?.trim();
+      if (doubaoAppId) ttsBody.doubaoAppId = doubaoAppId;
+      const doubaoAccessKey = document.getElementById("tts-doubao-access-key")?.value?.trim();
+      if (doubaoAccessKey) ttsBody.doubaoAccessKey = doubaoAccessKey;
       const openaiKey = document.getElementById("tts-openai-key")?.value?.trim();
       if (openaiKey) ttsBody.openaiTtsKey = openaiKey;
       const baseURL = document.getElementById("tts-openai-baseurl")?.value?.trim();
@@ -1716,7 +2254,7 @@ function initTTSSettings() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(ttsBody),
       }).then(() => {
-        ["tts-minimax-key", "tts-doubao-key", "tts-openai-key", "tts-elevenlabs-key", "tts-volcano-token"].forEach(id => {
+        ["tts-minimax-key", "tts-doubao-key", "tts-doubao-access-key", "tts-openai-key", "tts-elevenlabs-key", "tts-volcano-token"].forEach(id => {
           const el = document.getElementById(id);
           if (el) el.value = "";
         });
@@ -1731,11 +2269,21 @@ function initTTSSettings() {
       try {
         const preBody = { ttsProvider: providerSel.value };
         const currentVoice = voiceSel?.value?.trim();
-        if (currentVoice) preBody.ttsVoiceId = currentVoice;
+        if (currentVoice) { preBody.ttsVoiceId = currentVoice; activeTTSVoiceId = currentVoice; }
         const minimaxKey2 = document.getElementById("tts-minimax-key")?.value?.trim();
         if (minimaxKey2) preBody.minimaxKey = minimaxKey2;
         const doubaoKey = document.getElementById("tts-doubao-key")?.value?.trim();
         if (doubaoKey) preBody.doubaoKey = doubaoKey;
+        const doubaoResource = document.getElementById("tts-doubao-resource")?.value?.trim();
+        if (doubaoResource) preBody.doubaoResourceId = doubaoResource;
+        const doubaoStyleEl3 = document.getElementById("tts-doubao-style");
+        if (doubaoStyleEl3) preBody.doubaoStyle = doubaoStyleEl3.value.trim();
+        const rateEl3 = document.getElementById("tts-doubao-rate");
+        if (rateEl3) preBody.doubaoSpeechRate = rateEl3.value;
+        const doubaoAppId = document.getElementById("tts-doubao-appid")?.value?.trim();
+        if (doubaoAppId) preBody.doubaoAppId = doubaoAppId;
+        const doubaoAccessKey = document.getElementById("tts-doubao-access-key")?.value?.trim();
+        if (doubaoAccessKey) preBody.doubaoAccessKey = doubaoAccessKey;
         const openaiKey = document.getElementById("tts-openai-key")?.value?.trim();
         if (openaiKey) preBody.openaiTtsKey = openaiKey;
         const elevenKey = document.getElementById("tts-elevenlabs-key")?.value?.trim();
@@ -1768,6 +2316,7 @@ function initTTSSettings() {
         }
         const ttsUrl = URL.createObjectURL(ttsBlob);
         const ttsAudio = new Audio(ttsUrl);
+        attachJarvisFx(ttsAudio, voiceSel?.value || activeTTSVoiceId); // 试听按当前选中音色的开关决定是否叠加
         ttsAudio.onended = () => { URL.revokeObjectURL(ttsUrl); if (testStatus) testStatus.textContent = ""; };
         ttsAudio.onerror = () => { URL.revokeObjectURL(ttsUrl); if (testStatus) testStatus.textContent = "播放失败"; };
         await ttsAudio.play();
@@ -1965,6 +2514,8 @@ function initTTSSettings() {
         }
       };
       setStatus("websearch-status-serper",  !!webSearch?.serperConfigured, !!webSearch?.serperFromEnv);
+      setStatus("websearch-status-brave",   !!webSearch?.braveConfigured,  !!webSearch?.braveFromEnv);
+      setStatus("websearch-status-tavily",  !!webSearch?.tavilyConfigured, !!webSearch?.tavilyFromEnv);
       setStatus("websearch-status-jina",    !!webSearch?.jinaConfigured,   !!webSearch?.jinaFromEnv);
       const searxngConfigured = !!webSearch?.searxngUrl || !!webSearch?.searxngFromEnv;
       setStatus("websearch-status-searxng", searxngConfigured, !!webSearch?.searxngFromEnv, webSearch?.effectiveSearxngUrl || "");
@@ -1977,12 +2528,18 @@ function initTTSSettings() {
     saveWebSearchBtn.addEventListener("click", async () => {
       const updates = {};
       const serperEl  = document.getElementById("websearch-serper-key");
+      const braveEl   = document.getElementById("websearch-brave-key");
+      const tavilyEl  = document.getElementById("websearch-tavily-key");
       const jinaEl    = document.getElementById("websearch-jina-key");
       const searxngEl = document.getElementById("websearch-searxng-url");
       const serperVal  = serperEl?.value?.trim();
+      const braveVal   = braveEl?.value?.trim();
+      const tavilyVal  = tavilyEl?.value?.trim();
       const jinaVal    = jinaEl?.value?.trim();
       const searxngVal = searxngEl?.value?.trim();
       if (serperVal)  updates.serperKey  = serperVal;
+      if (braveVal)   updates.braveKey   = braveVal;
+      if (tavilyVal)  updates.tavilyKey  = tavilyVal;
       if (jinaVal)    updates.jinaKey    = jinaVal;
       // SearXNG URL：空字符串也要传，让用户能清掉
       if (searxngEl)  updates.searxngUrl = searxngVal || "";
@@ -1997,6 +2554,8 @@ function initTTSSettings() {
         if (data.ok) {
           showFeedback(webSearchFeedback, "已保存");
           if (serperEl) serperEl.value = "";
+          if (braveEl)  braveEl.value = "";
+          if (tavilyEl) tavilyEl.value = "";
           if (jinaEl)   jinaEl.value = "";
           loadWebSearchSettings();
         } else {
@@ -2118,16 +2677,65 @@ function initTTSSettings() {
   const VOICE_PROVIDER_KEY   = "littleprinceagent-voice-provider";
 
   function applyVoiceProviderUI(provider) {
-    const panels = { aliyun: "voice-cred-aliyun", tencent: "voice-cred-tencent", xunfei: "voice-cred-xunfei" };
+    const panels = {
+      aliyun: "voice-cred-aliyun",
+      volcengine: "voice-cred-volcengine",
+      tencent: "voice-cred-tencent",
+      xunfei: "voice-cred-xunfei",
+    };
     for (const [key, id] of Object.entries(panels)) {
       const el = document.getElementById(id);
       if (el) el.style.display = key === provider ? "" : "none";
     }
   }
 
+  function detectVoiceProviderFromKey(key) {
+    const value = (key || "").trim();
+    if (!value) return null;
+    if (/^sk-[A-Za-z0-9_\-.]{20,}$/.test(value)) {
+      return { provider: "aliyun", label: "阿里云 ASR", fieldId: "voice-aliyun-key" };
+    }
+    if (/^AKID/i.test(value)) {
+      return { provider: "tencent", label: "腾讯云 ASR", fieldId: "voice-tencent-sid" };
+    }
+    if (/^\d{6,10}$/.test(value)) {
+      return { provider: "xunfei", label: "科大讯飞", fieldId: "voice-xunfei-appid" };
+    }
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+      return {
+        provider: "volcengine",
+        label: "火山豆包 ASR",
+        fieldId: "voice-volc-apikey",
+        defaults: { "voice-volc-resourceid": "volc.bigasr.sauc.duration" },
+      };
+    }
+    return null;
+  }
+
   const voiceProviderSelect = document.getElementById("voice-provider-select");
   if (voiceProviderSelect) {
     voiceProviderSelect.addEventListener("change", () => applyVoiceProviderUI(voiceProviderSelect.value));
+  }
+
+  const voiceAutoKey = document.getElementById("voice-auto-key");
+  const voiceAutoDetect = document.getElementById("voice-auto-detect");
+  if (voiceAutoKey) {
+    voiceAutoKey.addEventListener("input", () => {
+      const detected = detectVoiceProviderFromKey(voiceAutoKey.value);
+      if (!detected) {
+        if (voiceAutoDetect) voiceAutoDetect.textContent = voiceAutoKey.value.trim() ? "未识别" : "";
+        return;
+      }
+      if (voiceProviderSelect) voiceProviderSelect.value = detected.provider;
+      applyVoiceProviderUI(detected.provider);
+      const target = document.getElementById(detected.fieldId);
+      if (target) target.value = voiceAutoKey.value.trim();
+      for (const [id, value] of Object.entries(detected.defaults || {})) {
+        const el = document.getElementById(id);
+        if (el && !el.value.trim()) el.value = value;
+      }
+      if (voiceAutoDetect) voiceAutoDetect.textContent = detected.label;
+    });
   }
 
   async function loadVoiceSettings() {
@@ -2141,7 +2749,15 @@ function initTTSSettings() {
     if (voiceThreshSlider) voiceThreshSlider.value = String(savedThresh);
     if (voiceThreshVal)    voiceThreshVal.textContent = savedThresh.toFixed(3);
 
-    const savedProvider = localStorage.getItem(VOICE_PROVIDER_KEY) || "aliyun";
+    let savedProvider = localStorage.getItem(VOICE_PROVIDER_KEY) || "aliyun";
+    try {
+      const resp = await fetch("http://127.0.0.1:3721/settings/voice");
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok && data?.voice?.voiceProvider) {
+        savedProvider = data.voice.voiceProvider;
+        localStorage.setItem(VOICE_PROVIDER_KEY, savedProvider);
+      }
+    } catch {}
     if (voiceProviderSelect) voiceProviderSelect.value = savedProvider;
     applyVoiceProviderUI(savedProvider);
   }
@@ -2169,7 +2785,7 @@ function initTTSSettings() {
 
       window.dispatchEvent(new CustomEvent("littleprinceagent:voice-threshold", { detail: { threshold } }));
 
-      const body = {};
+      const body = { voiceProvider: provider };
       const aliyunKey = document.getElementById("voice-aliyun-key")?.value?.trim();
       if (aliyunKey) body.aliyunApiKey = aliyunKey;
       const tencentSid = document.getElementById("voice-tencent-sid")?.value?.trim();
@@ -2182,6 +2798,14 @@ function initTTSSettings() {
       if (xunfeiAppid) body.xunfeiAppId = xunfeiAppid;
       const xunfeiApikey = document.getElementById("voice-xunfei-apikey")?.value?.trim();
       if (xunfeiApikey) body.xunfeiApiKey = xunfeiApikey;
+      const volcApiKey = document.getElementById("voice-volc-apikey")?.value?.trim();
+      if (volcApiKey) body.volcAsrApiKey = volcApiKey;
+      const volcResourceId = document.getElementById("voice-volc-resourceid")?.value?.trim();
+      if (volcResourceId) body.volcAsrResourceId = volcResourceId;
+      const volcAppKey = document.getElementById("voice-volc-appkey")?.value?.trim();
+      if (volcAppKey) body.volcAsrAppKey = volcAppKey;
+      const volcAccessKey = document.getElementById("voice-volc-accesskey")?.value?.trim();
+      if (volcAccessKey) body.volcAsrAccessKey = volcAccessKey;
 
       if (Object.keys(body).length > 0) {
         try {
@@ -2192,10 +2816,20 @@ function initTTSSettings() {
             body: JSON.stringify(body),
           });
           if (!resp.ok) throw new Error("保存失败");
-          ["voice-aliyun-key","voice-tencent-sid","voice-tencent-skey","voice-xunfei-apikey"].forEach(id => {
+          [
+            "voice-aliyun-key",
+            "voice-auto-key",
+            "voice-tencent-sid",
+            "voice-tencent-skey",
+            "voice-xunfei-apikey",
+            "voice-volc-apikey",
+            "voice-volc-appkey",
+            "voice-volc-accesskey",
+          ].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.value = "";
           });
+          if (voiceAutoDetect) voiceAutoDetect.textContent = "";
           showFeedback(voiceFeedback, "已保存");
         } catch { showFeedback(voiceFeedback, "保存失败", true); }
         finally { saveVoiceBtn.disabled = false; }
@@ -2243,6 +2877,9 @@ function initTTSSettings() {
     if (llmKeyInput) llmKeyInput.value = "";
     if (minimaxKeyInput) minimaxKeyInput.value = "";
   }
+
+  // 暴露给 chat.js 的斜杠命令使用
+  openSettingsRef = openSettings;
 
   settingsBtn.addEventListener("click", () => openSettings());
   closeBtn.addEventListener("click", closeSettings);
@@ -3266,4 +3903,225 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
       toggleHotspot();
     }
   });
+})();
+
+
+// ── AI 视频生成模式（Seedance · 生成工作台）──
+// 三段式：生成栏(多任务队列) + 播放区 + 输入区。全程由 aivideo_mode SSE 事件驱动。
+(function initAIVideoMode(){
+  var el = function(id){ return document.getElementById(id); };
+  var panel = el("aivideo-panel");
+  if (!panel) return;
+  var queueEl=el("aivideo-queue"), stage=el("aivideo-stage"), stageEmpty=el("aivideo-stage-empty"),
+      feed=el("aivideo-feed"), dlBtn=el("aivideo-dl"), playerMeta=el("aivideo-player-meta"),
+      dropzone=el("aivideo-dropzone"), modeTag=el("aivideo-modetag"), modeHint=el("aivideo-modehint"),
+      promptInput=el("aivideo-prompt-input"), ratioSel=el("aivideo-ratio"), resSel=el("aivideo-resolution"),
+      durSel=el("aivideo-duration"), submitBtn=el("aivideo-submit"), composeErr=el("aivideo-compose-err"),
+      fileInput=el("aivideo-file-input"), newBtn=el("aivideo-new-btn"), exitBtn=el("aivideo-exit-btn");
+
+  var active=false, jobs=[], selId=null, images=[], submitting=false;
+
+  var toastEl=document.createElement("div"); toastEl.className="aivideo-toast"; document.body.appendChild(toastEl);
+  var toastTimer=null;
+  function showToast(html){ toastEl.innerHTML=html; toastEl.classList.add("show"); clearTimeout(toastTimer); toastTimer=setTimeout(function(){ toastEl.classList.remove("show"); },3200); }
+
+  function mediaUrl(u){ var s=String(u||""); if(!s) return ""; return s.charAt(0)==="/" ? (API+s) : s; }
+  function modeLabel(m){ return m==="flf"?"首尾帧":(m==="image"?"图生视频":"文生视频"); }
+  function jobById(id){ for(var i=0;i<jobs.length;i++){ if(jobs[i].id===id) return jobs[i]; } return null; }
+
+  // —— 感知同步：把「面板开关 + 提示词草稿」实时回传后端，让 agent 能直接看到用户在框里写了什么 ——
+  var draftTimer=null, lastDraftSent=null;
+  function syncDraft(immediate){
+    clearTimeout(draftTimer);
+    var doSync=function(){
+      var payload=JSON.stringify({ open:active, prompt:(promptInput.value||"") });
+      if(payload===lastDraftSent) return;            // 没变化就不发，省流量
+      lastDraftSent=payload;
+      try{ fetch(API+"/aivideo/draft",{method:"POST",headers:{"Content-Type":"application/json"},body:payload}).catch(function(){}); }catch(e){}
+    };
+    if(immediate) doSync(); else draftTimer=setTimeout(doSync,400);
+  }
+
+  function setActive(on){
+    active=!!on; document.body.classList.toggle("aivideo-mode", active);
+    if(active){ try{ window.littleprinceagentMedia&&window.littleprinceagentMedia.controlVideo&&window.littleprinceagentMedia.controlVideo({action:"pause"}); }catch(e){} document.body.classList.remove("video-mode"); }
+    syncDraft(true);   // 开/关状态立即同步
+  }
+
+  // —— 生成栏 ——
+  function renderQueue(){
+    queueEl.innerHTML="";
+    if(!jobs.length){ var em=document.createElement("div"); em.className="aivideo-queue-empty"; em.textContent="还没有生成任务"; queueEl.appendChild(em); return; }
+    jobs.forEach(function(j){
+      var t=document.createElement("div");
+      t.className="av-tile "+(j.status==="gen"?"gen":j.status==="fail"?"fail":"")+(j.id===selId?" sel":"");
+      var fr=document.createElement("div"); fr.className="frame";
+      if(j.status==="done"){
+        var v=document.createElement("video"); v.className="thumb"; v.src=mediaUrl(j.videoUrl); v.muted=true; v.playsInline=true; v.preload="metadata"; fr.appendChild(v);
+        var pl=document.createElement("div"); pl.className="play"; pl.textContent="▶"; fr.appendChild(pl);
+        if(j.dur){ var d=document.createElement("div"); d.className="dur"; d.textContent=j.dur+"s"; fr.appendChild(d); }
+      } else if(j.status==="gen"){
+        var orb=document.createElement("div"); orb.className="av-orb"; orb.innerHTML="<i></i><i></i>"; fr.appendChild(orb);
+        var gb=document.createElement("div"); gb.className="genbadge"; gb.textContent="生成中"; fr.appendChild(gb);
+        var gt=document.createElement("div"); gt.className="gentime"; gt.dataset.start=String(j.start||Date.now()); gt.textContent="0:00"; fr.appendChild(gt);
+      } else {
+        var x=document.createElement("div"); x.className="x"; x.textContent="!"; fr.appendChild(x);
+      }
+      if(j.status!=="gen"){ var rm=document.createElement("button"); rm.className="rm"; rm.textContent="×"; rm.onclick=function(e){ e.stopPropagation(); removeJob(j.id); }; fr.appendChild(rm); }
+      t.appendChild(fr);
+      var lb=document.createElement("div"); lb.className="label";
+      lb.textContent = j.status==="fail" ? ("失败 · "+(j.error||"")) : (j.prompt || modeLabel(j.mode));
+      t.appendChild(lb);
+      t.onclick=function(){ if(j.status==="done") loadPlayer(j); };
+      queueEl.appendChild(t);
+    });
+  }
+  function tickTimers(){ var now=Date.now(); var list=queueEl.querySelectorAll(".gentime"); for(var i=0;i<list.length;i++){ var s=Math.floor((now-Number(list[i].dataset.start))/1000); if(s<0)s=0; list[i].textContent=Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); } }
+  setInterval(tickTimers,500);
+  function removeJob(id){ jobs=jobs.filter(function(j){ return j.id!==id; }); if(selId===id){ selId=null; clearPlayer(); } renderQueue(); }
+
+  // —— 重建历史：从后端拉已完成视频（newest-first），合并进 jobs。 ——
+  // 修复「面板关闭重开 / app 重启后队列空了」：jobs[] 原本纯内存，重载即丢，
+  // 而视频其实还在磁盘。这里按 id 去重，不覆盖本会话进行中的瓦片。
+  function hydrateHistory(){
+    fetch(API+"/aivideo/history").then(function(r){ return r.json(); }).then(function(d){
+      if(!d||!d.ok||!Array.isArray(d.jobs)) return;
+      var changed=false;
+      d.jobs.forEach(function(h){
+        if(!h||!h.id) return;
+        var ex=jobById(h.id);
+        if(ex){
+          if(ex.status!=="done"&&h.videoUrl){ ex.status="done"; ex.videoUrl=h.videoUrl; ex.mode=ex.mode||h.mode; ex.prompt=ex.prompt||h.prompt; ex.res=ex.res||h.res; ex.ratio=ex.ratio||h.ratio; ex.dur=ex.dur||h.dur; changed=true; }
+          return;
+        }
+        jobs.push({ id:h.id, status:"done", videoUrl:h.videoUrl, mode:h.mode, prompt:h.prompt, res:h.res, ratio:h.ratio, dur:h.dur });
+        changed=true;
+      });
+      if(changed) renderQueue();
+    }).catch(function(){});
+  }
+
+  // —— 播放区 ——
+  function clearPlayer(){ try{ feed.pause(); }catch(e){} feed.removeAttribute("src"); if(feed.load) feed.load(); feed.hidden=true; dlBtn.hidden=true; stageEmpty.hidden=false; if(stage) stage.classList.add("is-empty"); playerMeta.textContent=""; }
+  function loadPlayer(j){
+    selId=j.id; feed.src=mediaUrl(j.videoUrl); feed.hidden=false; feed.muted=false; dlBtn.hidden=false; stageEmpty.hidden=true; if(stage) stage.classList.remove("is-empty");
+    playerMeta.innerHTML="<b>"+modeLabel(j.mode)+"</b>"+(j.res?" · "+j.res:"")+(j.ratio?" · "+j.ratio:"")+(j.dur?" · "+j.dur+"s":"");
+    if(feed.play) feed.play().catch(function(){}); renderQueue();
+  }
+  function download(){
+    if(!selId) return; dlBtn.disabled=true; var old=dlBtn.textContent; dlBtn.textContent="保存中…";
+    fetch(API+"/aivideo/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jobId:selId})})
+      .then(function(r){ return r.json(); })
+      .then(function(d){ if(d&&d.ok){ showToast('已保存到　<span class="mono">'+(d.path||"")+'</span>'); } else { showToast('保存失败：'+((d&&d.error)||"未知错误")); } })
+      .catch(function(e){ showToast('保存失败：'+e.message); })
+      .then(function(){ dlBtn.disabled=false; dlBtn.textContent=old; });
+  }
+  dlBtn.addEventListener("click", download);
+
+  // —— 输入区：加图（点击/拖拽/粘贴，最多 2 张）——
+  function renderDropzone(){
+    dropzone.innerHTML="";
+    images.forEach(function(src,i){
+      var cell=document.createElement("div"); cell.className="av-imgcell";
+      var im=document.createElement("img"); im.src=src; cell.appendChild(im);
+      var r=document.createElement("div"); r.className="role"; r.textContent=images.length===2?(i===0?"首帧":"尾帧"):"参考图"; cell.appendChild(r);
+      var rm=document.createElement("button"); rm.className="rm"; rm.textContent="×"; rm.onclick=function(e){ e.stopPropagation(); images.splice(i,1); renderDropzone(); updateMode(); }; cell.appendChild(rm);
+      dropzone.appendChild(cell);
+    });
+    if(images.length<2){ var add=document.createElement("div"); add.className="av-addcell"; add.innerHTML='<span class="plus">+</span><span>图片</span><small>点击/拖拽/粘贴</small>'; add.onclick=function(){ fileInput.click(); }; dropzone.appendChild(add); }
+  }
+  var hadImages=false;
+  function updateMode(){
+    var m=images.length>=2?"flf":(images.length===1?"image":"text");
+    // 进入图生/首尾帧默认「适配图片」(输出比例跟随上传图)；退回文生时恢复 16:9。仅在边界切换，尊重用户在同一模式内的手动选择
+    if(images.length>0 && !hadImages){ ratioSel.value="adaptive"; }
+    else if(images.length===0 && hadImages && ratioSel.value==="adaptive"){ ratioSel.value="16:9"; }
+    hadImages=images.length>0;
+    modeTag.textContent=modeLabel(m); modeTag.classList.toggle("flf", m==="flf");
+    modeHint.textContent = m==="text" ? "不加图 = 文生视频 · 1 张 = 图生视频 · 2 张 = 首尾帧"
+      : m==="image" ? "已加 1 张参考图 → 图生视频（比例已设为「适配图片」）"
+      : "已加 2 张 → 首尾帧：第 1 张为「首帧」，第 2 张为「尾帧」";
+  }
+  function addImage(src){ if(images.length>=2) return; images.push(src); renderDropzone(); updateMode(); }
+  fileInput.addEventListener("change", function(e){ var f=e.target.files&&e.target.files[0]; if(f){ var rd=new FileReader(); rd.onload=function(){ addImage(String(rd.result||"")); }; rd.readAsDataURL(f); } e.target.value=""; });
+  ["dragenter","dragover"].forEach(function(ev){ dropzone.addEventListener(ev,function(e){ e.preventDefault(); dropzone.classList.add("dragover"); }); });
+  ["dragleave","drop"].forEach(function(ev){ dropzone.addEventListener(ev,function(e){ e.preventDefault(); dropzone.classList.remove("dragover"); }); });
+  dropzone.addEventListener("drop", function(e){ var f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0]; if(f&&f.type.indexOf("image/")===0){ var rd=new FileReader(); rd.onload=function(){ addImage(String(rd.result||"")); }; rd.readAsDataURL(f); } });
+  document.addEventListener("paste", function(e){
+    if(!active) return; var cd=e.clipboardData||window.clipboardData; var items=cd&&cd.items; if(!items) return;
+    for(var i=0;i<items.length;i++){ if(items[i].type.indexOf("image")===0){ var blob=items[i].getAsFile(); var rd=new FileReader(); rd.onload=function(){ addImage(String(rd.result||"")); }; rd.readAsDataURL(blob); e.preventDefault(); break; } }
+  });
+
+  var PROMPT_MIN=46, PROMPT_MAX=160;
+  function autoGrow(){
+    if(!promptInput.clientWidth){ promptInput.style.height=""; return; } // 面板隐藏(宽0)时测量会拿到错误的 scrollHeight，跳过，交给 CSS min-height
+    promptInput.style.height="auto";
+    var b=promptInput.offsetHeight-promptInput.clientHeight;
+    promptInput.style.height=Math.min(PROMPT_MAX, Math.max(PROMPT_MIN, promptInput.scrollHeight+b))+"px";
+  }
+  promptInput.addEventListener("input", function(){ autoGrow(); syncDraft(); });
+
+  // —— 提交生成 ——
+  function submitGenerate(){
+    if(submitting) return;
+    var prompt=(promptInput.value||"").trim();
+    if(!prompt && images.length===0){ composeErr.textContent="请至少输入一段画面描述（或加一张参考图）"; composeErr.hidden=false; return; }
+    composeErr.hidden=true; submitting=true; submitBtn.disabled=true; submitBtn.textContent="提交中…";
+    fetch(API+"/aivideo/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ prompt:prompt, images:images.slice(0,2), ratio:ratioSel.value, resolution:resSel.value, duration:Number(durSel.value)||5 })})
+      .then(function(r){ return r.json().then(function(d){ return {ok:r.ok,d:d}; }); })
+      .then(function(res){
+        submitting=false; submitBtn.disabled=false; submitBtn.textContent="生成";
+        if(!res.ok || !res.d || !res.d.ok){ var d=res.d||{}; composeErr.textContent=d.guide||d.error||"提交失败"; composeErr.hidden=false; return; }
+        promptInput.value=""; autoGrow(); images=[]; renderDropzone(); updateMode(); syncDraft(true);
+      })
+      .catch(function(e){ submitting=false; submitBtn.disabled=false; submitBtn.textContent="生成"; composeErr.textContent="网络错误："+e.message; composeErr.hidden=false; });
+  }
+  submitBtn.addEventListener("click", submitGenerate);
+  promptInput.addEventListener("keydown", function(e){ if((e.ctrlKey||e.metaKey)&&e.key==="Enter"){ e.preventDefault(); submitGenerate(); } });
+
+  // —— 打开/关闭 ——
+  function openPanel(configured){
+    setActive(true);
+    hydrateHistory();   // 每次打开都拉一次历史，重建之前生成的视频队列
+    if(configured===false){ composeErr.textContent="尚未配置火山方舟（Seedance）API Key —— 把 key 发给小王子即可（例如「火山视频 你的APIKey」），配置后就能在这里生成。"; composeErr.hidden=false; }
+    else composeErr.hidden=true;
+    setTimeout(function(){ try{ promptInput.focus(); }catch(e){} },60);
+  }
+  function closePanel(){ setActive(false); try{ feed.pause(); }catch(e){} }
+  newBtn.addEventListener("click", function(){ images=[]; renderDropzone(); updateMode(); promptInput.value=""; autoGrow(); composeErr.hidden=true; syncDraft(true); try{ promptInput.focus(); }catch(e){} });
+  exitBtn.addEventListener("click", closePanel);
+  window.addEventListener("keydown", function(e){ if(!active) return; if(e.key==="Escape"){ if(document.activeElement===promptInput){ promptInput.blur(); return; } e.preventDefault(); closePanel(); } });
+
+  // —— SSE 事件 ——
+  function handle(data){
+    data=data||{}; var action=data.action||"show";
+    if(action==="hide"||action==="close"){ closePanel(); return; }
+    if(action==="open"){ openPanel(data.configured); return; }
+    if(action==="set_prompt"){
+      // agent 在用户确认采用后，把优化好的提示词写回输入框（覆盖草稿）
+      if(!active) setActive(true);
+      promptInput.value=String(data.prompt||""); autoGrow(); syncDraft(true);
+      showToast("已采用优化后的提示词，检查后点「生成」即可");
+      try{ promptInput.focus(); }catch(e){}
+      return;
+    }
+    if(action==="show"){
+      setActive(true);
+      var j=jobById(data.jobId);
+      if(!j){ j={ id:data.jobId, status:"gen", start:Date.now() }; jobs.unshift(j); }
+      j.status="gen"; j.prompt=data.prompt||j.prompt||""; j.mode=data.mode||j.mode||"text";
+      j.res=data.resolution||j.res; j.ratio=data.ratio||j.ratio; j.dur=data.duration||j.dur;
+      if(!j.start) j.start=Date.now();
+      renderQueue(); return;
+    }
+    var job=jobById(data.jobId); if(!job) return;
+    if(action==="progress"){ job.status="gen"; return; }
+    if(action==="ready"){ job.status="done"; job.videoUrl=data.videoUrl; renderQueue(); if(!active) setActive(true); loadPlayer(job); return; }
+    if(action==="error"){ job.status="fail"; job.error=data.message||"生成失败"; renderQueue(); return; }
+  }
+  window.addEventListener("littleprinceagent:aivideo", function(e){ handle(e.detail||{}); });
+  window.littleprinceagentAIVideo={ handle:handle, open:openPanel, close:closePanel };
+
+  renderDropzone(); updateMode(); renderQueue(); autoGrow();
+  hydrateHistory();   // 初始化即重建一次（覆盖 app 重启/渲染进程重载后的历史恢复）
 })();

@@ -6,29 +6,30 @@ export const CONFIG_TOPICS = {
     title: '模型配置指南',
     subtitle: 'LLM Provider Configuration',
     icon: '🤖',
-    summary: '配置 AI 大模型服务商及 API Key。首选推荐 DeepSeek（官网 deepseek.com）。同时支持 MiniMax、通义千问、Moonshot、智谱、OpenAI 及自定义端点。',
+    summary: '配置 AI 大模型服务商及 API Key。首选推荐 DeepSeek（官网 deepseek.com）。同时支持 MiniMax、通义千问、Moonshot、智谱、OpenAI、小米 MiMo 及自定义端点。',
     sections: [
       {
         title: '支持的服务商总览',
         content: `当前支持以下 LLM 服务商（配置入口：⚙ → 模型设置）：
 
-■ DeepSeek — deepseek-v4-flash（默认）、deepseek-v4-pro
+■ DeepSeek — deepseek-v4-pro（默认）、deepseek-v4-flash
 ■ MiniMax — MiniMax-M2.7、MiniMax-M1（同时提供 TTS）
 ■ 通义千问（Qwen）— qwen-turbo、qwen-plus
 ■ Moonshot（月之暗面）— moonshot-v1-8k、moonshot-v1-32k
 ■ 智谱 AI（Zhipu）— glm-4-flash、glm-4-plus
 ■ OpenAI — gpt-4o-mini、gpt-4o
+■ 小米 MiMo — mimo-v2.5（默认）、mimo-v2.5-pro、mimo-v2-flash
 ■ 自定义端点 — 兼容 OpenAI 格式的任意服务
 
 只需填入 API Key，系统会自动识别服务商（Auto 模式）。`,
       },
       {
         title: 'DeepSeek 配置（首选推荐）',
-        content: `小王子 Agent 首选大模型，国产高性能、性价比出色、中文效果好。
+        content: `小王子 Agent首选大模型，国产高性能、性价比出色、中文效果好。
 
 ■ 官网：https://deepseek.com
 ■ 字段：apiKey（格式：sk-xxxxxxxx）
-■ 默认模型：deepseek-v4-flash
+■ 默认模型：deepseek-v4-pro
 
 申请步骤：
 1. 打开官网 https://deepseek.com 注册/登录
@@ -84,6 +85,22 @@ export const CONFIG_TOPICS = {
 → 默认模型：gpt-4o-mini`,
       },
       {
+        title: '小米 MiMo 配置',
+        content: `小米 MiMo 大模型平台，OpenAI 兼容接口。
+
+■ 官网：https://platform.xiaomimimo.com
+■ 字段：apiKey（在 MiMo 控制台「API Keys」生成）
+■ 默认模型：mimo-v2.5
+■ Base URL：https://api.xiaomimimo.com/v1（系统已内置）
+
+申请步骤：
+1. 打开 https://platform.xiaomimimo.com 注册/登录
+2. 进入「API Keys」→ 创建新 Key
+3. 复制 Key，在模型设置中填写（或直接发给 Agent 自动配置）
+
+文档：https://platform.xiaomimimo.com/docs/zh-CN/welcome`,
+      },
+      {
         title: '自定义端点配置',
         content: `兼容 OpenAI 格式的任意服务（本地 Ollama、中转代理等）。
 
@@ -103,6 +120,7 @@ export const CONFIG_TOPICS = {
       { name: '通义千问', url: 'https://bailian.console.aliyun.com/', free: false, note: 'qwen-turbo/plus' },
       { name: 'Moonshot', url: 'https://platform.moonshot.cn/', free: false, note: 'moonshot-v1-8k/32k' },
       { name: '智谱 AI', url: 'https://open.bigmodel.cn/', free: false, note: 'glm-4-flash/plus' },
+      { name: '小米 MiMo', url: 'https://platform.xiaomimimo.com/', free: false, note: 'mimo-v2.5（默认）、mimo-v2.5-pro' },
     ],
   },
 

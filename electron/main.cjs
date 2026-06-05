@@ -15,7 +15,7 @@ const { pathToFileURL } = require('url')
 const { autoUpdater } = require('electron-updater')
 
 const IS_DEV = !app.isPackaged
-const WINDOWS_APP_USER_MODEL_ID = 'com.359073395.littleprinceagent'
+const WINDOWS_APP_USER_MODEL_ID = 'com.xiaoyuanda.littleprinceagent'
 const USER_DIR = app.getPath('userData')
 const CODE_ROOT = app.getAppPath()
 const RESOURCE_ROOT = CODE_ROOT

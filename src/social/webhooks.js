@@ -55,7 +55,7 @@ async function handleFeishu(req, res) {
     return jsonResponse(res, 200, { challenge: body.challenge })
   }
 
-  if (body.encrypt) return jsonResponse(res, 400, { ok: false, error: 'encrypted Feishu events are not enabled in LittlePrinceAgent yet' })
+  if (body.encrypt) return jsonResponse(res, 400, { ok: false, error: 'encrypted Feishu events are not enabled in 小王子 Agent yet' })
 
   if (body.token !== expectedToken) {
     return jsonResponse(res, 403, { ok: false, error: 'invalid token' })

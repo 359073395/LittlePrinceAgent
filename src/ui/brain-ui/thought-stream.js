@@ -13,6 +13,7 @@ const TOOL_ZH = {
   fetch_url: "抓取网页",
   browser_read: "浏览器读取网页",
   search_memory: "检索记忆",
+  probe_memory: "探测记忆",
   upsert_memory: "写入记忆",
   merge_memories: "合并记忆",
   downgrade_memory: "降级记忆",
@@ -69,6 +70,7 @@ const TOOL_ICON = {
   fetch_url: "🌐",
   browser_read: "🧭",
   search_memory: "🔍",
+  probe_memory: "🩺",
   upsert_memory: "🧠",
   merge_memories: "🧬",
   downgrade_memory: "🌫️",
@@ -135,6 +137,7 @@ export class ThoughtStream {
     this.thinkingEl = null;
     this.lastToolEl = null;
     this.statusEl = null;
+    this.statusTimer = null;
     this.hadToolCall = false;
     this.toolFailed = false;
   }
@@ -200,20 +203,40 @@ export class ThoughtStream {
   }
 
   setStatus(text, kind = "busy") {
+    this.clearStatusTimer();
     if (!this.curLine) this.newLine(this.thinkingLabel);
-    const header = this.curLine.querySelector(".line-header");
-    if (!header) return;
-    if (!this.statusEl || !this.statusEl.parentElement) {
-      this.statusEl = document.createElement("span");
-      this.statusEl.className = "line-status";
-      const timeEl = header.querySelector(".line-time");
-      header.insertBefore(this.statusEl, timeEl || null);
+    if (!this.statusEl) {
+      this.statusEl = document.createElement("div");
     }
     this.statusEl.className = `line-status ${kind}`.trim();
     this.statusEl.textContent = text;
+    // 始终把状态条移到行末（最新工具的下方），避免被堆叠的工具顶出视口
+    this.curLine.appendChild(this.statusEl);
+    this.scrollToLatest();
+  }
+
+  setTimedStatus(text, kind = "busy", options = {}) {
+    this.setStatus(text, kind);
+    const staleAfterMs = Number(options.staleAfterMs || 0);
+    if (!staleAfterMs) return;
+    const statusEl = this.statusEl;
+    const staleText = options.staleText || text;
+    this.statusTimer = setTimeout(() => {
+      if (!statusEl || statusEl !== this.statusEl || !statusEl.parentElement) return;
+      statusEl.className = "line-status stale";
+      statusEl.textContent = staleText;
+    }, staleAfterMs);
+  }
+
+  clearStatusTimer() {
+    if (this.statusTimer) {
+      clearTimeout(this.statusTimer);
+      this.statusTimer = null;
+    }
   }
 
   clearStatus() {
+    this.clearStatusTimer();
     if (this.statusEl && this.statusEl.parentElement) {
       this.statusEl.remove();
     }
@@ -581,6 +604,7 @@ export class ThoughtStream {
   }
 
   finalizeLastTool() {
+    this.clearStatusTimer();
     if (this.lastToolEl) {
       this.lastToolEl.classList.add("done");
       this.lastToolEl = null;
@@ -641,15 +665,31 @@ export class ThoughtStream {
     }
 
     toolEl.appendChild(statusSpan);
-    this.curLine.appendChild(toolEl);
+
+    // 展开按钮：始终占一列保证图标对齐，仅当本行有 detail 时填充 ▸ 并可点击。
+    // 默认折叠——工具行只展示"大概"（图标+名称+对象+状态），点击整行展开 detail，
+    // ▸ 旋转成 ▾（向下）。再点收起。
+    const chevron = document.createElement("span");
+    chevron.className = "tool-chevron";
+    toolEl.insertBefore(chevron, toolEl.firstChild);
 
     const detailText = this.formatToolDetail(name, args, resultStr);
+    let detail = null;
     if (detailText) {
-      const detail = document.createElement("div");
-      detail.className = "line-tool-detail";
+      chevron.textContent = "▸";
+      toolEl.classList.add("expandable");
+      detail = document.createElement("div");
+      detail.className = "line-tool-detail collapsed";
       detail.textContent = detailText;
-      this.curLine.appendChild(detail);
+      toolEl.addEventListener("click", () => {
+        const open = toolEl.classList.toggle("expanded");
+        detail.classList.toggle("collapsed", !open);
+        if (open) this.scrollToLatest();
+      });
     }
+
+    this.curLine.appendChild(toolEl);
+    if (detail) this.curLine.appendChild(detail);
 
     this.scrollToLatest();
     this.lastToolEl = null;
@@ -675,6 +715,11 @@ export class ThoughtStream {
     statusSpan.className = `tool-status ${statusCls}`;
     statusSpan.textContent = this.toolFailed ? "已结束" : "完成";
 
+    // 空 chevron 占位，让收尾行与上面的工具行图标对齐（本行不可展开）。
+    const chevron = document.createElement("span");
+    chevron.className = "tool-chevron";
+
+    toolEl.appendChild(chevron);
     toolEl.appendChild(iconSpan);
     toolEl.appendChild(nameSpan);
     toolEl.appendChild(statusSpan);
@@ -708,4 +753,3 @@ export class ThoughtStream {
     this.lastToolEl = null;
   }
 }
-

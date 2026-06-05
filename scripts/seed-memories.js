@@ -1,5 +1,5 @@
 // 种子记忆：新 Agent 启动时预置的系统知识
-// 来源：从小王子 Agent 实际积累的记忆中提炼，经过验证的正确理解
+// 来源：从 小王子 Agent 实际积累的记忆中提炼，经过验证的正确理解
 import { getDB, insertMemory } from '../src/db.js'
 import { nowTimestamp } from '../src/time.js'
 import { pathToFileURL } from 'url'
@@ -113,7 +113,7 @@ const SEED_MEMORIES = [
     id: 'tool_send_message',
     type: 'knowledge',
     title: 'send_message：发消息',
-    content: '向已知 ID 发送消息。参数：target_id（接收者 ID，如 ID:xx）、content（消息内容）。只向已知 ID 发送，不猜测或构造 ID。有消息需要回复时，send_message 必须是第一个工具调用。',
+    content: '向已知 ID 发送消息。参数：target_id（接收者 ID，如 ID:xx）、content（消息内容）。只向已知 ID 发送，不猜测或构造 ID。是否要调它取决于本轮渠道：本地渠道（语音/语音识别/本地 TUI，即消息头没有「· 渠道」标记）直接输出纯文本就是回复，文本会被直接送达并在语音下朗读，不需要也不应该调 send_message——多调一次会让回复变慢；只有社交渠道（消息头带「· WECHAT/DISCORD/FEISHU/WECOM」）才必须调 send_message 才能把回复送出本机。社交渠道下 send_message 是回复用户的第一个工具调用。',
     parent_id: 'tools_system',
     children_ids: [],
     links: [

@@ -4,7 +4,7 @@ import { createDocPanel } from './doc-panel.js';
 
 const createGraphStage = () => `
 <div class="grid-overlay"></div>
-<svg id="graph" aria-label="小王子 记忆节点图"></svg>
+<svg id="graph" aria-label="小王子 Agent 记忆节点图"></svg>
 `;
 
 const createPrimaryPanel = () => `
@@ -13,7 +13,7 @@ const createPrimaryPanel = () => `
     <div class="brand-mark"></div>
     <div class="brand-copy">
       <div class="eyebrow">认知界面</div>
-      <div class="brand-title" id="agent-brand-name">小王子 Agent</div>
+      <div class="brand-title" id="agent-brand-name">小王子 Agent AI Agent</div>
     </div>
     <button class="voice-btn" id="voice-btn" title="麦克风 开/关" type="button">🎤</button>
     <button class="video-btn" id="video-btn" title="视频模式 (V)" type="button" hidden>⊞</button>
@@ -27,6 +27,14 @@ const createPrimaryPanel = () => `
       <!-- <div class="stream-subtitle">user message · react</div> -->
     </div>
     <span class="pill" id="pill-l1">实时</span>
+  </div>
+
+  <!-- AI 当前正在做什么：纯派生展示，从 tool_call 事件流自动归类，AI 不需要做任何额外动作。
+       北极星：通信问题靠界面侧派生可视化解决，不逼 AI 学人开口。 -->
+  <div class="ai-activity" id="ai-activity">
+    <span class="ai-activity-dot" id="ai-activity-dot"></span>
+    <span class="ai-activity-label" id="ai-activity-label">空闲</span>
+    <span class="ai-activity-detail" id="ai-activity-detail"></span>
   </div>
 
   ${createVoicePanel()}
@@ -94,6 +102,14 @@ const createSecondaryPanel = () => `
       <span class="stat-label">tok/s</span>
       <div class="stat-value" id="tok-rate">—</div>
     </div>
+    <div class="stat" id="mem-recall-stat" title="近 1 小时记忆召回次数 / 平均拉取条数。点击查看明细">
+      <span class="stat-label">召回/h</span>
+      <div class="stat-value" id="mem-recall-rate">—</div>
+    </div>
+    <div class="stat" id="mem-extract-stat" title="近 1 小时记忆抽取次数 / 平均写入条数。点击查看明细">
+      <span class="stat-label">抽取/h</span>
+      <div class="stat-value" id="mem-extract-rate">—</div>
+    </div>
   </header>
 
   <!-- 专注帧 UI 已隐藏（后端 focus stack 仍在工作，给 LLM 注入上下文）。
@@ -119,8 +135,9 @@ const createConsole = () => `
     <div id="chat-messages"></div>
   </div>
   <div id="input-row">
+    <div id="slash-menu" class="slash-menu" role="listbox" aria-label="命令" hidden></div>
     <span class="prompt-mark">▸</span>
-    <input id="msg-input" type="text" placeholder="向 小王子 发送消息…" autocomplete="off">
+    <input id="msg-input" type="text" placeholder="向 小王子 Agent 发送消息…（输入 / 调出命令）" autocomplete="off">
     <button id="send-btn" type="button">发送</button>
   </div>
 </section>
@@ -200,6 +217,7 @@ const createSettingsModal = () => `
                 <option value="auto">自动识别</option>
                 <option value="deepseek">DeepSeek</option>
                 <option value="minimax">MiniMax</option>
+                <option value="mimo">小米 MiMo</option>
                 <option value="custom">自定义端点（本地/其他）</option>
               </select>
             </div>
@@ -345,9 +363,15 @@ const createSettingsModal = () => `
           <div class="settings-section">
             <div class="settings-section-label">云端模式配置</div>
             <div class="settings-row">
+              <label class="settings-label" for="voice-auto-key">粘贴 Key 自动识别厂商</label>
+              <input class="settings-input" type="password" id="voice-auto-key" placeholder="阿里云 / 腾讯云 / 讯飞 / 火山豆包 ASR Key">
+              <span id="voice-auto-detect" style="color:var(--cool);font-size:12px;min-width:86px;text-align:right;"></span>
+            </div>
+            <div class="settings-row">
               <label class="settings-label" for="voice-provider-select">服务商</label>
               <select class="settings-select" id="voice-provider-select">
                 <option value="aliyun">阿里云百炼（推荐）</option>
+                <option value="volcengine">火山引擎豆包 ASR</option>
                 <option value="tencent">腾讯云 ASR</option>
                 <option value="xunfei">科大讯飞 RTASR</option>
               </select>
@@ -370,6 +394,24 @@ const createSettingsModal = () => `
               <div class="settings-row">
                 <label class="settings-label" for="voice-tencent-appid">AppId</label>
                 <input class="settings-input" type="text" id="voice-tencent-appid" placeholder="腾讯云 AppId">
+              </div>
+            </div>
+            <div id="voice-cred-volcengine" style="display:none;">
+              <div class="settings-row">
+                <label class="settings-label" for="voice-volc-apikey">API Key（新版）</label>
+                <input class="settings-input" type="password" id="voice-volc-apikey" placeholder="留空则不修改">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="voice-volc-resourceid">Resource ID</label>
+                <input class="settings-input" type="text" id="voice-volc-resourceid" placeholder="volc.bigasr.sauc.duration">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="voice-volc-appkey">App Key（旧版）</label>
+                <input class="settings-input" type="password" id="voice-volc-appkey" placeholder="旧版控制台可填">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="voice-volc-accesskey">Access Key（旧版）</label>
+                <input class="settings-input" type="password" id="voice-volc-accesskey" placeholder="旧版控制台可填">
               </div>
             </div>
             <div id="voice-cred-xunfei" style="display:none;">
@@ -413,7 +455,7 @@ const createSettingsModal = () => `
             </div>
           </div>
 
-          <div class="settings-section">
+          <div class="settings-section" id="settings-tts-section">
             <div class="settings-section-label">语音合成（TTS）</div>
             <p class="settings-hint">用语音发消息时，Agent 回复会自动转为语音播放。首选推荐豆包语音合成 2.0（https://console.volcengine.com/speech/new/），也支持 MiniMax、OpenAI、ElevenLabs、火山引擎。</p>
             <div class="settings-row">
@@ -430,13 +472,71 @@ const createSettingsModal = () => `
               <label class="settings-label" for="tts-voice-select">声音</label>
               <select class="settings-select" id="tts-voice-select"></select>
             </div>
+            <div class="settings-row">
+              <label class="settings-label" for="tts-streaming-toggle">流式合成</label>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--ink2);">
+                <input type="checkbox" id="tts-streaming-toggle" />
+                边合成边播放，回复更快出声（默认开）
+              </label>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="tts-fx-toggle">机器人音效</label>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--ink2);">
+                <input type="checkbox" id="tts-fx-toggle" />
+                给当前声音叠加混响 / 机械质感（默认关）
+              </label>
+            </div>
+            <div id="tts-fx-lock" style="display:none;flex-direction:column;align-items:stretch;gap:6px;padding:8px 0 4px;">
+              <p class="settings-hint" style="margin:0;color:#e0a64d;">未来感音效需要付费，这是维持这个项目动力，请联系作者索要密码</p>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input class="settings-input" type="text" id="tts-fx-pw" placeholder="输入密码解锁" style="flex:1;">
+                <button class="settings-save-btn" id="tts-fx-unlock" type="button" style="padding:4px 14px;font-size:12px;">解锁</button>
+              </div>
+              <span id="tts-fx-unlock-msg" style="font-size:11px;color:var(--ink2);"></span>
+            </div>
+            <div id="tts-fx-sliders" style="display:none;flex-direction:column;gap:7px;padding:8px 0 4px;">
+              <div class="tts-fx-srow"><label for="tts-fx-wet">混响</label><input type="range" id="tts-fx-wet" min="0" max="2" step="0.01"><span id="tts-fx-wet-val"></span></div>
+              <div class="tts-fx-srow"><label for="tts-fx-reverbSeconds">混响长度</label><input type="range" id="tts-fx-reverbSeconds" min="0.2" max="3.5" step="0.1"><span id="tts-fx-reverbSeconds-val"></span></div>
+              <div class="tts-fx-srow"><label for="tts-fx-driveMix">失真 / 重量</label><input type="range" id="tts-fx-driveMix" min="0" max="2" step="0.01"><span id="tts-fx-driveMix-val"></span></div>
+              <div class="tts-fx-srow"><label for="tts-fx-metallic">金属感</label><input type="range" id="tts-fx-metallic" min="0" max="2" step="0.01"><span id="tts-fx-metallic-val"></span></div>
+              <div class="tts-fx-srow"><label for="tts-fx-ring">机器人感</label><input type="range" id="tts-fx-ring" min="0" max="2" step="0.01"><span id="tts-fx-ring-val"></span></div>
+              <div class="tts-fx-srow"><label for="tts-fx-chorus">合成厚度</label><input type="range" id="tts-fx-chorus" min="0" max="2" step="0.01"><span id="tts-fx-chorus-val"></span></div>
+              <div class="tts-fx-srow"><label for="tts-fx-metallicFeedback">金属共振</label><input type="range" id="tts-fx-metallicFeedback" min="0" max="0.92" step="0.01"><span id="tts-fx-metallicFeedback-val"></span></div>
+              <div class="tts-fx-srow"><label for="tts-fx-metallicDelayMs">金属音调</label><input type="range" id="tts-fx-metallicDelayMs" min="2" max="20" step="0.5"><span id="tts-fx-metallicDelayMs-val"></span></div>
+              <div class="tts-fx-srow"><label for="tts-fx-ringHz">机器人音调</label><input type="range" id="tts-fx-ringHz" min="30" max="600" step="5"><span id="tts-fx-ringHz-val"></span></div>
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span class="settings-hint" style="margin:0;">拖动即时生效，下次播放 / 试听可听到</span>
+                <button class="settings-save-btn" id="tts-fx-reset" type="button" style="padding:3px 10px;font-size:12px;">恢复默认</button>
+              </div>
+            </div>
 
             <div id="tts-creds-doubao" style="display:none;">
               <div class="settings-row">
                 <label class="settings-label" for="tts-doubao-key">API Key</label>
                 <input class="settings-input" type="password" id="tts-doubao-key" placeholder="留空则不修改">
               </div>
-              <p class="settings-hint">在<a href="https://console.volcengine.com/speech/new/" target="_blank" style="color:var(--cool)">豆包语音合成 2.0 控制台</a>获取 API Key（需先完成实名认证和服务开通）。音色默认使用 seed-tts-2.0。</p>
+              <div class="settings-row">
+                <label class="settings-label" for="tts-doubao-resource">Resource ID</label>
+                <input class="settings-input" type="text" id="tts-doubao-resource" placeholder="自动匹配，或填 seed-tts-2.0 / seed-tts-1.0">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="tts-doubao-appid">AppId</label>
+                <input class="settings-input" type="text" id="tts-doubao-appid" placeholder="旧版控制台鉴权选填">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="tts-doubao-access-key">Access Key</label>
+                <input class="settings-input" type="password" id="tts-doubao-access-key" placeholder="旧版控制台 Access Token，留空则不修改">
+              </div>
+              <div class="settings-row">
+                <label class="settings-label" for="tts-doubao-style">情感风格</label>
+                <input class="settings-input" type="text" id="tts-doubao-style" placeholder="可空。例：用低沉沉稳、情绪饱满带金属感的人工智能管家声音">
+              </div>
+              <div class="tts-fx-srow" style="margin-bottom:8px;">
+                <label for="tts-doubao-rate">语速</label>
+                <input type="range" id="tts-doubao-rate" min="-50" max="100" step="5">
+                <span id="tts-doubao-rate-val"></span>
+              </div>
+              <p class="settings-hint">在<a href="https://console.volcengine.com/speech/new/" target="_blank" style="color:var(--cool)">豆包语音合成控制台</a>获取 API Key。2.0 音色使用 seed-tts-2.0；1.0/moon/BV 音色使用 seed-tts-1.0 或控制台对应资源。<br>「情感风格」用自然语言描述语气（越具体越好，短词无效），留空＝中性。要贾维斯感建议配男声（云舟 zh_male_m191_uranus_bigtts）。</p>
             </div>
 
             <div id="tts-creds-minimax" style="display:none;">
@@ -495,7 +595,7 @@ const createSettingsModal = () => `
         <div class="settings-tab" data-tab="web-search">
           <div class="settings-section">
             <div class="settings-section-label">搜索引擎</div>
-            <p class="settings-hint">Agent 调用 web_search 时会按 Serper → SearXNG → Bing → Jina → DuckDuckGo 顺序兜底。Bing 和 DuckDuckGo 不需要配置即可使用；如果你有 Serper / Jina 的 key，质量会显著提升。</p>
+            <p class="settings-hint">Agent 调用 web_search 时分两梯队：第一梯队（带 key 的 API：Serper → Brave → Tavily → SearXNG）按优先级尝试；都没结果时，第二梯队（Bing / Jina / DuckDuckGo，无需配置）并行兜底。配任意一个 key 都能显著提升质量和稳定性，多配几个可避免单一额度用尽时搜索失败。</p>
 
             <div class="settings-row">
               <label class="settings-label" for="websearch-serper-key">Serper API Key</label>
@@ -504,10 +604,22 @@ const createSettingsModal = () => `
             <p class="settings-hint">在 <a href="https://serper.dev" target="_blank" style="color:var(--cool)">serper.dev</a> 注册后获取（每月 2500 次免费）。Google SERP JSON 接口，最稳定。</p>
 
             <div class="settings-row">
+              <label class="settings-label" for="websearch-brave-key">Brave API Key</label>
+              <input class="settings-input" type="password" id="websearch-brave-key" placeholder="留空则不修改">
+            </div>
+            <p class="settings-hint">在 <a href="https://brave.com/search/api" target="_blank" style="color:var(--cool)">brave.com/search/api</a> 获取（每月 2000 次免费）。独立索引，Serper 的可靠兜底。</p>
+
+            <div class="settings-row">
+              <label class="settings-label" for="websearch-tavily-key">Tavily API Key</label>
+              <input class="settings-input" type="password" id="websearch-tavily-key" placeholder="留空则不修改">
+            </div>
+            <p class="settings-hint">在 <a href="https://tavily.com" target="_blank" style="color:var(--cool)">tavily.com</a> 获取（每月 1000 次免费）。面向 LLM 的搜索接口。</p>
+
+            <div class="settings-row">
               <label class="settings-label" for="websearch-jina-key">Jina API Key</label>
               <input class="settings-input" type="password" id="websearch-jina-key" placeholder="留空则不修改">
             </div>
-            <p class="settings-hint">在 <a href="https://jina.ai" target="_blank" style="color:var(--cool)">jina.ai</a> 获取（有免费额度）。s.jina.ai 搜索接口，作为 Bing 失效时的额外兜底。</p>
+            <p class="settings-hint">在 <a href="https://jina.ai" target="_blank" style="color:var(--cool)">jina.ai</a> 获取（有免费额度）。s.jina.ai 搜索接口，第二梯队兜底之一。</p>
 
             <div class="settings-row">
               <label class="settings-label" for="websearch-searxng-url">SearXNG URL</label>
@@ -521,6 +633,14 @@ const createSettingsModal = () => `
             <div class="settings-config-row">
               <span class="settings-config-type">Serper</span>
               <span class="settings-config-info" id="websearch-status-serper">—</span>
+            </div>
+            <div class="settings-config-row">
+              <span class="settings-config-type">Brave</span>
+              <span class="settings-config-info" id="websearch-status-brave">—</span>
+            </div>
+            <div class="settings-config-row">
+              <span class="settings-config-type">Tavily</span>
+              <span class="settings-config-info" id="websearch-status-tavily">—</span>
             </div>
             <div class="settings-config-row">
               <span class="settings-config-type">Jina</span>
@@ -646,6 +766,69 @@ const createVideoPanel = () => `
 </div>
 `;
 
+const createAIVideoPanel = () => `
+<div class="aivideo-panel" id="aivideo-panel">
+  <div class="media-stage-head">
+    <div class="media-stage-title">AI 视频生成</div>
+    <div class="aivideo-head-spacer"></div>
+    <button class="aivideo-new-btn" id="aivideo-new-btn" type="button" title="清空输入">+ 新视频</button>
+    <button class="aivideo-exit-btn" id="aivideo-exit-btn" type="button" title="关闭 (Esc)">×</button>
+  </div>
+
+  <!-- 区1 生成栏 -->
+  <div class="aivideo-queue-wrap">
+    <div class="aivideo-queue-cap">生成栏 · QUEUE</div>
+    <div class="aivideo-queue" id="aivideo-queue"></div>
+  </div>
+
+  <!-- 区2 播放区 -->
+  <div class="aivideo-player">
+    <div class="aivideo-stage is-empty" id="aivideo-stage">
+      <video id="aivideo-feed" class="aivideo-feed" playsinline controls hidden></video>
+      <button class="aivideo-dl" id="aivideo-dl" type="button" hidden>↓ 下载</button>
+      <div class="aivideo-stage-empty" id="aivideo-stage-empty">
+        <svg class="aivideo-empty-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+          <rect x="6" y="9" width="36" height="30" rx="4" stroke="currentColor" stroke-width="2"/>
+          <circle cx="16.5" cy="19" r="3.5" stroke="currentColor" stroke-width="2"/>
+          <path d="M9 33l9-9 7 7 6-5 8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="aivideo-empty-text">暂无资源</div>
+        <div class="aivideo-empty-sub">在下方输入提示词或加图，点“生成”</div>
+      </div>
+    </div>
+    <div class="aivideo-player-meta" id="aivideo-player-meta"></div>
+  </div>
+
+  <!-- 区3 输入区 -->
+  <div class="aivideo-composer">
+    <div class="aivideo-dropzone" id="aivideo-dropzone"></div>
+    <div class="aivideo-modebar">
+      <span class="aivideo-modetag" id="aivideo-modetag">文生视频</span>
+      <span class="aivideo-modehint" id="aivideo-modehint">不加图 = 文生视频 · 1 张 = 图生视频 · 2 张 = 首尾帧</span>
+    </div>
+    <textarea id="aivideo-prompt-input" class="aivideo-prompt-input" rows="1"
+      placeholder="描述你想要的画面、动作、镜头运动、光线、风格…（Ctrl+Enter 生成）"></textarea>
+    <div class="aivideo-controls">
+      <select id="aivideo-ratio" title="画面比例">
+        <option value="adaptive">适配图片</option>
+        <option value="16:9" selected>16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
+        <option value="4:3">4:3</option><option value="3:4">3:4</option><option value="21:9">21:9</option>
+      </select>
+      <select id="aivideo-resolution" title="分辨率">
+        <option value="480p">480p</option><option value="720p" selected>720p</option><option value="1080p">1080p</option>
+      </select>
+      <select id="aivideo-duration" title="时长（秒）">
+        <option value="5" selected>5s</option><option value="10">10s</option><option value="15">15s</option>
+      </select>
+      <button type="button" class="aivideo-submit" id="aivideo-submit">生成</button>
+    </div>
+    <div class="aivideo-compose-err" id="aivideo-compose-err" hidden></div>
+  </div>
+
+  <input type="file" id="aivideo-file-input" accept="image/*" hidden>
+</div>
+`;
+
 const createMusicPanel = () => `
 <div class="music-panel" id="music-panel">
   <div class="media-stage-head">
@@ -726,6 +909,7 @@ export function createBrainUiMarkup() {
     createTooltip(),
     createSettingsModal(),
     createVideoPanel(),
+    createAIVideoPanel(),
     createMusicPanel(),
     createImagePanel(),
     createHotspotPanel(),

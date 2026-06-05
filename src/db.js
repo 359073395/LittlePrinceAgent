@@ -115,6 +115,20 @@ function initSchema() {
   try { db.exec(`ALTER TABLE conversations ADD COLUMN focus_absorbed INTEGER NOT NULL DEFAULT 0`) } catch {}
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_focus_absorbed ON conversations(focus_absorbed)`) } catch {}
 
+  // 迁移：P0-1 给每条对话打上"当时的焦点话题"标签。
+  //   conversationWindow 注入 LLM 时，每条 user/jarvis 消息的 marker 里带上这个 topic，
+  //   让模型在做代词消解时能看到话题边界（"那个/这个/现在"才不会跨段乱钩）。
+  //   写入时机：insertConversation 自动读 db 内部 currentFocusTopic 变量；
+  //   index.js 在 updateFocusFrame 之后 setCurrentFocusTopic(栈顶 topic)，
+  //   并对本轮触发判定的 user 消息做一次 UPDATE 回填（push 时 focus 尚未算）。
+  try { db.exec(`ALTER TABLE conversations ADD COLUMN focus_topic TEXT DEFAULT ''`) } catch {}
+
+  // 迁移：P0-2 标记 agent 自己留下的"未答悬念"（follow-up question）。
+  //   open_question=1 表示这条 jarvis 消息末尾留了一个非澄清型问号悬念。
+  //   conversationWindow 渲染时：若该悬念在 N 轮内未被用户接茬 / 话题已切换，
+  //   marker 末尾追加 "[expired follow-up — ignore]"，避免模糊代词被钩到这里。
+  try { db.exec(`ALTER TABLE conversations ADD COLUMN open_question INTEGER NOT NULL DEFAULT 0`) } catch {}
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS memories (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -420,6 +434,47 @@ function initSchema() {
       context_token TEXT    NOT NULL,
       updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
     );
+  `)
+
+  // recall_audit / extract_audit：记忆系统观测层（Phase 0 of Memory-Optimization v0.1）
+  //   recall_audit  : injector 每次召回写一行——给"召回到底命中了什么/漏了什么"留证据
+  //   extract_audit : recognizer 每次抽取写一行——给"哪些 turn 没抽到记忆"留证据
+  // 写入采用 best-effort（try/catch + console.warn），任何写失败都不能影响主流程
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS recall_audit (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+      turn_label      TEXT,
+      from_id         TEXT,
+      channel         TEXT,
+      query_text      TEXT,
+      matched_mem_ids TEXT    NOT NULL DEFAULT '[]',
+      matched_count   INTEGER NOT NULL DEFAULT 0,
+      chosen_count    INTEGER NOT NULL DEFAULT 0,
+      event_type_dist TEXT    NOT NULL DEFAULT '{}',
+      latency_ms      INTEGER,
+      source          TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_recall_audit_created_at ON recall_audit(created_at);
+    CREATE INDEX IF NOT EXISTS idx_recall_audit_from_id    ON recall_audit(from_id);
+  `)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS extract_audit (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+      turn_label        TEXT,
+      from_id           TEXT,
+      channel           TEXT,
+      turn_summary      TEXT,
+      extracted_mem_ids TEXT    NOT NULL DEFAULT '[]',
+      extracted_count   INTEGER NOT NULL DEFAULT 0,
+      event_type_dist   TEXT    NOT NULL DEFAULT '{}',
+      latency_ms        INTEGER,
+      skipped           INTEGER NOT NULL DEFAULT 0,
+      skip_reason       TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_extract_audit_created_at ON extract_audit(created_at);
+    CREATE INDEX IF NOT EXISTS idx_extract_audit_from_id    ON extract_audit(from_id);
   `)
 
   // 重建 FTS 索引（覆盖已有数据，确保历史记忆也被索引）
@@ -1217,15 +1272,108 @@ export function getImpressiveBySource(entityId, limit = 5) {
 
 // ── 对话记录 ──
 
+// P0-1：进程内当前焦点话题。index.js 在 updateFocusFrame 之后 set 一次；
+// insertConversation 写库时自动读这个变量，给本轮所有新写入的对话打 focus_topic。
+// 不写文件、不持久化——焦点栈本身已经持久化在 focus_stack 表，这里只是个写入时的"印章"。
+let currentFocusTopic = ''
+export function setCurrentFocusTopic(topic) {
+  if (Array.isArray(topic)) {
+    currentFocusTopic = topic.slice(0, 3).join(',')
+  } else {
+    currentFocusTopic = String(topic || '').slice(0, 60)
+  }
+}
+export function getCurrentFocusTopic() { return currentFocusTopic }
+
 // 写入一条对话记录
-export function insertConversation({ role, from_id, to_id = null, content, timestamp, channel = '', external_party_id = '' }) {
+// focus_topic / open_question 优先取调用方显式传入；未传时 focus_topic 读 currentFocusTopic。
+export function insertConversation({
+  role, from_id, to_id = null, content, timestamp,
+  channel = '', external_party_id = '',
+  focus_topic = null, open_question = 0,
+}) {
   const db = getDB()
   const fromId = normalizeConversationPartyId(from_id)
   const toId = normalizeConversationPartyId(to_id)
-  db.prepare(`
-    INSERT INTO conversations (role, from_id, to_id, content, timestamp, channel, external_party_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(role, fromId, toId, content, timestamp, channel || '', external_party_id || '')
+  const topic = focus_topic == null ? currentFocusTopic : String(focus_topic || '')
+  const info = db.prepare(`
+    INSERT INTO conversations (role, from_id, to_id, content, timestamp, channel, external_party_id, focus_topic, open_question)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(role, fromId, toId, content, timestamp, channel || '', external_party_id || '', topic, open_question ? 1 : 0)
+  return Number(info.lastInsertRowid) || 0
+}
+
+// P0-1：给本轮触发判定的 user 消息回填 focus_topic
+//   pushMessage 时焦点栈还没算（要等收到消息才更新），用户消息写库时 focus_topic = ''。
+//   index.js 在 updateFocusFrame 之后调用本函数，用 (from_id, timestamp) 定位该行回填。
+//   注意：不加 focus_topic 必须为空的 WHERE 约束——只通过 from_id+timestamp 精确定位单行；
+//   即使外部预填了别的值，本轮焦点判断的结果才是权威的。
+export function updateUserMessageFocusTopic(fromId, timestamp, topic) {
+  if (!fromId || !timestamp) return 0
+  const db = getDB()
+  const normalizedId = normalizeConversationPartyId(fromId)
+  const t = Array.isArray(topic) ? topic.slice(0, 3).join(',') : String(topic || '')
+  const info = db.prepare(`
+    UPDATE conversations SET focus_topic = ?
+    WHERE role = 'user' AND from_id = ? AND timestamp = ?
+  `).run(t, normalizedId, timestamp)
+  return info.changes || 0
+}
+
+// P0-2：把某条 jarvis 消息标记为留了未答悬念（open_question=1）
+//   executor.js send_message 写完库立刻拿回 row id，按需 mark。
+export function markConversationOpenQuestion(id, isOpen = true) {
+  if (!id) return 0
+  const db = getDB()
+  const info = db.prepare(`UPDATE conversations SET open_question = ? WHERE id = ?`).run(isOpen ? 1 : 0, id)
+  return info.changes || 0
+}
+
+// 查最近 withinMs 毫秒内 jarvis 发给 toId 的消息中，是否有 content 完全相同的一条。
+// 命中返回 { id, content, timestamp, ageMs }，未命中返回 null。
+// 用途：send_message 防重发——零用户消息状态下，模型常被旧 directions 反复驱动发同一句话。
+// 防重发判定：在最近的 jarvis 出站里找一条与 content 逐字相同、且"用户尚未回应过"的消息。
+//
+// 旧逻辑只用 5 分钟时间窗（withinMs）卡——实测 deepseek 等模型重发节奏（如 5min4s / 14min）
+// 恰好踩在窗口外，逐字重发照样漏过（典型：启动期"委托授权询问"被连发 3 次）。对一条用户
+// 还没回应的主动消息，逐字重发不管隔多久都是骚扰，时间长短不该是豁免条件。
+// 新逻辑以"该条之后用户有没有回过话"为分界：
+//   - 没回过 → 不论间隔多久都判为重发并拒绝；
+//   - 回过了 → 话题已翻篇，放行（仍保留 withinMs 作兜底下限：刚回过也不许 5 分钟内逐字重发）。
+export function findRecentJarvisDuplicate(toId, content, withinMs = 300_000) {
+  if (!toId || !content) return null
+  const db = getDB()
+  const normalizedId = normalizeConversationPartyId(toId)
+  const target = String(content).trim()
+  if (!target) return null
+
+  // 该对象最近一条真实用户消息的时间戳，作为"用户是否已回应"的分界线。
+  // SYSTEM 信号的 from_id 是 'SYSTEM'，不等于对象 id，天然被排除，不会被误当成用户回应。
+  const lastUserRow = db.prepare(`
+    SELECT timestamp FROM conversations
+    WHERE role = 'user' AND from_id = ?
+    ORDER BY id DESC LIMIT 1
+  `).get(normalizedId)
+  const lastUserTs = lastUserRow ? Date.parse(lastUserRow.timestamp) : NaN
+
+  // 拉最近 20 条 jarvis 出站做内存比对，比 LIKE 全表扫稳。
+  const rows = db.prepare(`
+    SELECT id, content, timestamp FROM conversations
+    WHERE role = 'jarvis' AND to_id = ?
+    ORDER BY id DESC
+    LIMIT 20
+  `).all(normalizedId)
+  const now = Date.now()
+  for (const r of rows) {
+    if (String(r.content || '').trim() !== target) continue
+    const ts = Date.parse(r.timestamp)
+    const ageMs = Number.isFinite(ts) ? now - ts : Infinity
+    // 用户在这条逐字相同的消息之后回过话 → 话题已翻篇；除非仍在 withinMs 兜底窗内，否则放行。
+    const userRepliedSince = Number.isFinite(lastUserTs) && Number.isFinite(ts) && lastUserTs > ts
+    if (userRepliedSince && ageMs > withinMs) continue
+    return { id: r.id, content: r.content, timestamp: r.timestamp, ageMs }
+  }
+  return null
 }
 
 // 将最近一条 jarvis 消息内容裁剪为已说出的部分（TTS 被打断时调用）
@@ -1519,10 +1667,23 @@ export function insertActionLog({
 }
 
 // 获取最近 N 条行动日志（时间正序）
-export function getRecentActionLogs(limit = 50) {
+// 默认排除后台 housekeeping 人格（recognizer / consolidator）：它们不算主 Agent 的"自我历史"。
+// 一旦混进 self-snapshot 的"工具习惯（近 10 次调用）"、tool-router 的 ActionLog 保活，
+// 主 Agent 会(1)误以为自己最近在做识别/整理，把无关问题误读成"用户在问识别器"，
+// (2)被把 skip_recognition / skip_consolidation 这类后台专属工具重新注入工具表，
+//    于是在普通对话回完话后顺手补一个 skip_consolidation 当收尾（多余的"跳过整理"步骤）。
+// 极少数审计/诊断场景需要看全部时，传 { includeHousekeeping: true }。
+export function getRecentActionLogs(limit = 50, { includeHousekeeping = false, includeRecognizer = false } = {}) {
   const db = getDB()
+  if (includeHousekeeping || includeRecognizer) {
+    return db.prepare(`
+      SELECT * FROM action_logs ORDER BY id DESC LIMIT ?
+    `).all(limit).reverse()
+  }
   return db.prepare(`
-    SELECT * FROM action_logs ORDER BY id DESC LIMIT ?
+    SELECT * FROM action_logs
+    WHERE source IS NULL OR source NOT IN ('recognizer', 'consolidator')
+    ORDER BY id DESC LIMIT ?
   `).all(limit).reverse()
 }
 
@@ -1645,8 +1806,10 @@ export function searchMemories(keyword, limit = 10) {
   if (kw.length < 3) return likeFallback()
 
   try {
+    // 带出 bm25 相关度分（_ftsScore，越小越相关）。供注入器"少即是强"选择器做
+    // 相关度地板过滤用；LIKE 兜底路径无此分（_ftsScore 为 undefined，选择器自动豁免）。
     const hits = db.prepare(`
-      SELECT m.* FROM memories m
+      SELECT m.*, bm25(memories_fts) AS _ftsScore FROM memories m
       JOIN memories_fts ON memories_fts.rowid = m.id
       WHERE memories_fts MATCH ? AND m.${VISIBLE_CLAUSE}
       ORDER BY bm25(memories_fts), m.timestamp DESC
@@ -1702,9 +1865,30 @@ function cosineSimilarity(aBuf, bBuf) {
 // 全表扫描所有有 embedding 的 memories，返回 cosine 相似度 top-N。
 // 输入 queryBuffer：Buffer，包裹 Float32Array。
 // 返回：每条形如 {...memoryRow, _vecScore: number}。
+//
+// Wave 1 优化：scaling 防御 —— 行数超过 VEC_FULL_SCAN_LIMIT 时直接返回 []，
+// 让上层走 FTS5 兜底。理由：纯 JS cosine 在 N×1024 维度下 N>5k 后单次
+// 召回会到几百毫秒，把主路径同步阻塞拖到秒级。当前 DB 实测 0 行 embedding，
+// 这条是预防 embedding-backfill 跑起来后突然变慢的"未来 bug"。
+// 真要支持大表向量召回应接 sqlite-vec 扩展或外部 ANN，此处先保命。
+const VEC_FULL_SCAN_LIMIT = 5000
+
 export function searchByEmbedding(queryBuffer, limit = 20) {
   if (!queryBuffer || !(queryBuffer instanceof Buffer) || queryBuffer.byteLength === 0) return []
   const db = getDB()
+
+  // 上限保护：先 COUNT，超限直接返回。better-sqlite3 + WAL + 索引扫描，几 ms 就回。
+  try {
+    const countRow = db.prepare(`SELECT COUNT(*) AS c FROM memories WHERE embedding IS NOT NULL AND ${VISIBLE_CLAUSE}`).get()
+    if (countRow && countRow.c > VEC_FULL_SCAN_LIMIT) {
+      // 静默跳过，不打 warn——这条会被 inject 链路每条消息都走一次，
+      // 噪声日志反而干扰调试。需要时把这里改成节流日志。
+      return []
+    }
+  } catch {
+    // 老库 schema 未迁移：COUNT 失败 → 走原路径让 SELECT 自己决定 fallback
+  }
+
   let rows
   try {
     // 软隐藏过滤：被隐藏的记忆即使有 embedding 也不参与召回
@@ -1841,12 +2025,18 @@ export function getMusicTrack(id) {
 
 export function searchMusicLibrary(query, limit = 20) {
   const db = getDB()
-  const q = `%${query}%`
+  const tokens = String(query || '').trim().split(/\s+/).filter(Boolean)
+  if (!tokens.length) return []
+  // 每个词都要命中 title/artist/album 之一（per-token OR，token 之间 AND）：
+  // 这样 "歌名 歌手" 能匹配到 title 只含歌名、artist 只含歌手的行，避免漏命中后白跑下载。
+  const clauses = tokens.map(() => '(title LIKE ? OR artist LIKE ? OR album LIKE ?)')
+  const params = []
+  for (const t of tokens) { const like = `%${t}%`; params.push(like, like, like) }
   return db.prepare(`
     SELECT * FROM music_library
-    WHERE title LIKE ? OR artist LIKE ? OR album LIKE ?
+    WHERE ${clauses.join(' AND ')}
     ORDER BY added_at DESC LIMIT ?
-  `).all(q, q, q, limit)
+  `).all(...params, limit)
 }
 
 export function listMusicLibrary(limit = 50) {
@@ -1917,3 +2107,135 @@ export function saveFocusStack(stack) {
     console.warn('[focus-persist] saveFocusStack failed:', err.message)
   }
 }
+
+// ───────── 记忆观测层（Memory-Optimization v0.1 Phase 0） ─────────
+// 所有 audit 写入都是 best-effort：失败只记 warn，不抛出，不影响主流程。
+
+export function insertRecallAudit({
+  turn_label = null,
+  from_id = null,
+  channel = null,
+  query_text = '',
+  matched_mem_ids = [],
+  chosen_count = 0,
+  event_type_dist = {},
+  latency_ms = null,
+  source = null,
+} = {}) {
+  try {
+    const ids = Array.isArray(matched_mem_ids) ? matched_mem_ids : []
+    getDB().prepare(`
+      INSERT INTO recall_audit (
+        turn_label, from_id, channel, query_text,
+        matched_mem_ids, matched_count, chosen_count,
+        event_type_dist, latency_ms, source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      turn_label,
+      from_id,
+      channel,
+      (query_text || '').slice(0, 1000),
+      JSON.stringify(ids),
+      ids.length,
+      chosen_count,
+      JSON.stringify(event_type_dist || {}),
+      latency_ms,
+      source
+    )
+  } catch (err) {
+    console.warn('[recall_audit] insert failed:', err.message)
+  }
+}
+
+export function insertExtractAudit({
+  turn_label = null,
+  from_id = null,
+  channel = null,
+  turn_summary = '',
+  extracted_mem_ids = [],
+  event_type_dist = {},
+  latency_ms = null,
+  skipped = false,
+  skip_reason = null,
+} = {}) {
+  try {
+    const ids = Array.isArray(extracted_mem_ids) ? extracted_mem_ids : []
+    getDB().prepare(`
+      INSERT INTO extract_audit (
+        turn_label, from_id, channel, turn_summary,
+        extracted_mem_ids, extracted_count,
+        event_type_dist, latency_ms, skipped, skip_reason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      turn_label,
+      from_id,
+      channel,
+      (turn_summary || '').slice(0, 500),
+      JSON.stringify(ids),
+      ids.length,
+      JSON.stringify(event_type_dist || {}),
+      latency_ms,
+      skipped ? 1 : 0,
+      skip_reason
+    )
+  } catch (err) {
+    console.warn('[extract_audit] insert failed:', err.message)
+  }
+}
+
+export function getRecentRecallAudits(limit = 50) {
+  try {
+    return getDB().prepare(`SELECT * FROM recall_audit ORDER BY id DESC LIMIT ?`).all(limit)
+  } catch (err) {
+    console.warn('[recall_audit] read failed:', err.message)
+    return []
+  }
+}
+
+export function getRecentExtractAudits(limit = 50) {
+  try {
+    return getDB().prepare(`SELECT * FROM extract_audit ORDER BY id DESC LIMIT ?`).all(limit)
+  } catch (err) {
+    console.warn('[extract_audit] read failed:', err.message)
+    return []
+  }
+}
+
+export function getRecallAuditStats({ sinceIso = null } = {}) {
+  try {
+    const sinceClause = sinceIso ? 'WHERE created_at >= ?' : ''
+    const args = sinceIso ? [sinceIso] : []
+    return getDB().prepare(`
+      SELECT
+        COUNT(*) AS total,
+        AVG(matched_count) AS avg_matched,
+        AVG(chosen_count)  AS avg_chosen,
+        AVG(latency_ms)    AS avg_latency_ms,
+        MAX(latency_ms)    AS max_latency_ms,
+        SUM(CASE WHEN matched_count = 0 THEN 1 ELSE 0 END) AS zero_match_count
+      FROM recall_audit ${sinceClause}
+    `).get(...args)
+  } catch (err) {
+    console.warn('[recall_audit] stats failed:', err.message)
+    return null
+  }
+}
+
+export function getExtractAuditStats({ sinceIso = null } = {}) {
+  try {
+    const sinceClause = sinceIso ? 'WHERE created_at >= ?' : ''
+    const args = sinceIso ? [sinceIso] : []
+    return getDB().prepare(`
+      SELECT
+        COUNT(*)            AS total,
+        AVG(extracted_count) AS avg_extracted,
+        AVG(latency_ms)      AS avg_latency_ms,
+        SUM(skipped)         AS skipped_count
+      FROM extract_audit ${sinceClause}
+    `).get(...args)
+  } catch (err) {
+    console.warn('[extract_audit] stats failed:', err.message)
+    return null
+  }
+}
+

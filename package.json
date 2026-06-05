@@ -1,7 +1,7 @@
 {
   "name": "littleprince-agent",
   "productName": "小王子 Agent",
-  "version": "2.1.179",
+  "version": "2.1.322",
   "description": "A continuously running digital consciousness framework",
   "type": "module",
   "main": "electron/main.cjs",
@@ -17,6 +17,9 @@
     "build": "powershell -ExecutionPolicy Bypass -File scripts/prebuild-clean.ps1 && electron-rebuild -f -w better-sqlite3 -v 33.4.11 && electron-builder --win",
     "publish": "electron-builder --win --publish always",
     "postinstall": "electron-builder install-app-deps",
+    "test:rule-context": "electron ./src/test-rule-context.js",
+    "test:relevance": "electron ./src/test-relevance-selection.js",
+    "test:section-gate": "node ./src/test-section-gate.js",
     "smoke:tools": "node scripts/smoke-tools.mjs",
     "smoke:brain-ui": "node scripts/smoke-brain-ui.mjs",
     "smoke:social": "node scripts/smoke-social.mjs"
@@ -91,7 +94,7 @@
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
-      "deleteAppDataOnUninstall": true,
+      "deleteAppDataOnUninstall": false,
       "installerHeaderIcon": "build/installerHeaderIcon.ico",
       "installerSidebar": "build/installerSidebar.bmp",
       "uninstallerSidebar": "build/uninstallerSidebar.bmp",
@@ -109,3 +112,4 @@
     ]
   }
 }
+

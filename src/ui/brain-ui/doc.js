@@ -209,12 +209,19 @@ export function toggleDocPanel(topicId = null) {
 
 const ASR_PROVIDER_DEFS = [
   { id: 'aliyun',  label: '阿里云百炼' },
+  { id: 'volcengine', label: '火山豆包' },
   { id: 'tencent', label: '腾讯云' },
   { id: 'xunfei',  label: '科大讯飞' },
 ]
 
 const ASR_FIELDS = {
   aliyun:  [{ key: 'aliyunApiKey',   label: 'API Key',   type: 'password', ph: 'sk-xxxxxxxx...' }],
+  volcengine: [
+    { key: 'volcAsrApiKey',     label: 'API Key（新版）',    type: 'password', ph: '' },
+    { key: 'volcAsrResourceId', label: 'Resource ID',       type: 'text',     ph: 'volc.bigasr.sauc.duration' },
+    { key: 'volcAsrAppKey',     label: 'App Key（旧版）',    type: 'password', ph: '' },
+    { key: 'volcAsrAccessKey',  label: 'Access Key（旧版）', type: 'password', ph: '' },
+  ],
   tencent: [
     { key: 'tencentSecretId',  label: 'SecretId',  type: 'password', ph: '' },
     { key: 'tencentSecretKey', label: 'SecretKey', type: 'password', ph: '' },
@@ -238,7 +245,9 @@ const TTS_PROVIDER_DEFS = [
 const TTS_FIELDS = {
   doubao: [
     { key: 'doubaoKey',    label: 'API Key',       type: 'password', ph: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' },
+    { key: 'doubaoResourceId', label: 'Resource ID', type: 'text',     ph: 'seed-tts-2.0' },
     { key: 'doubaoAppId',  label: 'App ID（可选）', type: 'text',     ph: '' },
+    { key: 'doubaoAccessKey', label: 'Access Key（旧版）', type: 'password', ph: '' },
   ],
   minimax: [],
   openai: [
@@ -263,7 +272,10 @@ async function fetchConfigState() {
       fetch(apiUrl('/settings/voice')),
       fetch(apiUrl('/settings/tts')),
     ])
-    if (vRes.ok) cfgVoiceState = (await vRes.json()).voice || {}
+    if (vRes.ok) {
+      cfgVoiceState = (await vRes.json()).voice || {}
+      if (cfgVoiceState.voiceProvider) cfgAsrProvider = cfgVoiceState.voiceProvider
+    }
     if (tRes.ok) {
       const td = await tRes.json()
       cfgTtsState = td.tts || {}
@@ -439,6 +451,7 @@ function bindConfigForm(topicId) {
       const fieldsEl = $(fieldsId)
       if (!fieldsEl) return
       const body = collectFieldValues(fieldsEl)
+      if (isAsr) body.voiceProvider = cfgAsrProvider
       if (!isAsr) body.ttsProvider = cfgTtsProvider
       await saveConfig(endpoint, body, $('dpc-status'))
     })
@@ -448,7 +461,11 @@ function bindConfigForm(topicId) {
   if (asrSave) {
     asrSave.addEventListener('click', async () => {
       const fieldsEl = $('dpc-asr-fields')
-      if (fieldsEl) await saveConfig('/settings/voice', collectFieldValues(fieldsEl), $('dpc-asr-status'))
+      if (fieldsEl) {
+        const body = collectFieldValues(fieldsEl)
+        body.voiceProvider = cfgAsrProvider
+        await saveConfig('/settings/voice', body, $('dpc-asr-status'))
+      }
     })
   }
 

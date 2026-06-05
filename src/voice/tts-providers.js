@@ -73,7 +73,19 @@ function resolveDoubaoResourceId(voiceId, resourceId) {
   return 'seed-tts-2.0'
 }
 
-function decodeDoubaoLine(transform, rawLine) {
+function annotateDoubaoError(statusCode, message, { speaker, resourceId }) {
+  if (statusCode !== 55000000 || !/resource ID is mismatched/i.test(message || '')) {
+    return message || '未知错误'
+  }
+  return [
+    message,
+    `当前音色 ${speaker} 使用资源 ${resourceId}。`,
+    '豆包 2.0 音色（*_uranus_bigtts）需使用 seed-tts-2.0；1.0/moon/BV 音色需使用 seed-tts-1.0 或对应控制台资源。',
+    '请在语音设置中切换声音，或填写控制台中该音色对应的 Resource ID。',
+  ].join(' ')
+}
+
+function decodeDoubaoLine(transform, rawLine, context = {}) {
   const line = rawLine.trim().replace(/^data:\s*/, '')
   if (!line || line === '[DONE]') return
   if (!line.startsWith('{')) {
@@ -84,12 +96,13 @@ function decodeDoubaoLine(transform, rawLine) {
   const data = JSON.parse(line)
   const statusCode = Number(data.code ?? data.status_code ?? data.StatusCode ?? 0)
   if (statusCode > 0 && statusCode !== 20000000) {
-    throw new Error(`豆包 TTS 流错误 (${statusCode}): ${data.message || data.status_text || '未知错误'}`)
+    const message = annotateDoubaoError(statusCode, data.message || data.status_text, context)
+    throw new Error(`豆包 TTS 流错误 (${statusCode}): ${message}`)
   }
   if (data.data) transform.push(Buffer.from(data.data, 'base64'))
 }
 
-function decodeDoubaoStream(webStream) {
+function decodeDoubaoStream(webStream, context = {}) {
   let pending = ''
   const nodeStream = webStreamToNode(webStream)
   const transform = new Transform({
@@ -98,7 +111,7 @@ function decodeDoubaoStream(webStream) {
       const lines = pending.split(/\r?\n/)
       pending = lines.pop() || ''
       try {
-        for (const rawLine of lines) decodeDoubaoLine(this, rawLine)
+        for (const rawLine of lines) decodeDoubaoLine(this, rawLine, context)
         callback()
       } catch (err) {
         callback(err)
@@ -106,7 +119,7 @@ function decodeDoubaoStream(webStream) {
     },
     flush(callback) {
       try {
-        if (pending.trim()) decodeDoubaoLine(this, pending)
+        if (pending.trim()) decodeDoubaoLine(this, pending, context)
         callback()
       } catch (err) {
         callback(err)
@@ -126,6 +139,8 @@ async function streamDoubao({
   appId,
   accessKey,
   resourceId,
+  style,
+  speechRate,
 }) {
   const token = accessKey || apiKey
   if (!token) throw new Error('豆包 TTS: 缺少 API Key/Access Key，请在设置中填写豆包语音凭证')
@@ -139,16 +154,28 @@ async function streamDoubao({
   if (appId) headers['X-Api-App-Id'] = appId
   if (accessKey) headers['X-Api-Access-Key'] = accessKey
   if (apiKey) headers['X-Api-Key'] = apiKey
+  const reqParams = {
+    text,
+    speaker,
+    audio_params: { format: 'mp3', sample_rate: 24000 },
+  }
+  // 语速：speech_rate 范围 -50~100（0=正常，100=2倍速，-50=0.5倍速，正数更快）
+  const rate = Number(speechRate)
+  if (Number.isFinite(rate) && rate !== 0) {
+    reqParams.audio_params.speech_rate = Math.max(-50, Math.min(100, Math.round(rate)))
+  }
+  // 情感风格：自然语言描述（如"用低沉沉稳、情绪饱满带金属感的人工智能管家声音"），
+  // 通过 additions.context_texts 注入。additions 必须是序列化后的 JSON 字符串。
+  const styleText = (style || '').trim()
+  if (styleText) {
+    reqParams.additions = JSON.stringify({ context_texts: [styleText], model_type: 4 })
+  }
   const resp = await fetch('https://openspeech.bytedance.com/api/v3/tts/unidirectional', {
     method: 'POST',
     headers,
     body: JSON.stringify({
       user: { uid: 'littleprinceagent' },
-      req_params: {
-        text,
-        speaker,
-        audio_params: { format: 'mp3', sample_rate: 24000 },
-      },
+      req_params: reqParams,
     }),
   })
   if (!resp.ok) {
@@ -157,7 +184,7 @@ async function streamDoubao({
   }
   const contentType = resp.headers.get('content-type') || ''
   if (contentType.includes('audio/')) return webStreamToNode(resp.body)
-  return decodeDoubaoStream(resp.body)
+  return decodeDoubaoStream(resp.body, { speaker, resourceId: resolvedResourceId })
 }
 
 // ── MiniMax TTS ────────────────────────────────────────────────────────────
@@ -294,6 +321,8 @@ export async function streamTTS({ text, provider, voiceId, keys = {} }) {
         appId: keys.doubaoAppId,
         accessKey: keys.doubaoAccessKey,
         resourceId: keys.doubaoResourceId,
+        style: keys.doubaoStyle,
+        speechRate: keys.doubaoSpeechRate,
       })
     case 'minimax':
       return streamMiniMax({ text, voiceId, apiKey: keys.minimaxKey })

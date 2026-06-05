@@ -64,7 +64,7 @@ async function fetchLocation() {
   // User-Agent 是 Nominatim 免费使用协议要求
   const nominatim = await fetchJSON(
     'https://nominatim.openstreetmap.org/reverse?lat=' + lat + '&lon=' + lon + '&format=json&accept-language=zh',
-    { headers: { 'User-Agent': 'LittlePrinceAgent/2.0 (personal-assistant)' } },
+    { headers: { 'User-Agent': 'Bai小王子 Agent/2.0 (personal-assistant; contact: user@example.com)' } },
     10000
   )
 
@@ -201,6 +201,15 @@ export async function collectGeoWeather() {
 }
 
 // ─── 对外接口 ─────────────────────────────────────────────────────────────────
+
+/**
+ * 同步返回缓存的国家代码（大写，如 "CN"）。collectGeoWeather() 完成前或失败时返回 null。
+ * 供工具层（如 media_mode 视频平台决策）快速判断用户地区，无需走 prompt。
+ */
+export function getCountryCode() {
+  const cc = _cached?.location?.country_code
+  return cc ? String(cc).toUpperCase() : null
+}
 
 /**
  * 返回注入 system prompt 的纯文本块。
