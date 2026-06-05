@@ -1,0 +1,38 @@
+# Git
+.git
+.gitattributes
+.gitignore
+.gitmodules
+
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+*.exe
+*.exe.blockmap
+*.7z
+
+# Data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc

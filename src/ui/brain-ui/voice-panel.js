@@ -81,7 +81,8 @@ const SOUND_EVENT_ICONS = {
   knock_door:      '🚪',
 };
 
-const CLOUD_WS_URL  = 'ws://127.0.0.1:3721/voice/cloud';
+const WS_PROTO = location.protocol === 'https:' ? 'wss:' : 'ws:'
+const CLOUD_WS_URL  = WS_PROTO + '//' + location.host + '/voice/cloud';
 const VOICE_THRESHOLD_KEY = 'littleprinceagent-voice-threshold';
 const VOICE_PROVIDER_KEY = 'littleprinceagent-voice-provider';
 
