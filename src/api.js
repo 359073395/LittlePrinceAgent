@@ -2,6 +2,8 @@
 import fs from 'fs'
 import path from 'path'
 import net from 'net'
+import { Readable } from 'stream'
+import { pipeline } from 'stream/promises'
 import { fileURLToPath } from 'url'
 import { WebSocketServer } from 'ws'
 import { pushMessage } from './queue.js'
@@ -38,6 +40,8 @@ const SYSTEM_PROMPT_PATH = paths.systemPromptHtml
 const ACTIVATION_PATH    = paths.activationHtml
 const BRAIN_UI_ASSET_ROOT = paths.brainUiAssetRoot
 const D3_VENDOR_PATH     = path.join(paths.resourcesDir, 'node_modules', 'd3', 'dist', 'd3.min.js')
+const INSTALL_SCRIPT_PATH = path.join(paths.resourcesDir, 'scripts', 'install-debian-ubuntu.sh')
+const DOWNLOAD_CACHE_DIR = path.join(paths.dataDir, 'downloads')
 const SANDBOX_PATH       = paths.sandboxDir
 const DEFAULT_AGENT_NAME = '小王子'
 const DEFAULT_API_HOST = '127.0.0.1'
@@ -108,8 +112,19 @@ function isLoopbackOrigin(origin = '') {
   }
 }
 
-function isAllowedOrigin(origin = '') {
+function isSameHostOrigin(req, origin = '') {
+  if (!origin || origin === 'null') return false
+  try {
+    const parsed = new URL(origin)
+    return parsed.host === req.headers.host
+  } catch {
+    return false
+  }
+}
+
+function isAllowedOrigin(origin = '', req = null) {
   if (isLoopbackOrigin(origin)) return true
+  if (req && isSameHostOrigin(req, origin)) return true
   if (!isLanAccessEnabled()) return false
   try {
     const parsed = new URL(origin)
@@ -123,13 +138,42 @@ function getAuthToken() {
   return String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_API_TOKEN || '').trim()
 }
 
+function getCookie(req, name) {
+  const raw = String(req.headers.cookie || '')
+  const parts = raw.split(';')
+  for (const part of parts) {
+    const index = part.indexOf('=')
+    if (index < 0) continue
+    const key = decodeURIComponent(part.slice(0, index).trim())
+    if (key === name) return decodeURIComponent(part.slice(index + 1).trim())
+  }
+  return ''
+}
+
+function setAuthCookieIfQueryToken(req, res, url) {
+  const expected = getAuthToken()
+  const queryToken = url.searchParams.get('token')
+  if (!expected || queryToken !== expected) return
+  const secure = /^(1|true|yes|on)$/i.test(String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_SECURE_COOKIE || '').trim())
+  const cookie = [
+    `lp_agent_token=${encodeURIComponent(queryToken)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=2592000',
+    secure ? 'Secure' : '',
+  ].filter(Boolean).join('; ')
+  res.setHeader('Set-Cookie', cookie)
+}
+
 function hasValidAuthToken(req, url) {
   const expected = getAuthToken()
   if (!expected) return false
   const header = req.headers.authorization || ''
   const bearer = header.match(/^Bearer\s+(.+)$/i)?.[1]?.trim()
   const queryToken = url.searchParams.get('token')
-  return bearer === expected || queryToken === expected
+  const cookieToken = getCookie(req, 'lp_agent_token')
+  return bearer === expected || queryToken === expected || cookieToken === expected
 }
 
 function requireLocalOrToken(req, res, url) {
@@ -209,6 +253,145 @@ function safeJsonParse(value, fallback) {
   try { return JSON.parse(value) } catch { return fallback }
 }
 
+function getPackageMeta() {
+  try {
+    return safeJsonParse(fs.readFileSync(path.join(paths.resourcesDir, 'package.json'), 'utf-8'), {})
+  } catch {
+    return {}
+  }
+}
+
+function getPublicBaseUrl(req = null) {
+  const configured = String(process.env.LITTLE_PRINCE_AGENT_PUBLIC_URL || '').trim().replace(/\/+$/, '')
+  if (configured) return configured
+  if (!req?.headers?.host) return ''
+  const protoHeader = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim()
+  const proto = protoHeader || (req.socket?.encrypted ? 'https' : 'http')
+  return `${proto}://${req.headers.host}`
+}
+
+function publicUrl(req, pathname) {
+  const base = getPublicBaseUrl(req)
+  return base ? new URL(pathname, `${base}/`).toString() : pathname
+}
+
+function getDownloadInfo(req = null) {
+  const pkg = getPackageMeta()
+  const owner = process.env.LITTLE_PRINCE_AGENT_GITHUB_OWNER || pkg.build?.publish?.[0]?.owner || '359073395'
+  const repo = process.env.LITTLE_PRINCE_AGENT_GITHUB_REPO || pkg.build?.publish?.[0]?.repo || 'LittlePrinceAgent'
+  const branch = process.env.LITTLE_PRINCE_AGENT_GITHUB_BRANCH || 'main'
+  const repoUrl = (process.env.LITTLE_PRINCE_AGENT_REPO_URL || `https://github.com/${owner}/${repo}`).replace(/\.git$/i, '')
+  const latestReleaseUrl = process.env.LITTLE_PRINCE_AGENT_RELEASES_URL || `${repoUrl}/releases/latest`
+  const windowsDownloadUrl = process.env.LITTLE_PRINCE_AGENT_WINDOWS_DOWNLOAD_PROXY_URL || publicUrl(req, '/downloads/windows')
+  const linuxInstallUrl = process.env.LITTLE_PRINCE_AGENT_LINUX_INSTALL_URL || publicUrl(req, '/downloads/linux-install.sh')
+  return {
+    ok: true,
+    version: pkg.version || '0.0.0',
+    repo: { owner, name: repo, branch, url: repoUrl },
+    downloads: {
+      windows: {
+        label: 'Windows 桌面客户端',
+        url: windowsDownloadUrl,
+        upstreamUrl: process.env.LITTLE_PRINCE_AGENT_WINDOWS_DOWNLOAD_URL || latestReleaseUrl,
+        note: '由服务器先缓存 GitHub Release 安装包，再提供本地下载',
+      },
+      linux: {
+        label: 'Debian / Ubuntu 一键安装',
+        url: linuxInstallUrl,
+        command: `curl -fsSL ${linuxInstallUrl} | bash`,
+        note: '服务器私有云端网页版安装脚本',
+      },
+      source: {
+        label: '项目源码',
+        url: repoUrl,
+        note: '桌面端和云端网页端共用同一个仓库',
+      },
+    },
+    updatePolicy: '桌面客户端与云端网页版共用同一仓库；原项目更新后，网页端代码随同一分支/Release 一起更新。',
+  }
+}
+
+function sanitizeFileName(name = '') {
+  return String(name || '')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160) || 'littleprince-agent-setup.exe'
+}
+
+function fileNameFromUrl(url = '', fallback = 'littleprince-agent-setup.exe') {
+  try {
+    const parsed = new URL(url)
+    const last = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '')
+    return sanitizeFileName(last || fallback)
+  } catch {
+    return fallback
+  }
+}
+
+async function resolveWindowsDownloadAsset() {
+  const info = getDownloadInfo()
+  const directUrl = String(process.env.LITTLE_PRINCE_AGENT_WINDOWS_DOWNLOAD_URL || '').trim()
+  if (/\.(exe|msi)(?:[?#].*)?$/i.test(directUrl)) {
+    return { url: directUrl, fileName: fileNameFromUrl(directUrl), source: 'env' }
+  }
+
+  const apiUrl = `https://api.github.com/repos/${info.repo.owner}/${info.repo.name}/releases/latest`
+  const headers = {
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': 'littleprince-agent-download-cache',
+  }
+  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`
+  const response = await fetch(apiUrl, { headers })
+  if (!response.ok) throw new Error(`GitHub release lookup failed: HTTP ${response.status}`)
+  const release = await response.json()
+  const assets = Array.isArray(release.assets) ? release.assets : []
+  const asset = assets.find(a => /\.(exe|msi)$/i.test(a.name || '') && /setup|installer|小王子|agent/i.test(a.name || ''))
+    || assets.find(a => /\.(exe|msi)$/i.test(a.name || ''))
+  if (!asset?.browser_download_url) throw new Error('latest GitHub Release has no Windows installer asset')
+  return {
+    url: asset.browser_download_url,
+    fileName: sanitizeFileName(asset.name || fileNameFromUrl(asset.browser_download_url)),
+    source: 'github-release',
+  }
+}
+
+async function ensureCachedWindowsInstaller() {
+  fs.mkdirSync(DOWNLOAD_CACHE_DIR, { recursive: true })
+  const asset = await resolveWindowsDownloadAsset()
+  const filePath = path.join(DOWNLOAD_CACHE_DIR, asset.fileName)
+  const metaPath = `${filePath}.json`
+  if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+    return { ...asset, filePath, cached: true }
+  }
+
+  const tmpPath = `${filePath}.download`
+  const response = await fetch(asset.url, {
+    headers: { 'User-Agent': 'littleprince-agent-download-cache' },
+    redirect: 'follow',
+  })
+  if (!response.ok || !response.body) throw new Error(`installer download failed: HTTP ${response.status}`)
+  await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(tmpPath))
+  fs.renameSync(tmpPath, filePath)
+  fs.writeFileSync(metaPath, JSON.stringify({
+    ...asset,
+    cachedAt: new Date().toISOString(),
+    size: fs.statSync(filePath).size,
+  }, null, 2), 'utf-8')
+  return { ...asset, filePath, cached: false }
+}
+
+function serveLocalDownload(res, filePath, downloadName, contentType) {
+  const stat = fs.statSync(filePath)
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': stat.size,
+    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
+    'Cache-Control': 'no-cache',
+  })
+  fs.createReadStream(filePath).pipe(res)
+}
+
 function stripAssistantHistoryLabels(content) {
   return String(content || '')
     .trim()
@@ -230,6 +413,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     const base = `http://localhost:${port}`
     const url = new URL(req.url, base)
     const origin = req.headers.origin
+    setAuthCookieIfQueryToken(req, res, url)
 
     // GET /social/wechat-clawbot/qr — get current QR code status and URL
     if (req.method === 'GET' && url.pathname === '/social/wechat-clawbot/qr') {
@@ -249,15 +433,41 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return handleSocialWebhook(req, res, url)
     }
 
-    if (origin && !isAllowedOrigin(origin)) {
+    if (origin && !isAllowedOrigin(origin, req)) {
       return jsonResponse(res, 403, { ok: false, error: 'forbidden origin' })
+    }
+
+    // Public client downloads. These do not expose user data and must work for
+    // curl/download clients that do not have the web auth cookie yet.
+    if (req.method === 'GET' && url.pathname === '/downloads') {
+      jsonResponse(res, 200, getDownloadInfo(req))
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/downloads/windows') {
+      try {
+        const asset = await ensureCachedWindowsInstaller()
+        serveLocalDownload(res, asset.filePath, asset.fileName, 'application/vnd.microsoft.portable-executable')
+      } catch (err) {
+        jsonResponse(res, 502, { ok: false, error: err.message })
+      }
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/downloads/linux-install.sh') {
+      try {
+        serveLocalDownload(res, INSTALL_SCRIPT_PATH, 'install-debian-ubuntu.sh', 'text/x-shellscript; charset=utf-8')
+      } catch (err) {
+        jsonResponse(res, 404, { ok: false, error: err.message })
+      }
+      return
     }
 
     if (!hasAllowedAccess(req, url)) {
       return jsonResponse(res, 403, { ok: false, error: 'forbidden' })
     }
 
-    if (isAllowedOrigin(origin)) {
+    if (isAllowedOrigin(origin, req)) {
       res.setHeader('Access-Control-Allow-Origin', origin || 'null')
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -1567,7 +1777,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     const url = new URL(req.url, `http://localhost:${port}`)
     if (url.pathname === '/acui') {
       const origin = req.headers.origin
-      if (origin && !isAllowedOrigin(origin)) {
+      if (origin && !isAllowedOrigin(origin, req)) {
         socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
         socket.destroy()
         return
@@ -1579,6 +1789,17 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       }
       acuiWss.handleUpgrade(req, socket, head, (ws) => acuiWss.emit('connection', ws, req))
     } else if (url.pathname === '/voice/cloud') {
+      const origin = req.headers.origin
+      if (origin && !isAllowedOrigin(origin, req)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
+        socket.destroy()
+        return
+      }
+      if (!hasAllowedAccess(req, url)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
+        socket.destroy()
+        return
+      }
       cloudWss.handleUpgrade(req, socket, head, (ws) => cloudWss.emit('connection', ws, req))
     } else {
       socket.destroy()

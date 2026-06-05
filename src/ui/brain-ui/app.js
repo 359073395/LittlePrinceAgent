@@ -1,5 +1,5 @@
 ﻿import { renderBrainUiApp } from "./app-shell.js";
-import { API } from "./api-client.js";
+import { API, apiUrl } from "./api-client.js";
 import { bootstrapACUI } from "./acui/bootstrap.js";
 import { initChat, friendlyChannelLabel } from "./chat.js";
 import { initPanelCollapse } from "./panel-collapse.js";
@@ -2751,7 +2751,7 @@ function initTTSSettings() {
 
     let savedProvider = localStorage.getItem(VOICE_PROVIDER_KEY) || "aliyun";
     try {
-      const resp = await fetch("http://127.0.0.1:3721/settings/voice");
+      const resp = await fetch(apiUrl("/settings/voice"));
       const data = await resp.json().catch(() => ({}));
       if (resp.ok && data?.voice?.voiceProvider) {
         savedProvider = data.voice.voiceProvider;
@@ -2810,7 +2810,7 @@ function initTTSSettings() {
       if (Object.keys(body).length > 0) {
         try {
           saveVoiceBtn.disabled = true;
-          const resp = await fetch("http://127.0.0.1:3721/settings/voice", {
+          const resp = await fetch(apiUrl("/settings/voice"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
@@ -3082,6 +3082,10 @@ function initTTSSettings() {
   const settingsIgnoredSection     = document.getElementById("settings-ignored-section");
   const settingsIgnoredVersionEl   = document.getElementById("settings-ignored-version-val");
   const settingsClearIgnoredBtn    = document.getElementById("settings-clear-ignored-btn");
+  const settingsDownloadWindows    = document.getElementById("settings-download-windows");
+  const settingsDownloadLinux      = document.getElementById("settings-download-linux");
+  const settingsDownloadSource     = document.getElementById("settings-download-source");
+  const settingsDownloadNote       = document.getElementById("settings-download-note");
 
   let pendingUpdateVersion = null;
   let removeUpdaterListener = null;
@@ -3117,8 +3121,26 @@ function initTTSSettings() {
     if (settingsIgnoredVersionEl && ignored) settingsIgnoredVersionEl.textContent = ignored;
   }
 
+  async function loadDownloadLinks() {
+    try {
+      const res = await fetch(apiUrl("/downloads"), { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (settingsDownloadWindows && data?.downloads?.windows?.url) settingsDownloadWindows.href = data.downloads.windows.url;
+      if (settingsDownloadLinux && data?.downloads?.linux?.url) {
+        settingsDownloadLinux.href = data.downloads.linux.url;
+        settingsDownloadLinux.title = data.downloads.linux.command || "";
+      }
+      if (settingsDownloadSource && data?.downloads?.source?.url) settingsDownloadSource.href = data.downloads.source.url;
+      if (settingsDownloadNote && data?.updatePolicy) {
+        settingsDownloadNote.textContent = `Windows 安装包由服务器先缓存原项目 Release，再从服务器下载到本地。${data.updatePolicy}`;
+      }
+    } catch {}
+  }
+
   async function loadUpdateSettings() {
     syncUpdateSettings();
+    loadDownloadLinks();
     const bridge = window.littleprinceagent;
     if (!bridge?.isElectron) {
       if (settingsCurrentVersion) settingsCurrentVersion.textContent = "仅桌面端可用";

@@ -347,6 +347,60 @@
       font-size: 13px;
       color: #7a90a8;
     }
+    .client-downloads {
+      margin-top: 18px;
+      padding: 14px;
+      border: 1px solid rgba(132, 161, 204, 0.16);
+      border-radius: 14px;
+      background: rgba(12, 22, 34, 0.64);
+    }
+    .client-downloads-title {
+      margin: 0 0 10px;
+      color: #d8e7fb;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .client-downloads-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .client-downloads a {
+      min-height: 38px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 10px;
+      border: 1px solid rgba(132, 161, 204, 0.22);
+      background: rgba(16, 25, 38, 0.88);
+      color: #dfeaff;
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: 600;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .client-downloads a:hover {
+      border-color: rgba(117, 168, 255, 0.55);
+      background: rgba(30, 48, 72, 0.9);
+    }
+    .client-downloads a.source-link {
+      grid-column: 1 / -1;
+      color: #9fcbff;
+    }
+    .client-downloads-note {
+      margin: 10px 0 0;
+      font-size: 12px;
+      color: #6f819a;
+      line-height: 1.5;
+    }
+    @media (max-width: 460px) {
+      .client-downloads-actions {
+        grid-template-columns: 1fr;
+      }
+      .client-downloads a.source-link {
+        grid-column: auto;
+      }
+    }
   </style>
 </head>
 <body>
@@ -443,6 +497,16 @@
     <div id="status" class="status"></div>
     <button id="settings-toggle" type="button">或使用自定义端点（本地模型）</button>
 
+    <section class="client-downloads" aria-label="下载客户端">
+      <p class="client-downloads-title">下载客户端</p>
+      <div class="client-downloads-actions">
+        <a id="download-windows" href="/downloads/windows">Windows 桌面版</a>
+        <a id="download-linux" href="/downloads/linux-install.sh">Debian / Ubuntu</a>
+        <a id="download-source" class="source-link" href="https://github.com/359073395/LittlePrinceAgent" target="_blank" rel="noopener">源码与更新说明</a>
+      </div>
+      <p class="client-downloads-note" id="download-note">Windows 安装包由服务器先缓存原项目 Release，再从服务器下载到本地；网页端与原项目共用同一仓库同步更新。</p>
+    </section>
+
     <p class="hint">
       激活信息会保存到本地 <code>config.json</code>，仅用于连接对应厂商的官方 API。
     </p>
@@ -479,6 +543,26 @@
     const agentNameInput = document.getElementById('agentName')
     const btn = document.getElementById('activate')
     const statusEl = document.getElementById('status')
+    const downloadWindows = document.getElementById('download-windows')
+    const downloadLinux = document.getElementById('download-linux')
+    const downloadSource = document.getElementById('download-source')
+    const downloadNote = document.getElementById('download-note')
+
+    fetch('/downloads', { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data?.downloads) return
+        if (downloadWindows && data.downloads.windows?.url) downloadWindows.href = data.downloads.windows.url
+        if (downloadLinux && data.downloads.linux?.url) {
+          downloadLinux.href = data.downloads.linux.url
+          downloadLinux.title = data.downloads.linux.command || ''
+        }
+        if (downloadSource && data.downloads.source?.url) downloadSource.href = data.downloads.source.url
+        if (downloadNote && data.updatePolicy) {
+          downloadNote.textContent = `Windows 安装包由服务器先缓存原项目 Release，再从服务器下载到本地。${data.updatePolicy}`
+        }
+      })
+      .catch(() => {})
 
     const AGENT_NAME_RE = /^[一-龥A-Za-z0-9 _-]+$/
     function readAgentName() {

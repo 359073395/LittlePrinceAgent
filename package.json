@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "electron .",
+    "start:web": "node src/index.js",
     "start:lan": "powershell -ExecutionPolicy Bypass -File scripts/start-lan.ps1 app",
     "start:backend": "node --env-file=.env src/index.js",
     "start:backend:lan": "powershell -ExecutionPolicy Bypass -File scripts/start-lan.ps1 backend",
@@ -60,6 +61,7 @@
       "systemPrompt.html",
       "activation.html",
       "focus-banner.html",
+      "scripts/install-debian-ubuntu.sh",
       "build/icon.ico",
       "sandbox/**/*",
       "music/**/*",

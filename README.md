@@ -1,3 +1,5 @@
+![图片](https://github.com/359073395/LittlePrinceAgent/blob/main/images/AGI128k.jpg)
+
 # 小王子 Agent — 数字意识框架
 
 **v1.0.2** | 一个持续运行的「数字意识」实验框架。
@@ -141,6 +143,9 @@ npm start
 
 # 纯后端模式
 npm run start:backend
+
+# 网页/云端入口（云端部署见 CLOUD-WEB.md）
+npm run start:web
 
 # 开发模式（文件改动自动重启）
 npm run dev

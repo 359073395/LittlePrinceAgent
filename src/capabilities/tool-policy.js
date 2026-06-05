@@ -1,4 +1,5 @@
 import { config } from '../config.js'
+import { isCloudMode, isRuntimeToolEnabled } from '../runtime-mode.js'
 
 const TOOL_RISK = {
   read_file: 'low',
@@ -73,6 +74,9 @@ export function isDangerousShellCommand(command) {
 
 export function evaluateToolPolicy(name, args = {}, context = {}) {
   const risk = classifyTool(name)
+  if (!isRuntimeToolEnabled(name)) {
+    return { allowed: false, risk, reason: isCloudMode() ? 'cloud mode disables local privileged tools by default' : 'tool disabled by runtime mode' }
+  }
   const blockedTools = config.security?.blockedTools || []
   if (blockedTools.includes(name)) {
     return { allowed: false, risk, reason: `工具 "${name}" 已被安全策略禁用` }

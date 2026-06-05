@@ -2,6 +2,7 @@
 // 云端 ASR（阿里云/腾讯云/讯飞），通过后端 WebSocket 代理
 //
 // 点云算法移植自 ACUI (Remix)/Voice Component.html
+import { wsUrl } from './api-client.js';
 
 // ─── 球面采样（Fibonacci） ───
 function fibSphere(n, radius) {
@@ -81,7 +82,7 @@ const SOUND_EVENT_ICONS = {
   knock_door:      '🚪',
 };
 
-const CLOUD_WS_URL  = 'ws://127.0.0.1:3721/voice/cloud';
+const CLOUD_WS_URL  = wsUrl('/voice/cloud');
 const VOICE_THRESHOLD_KEY = 'littleprinceagent-voice-threshold';
 const VOICE_PROVIDER_KEY = 'littleprinceagent-voice-provider';
 

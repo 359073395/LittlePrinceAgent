@@ -40,6 +40,7 @@ import { PRIMARY_USER_ID, formatPresenceForPrompt, normalizeChannel, isExternalC
 import { truncateToolResultForUI } from './runtime/tool-result-preview.js'
 import { buildLLMMessages } from './runtime/messages.js'
 import { parseMarkers } from './runtime/markers.js'
+import { cloudCapabilityEnabled, isCloudMode, runtimeModeSummary } from './runtime-mode.js'
 
 // On first launch, copy sandbox seed files from the resource directory to the user data directory (Electron install)
 seedSandboxOnce()
@@ -62,27 +63,51 @@ try {
 
 // Collect host system environment info (full scan + persist on first run, then refresh dynamic fields).
 // Must complete before the main loop starts so buildSystemPrompt can inject the env block.
-await collectSystemInfo()
+console.log(`[runtime] mode=${runtimeModeSummary().mode}${isCloudMode() ? ' (cloud-safe defaults)' : ''}`)
+if (cloudCapabilityEnabled('HOST_CONTEXT')) {
+  await collectSystemInfo()
+} else {
+  console.log('[runtime] host context collection disabled')
+}
 
 // Scan the user's desktop (shortcuts cached by mtime, regular files scanned every time)
-collectDesktopInfo(getDesktopPath())
+if (cloudCapabilityEnabled('DESKTOP_SCAN')) {
+  collectDesktopInfo(getDesktopPath())
+} else {
+  console.log('[runtime] desktop scan disabled')
+}
 
 // Scan installed software once so software/app/proxy questions can use local evidence.
-collectInstalledSoftware()
+if (cloudCapabilityEnabled('INSTALLED_SOFTWARE_SCAN')) {
+  collectInstalledSoftware()
+} else {
+  console.log('[runtime] installed software scan disabled')
+}
 
 // Scan the user's local resources (ssh hosts, keys, known_hosts, git identity)
 // for the "Self-Sufficient Execution" prompt — so the agent already knows what
 // the user has before being asked "上服务器看看".
-collectLocalResources()
+if (cloudCapabilityEnabled('LOCAL_RESOURCES_SCAN')) {
+  collectLocalResources()
+} else {
+  console.log('[runtime] local resources scan disabled')
+}
 
 // Collect geo-location + live weather (refresh on IP change or after 7 days; weather refreshed every time)
-const geoResult = await collectGeoWeather()
+const geoResult = cloudCapabilityEnabled('GEO_WEATHER')
+  ? await collectGeoWeather()
+  : null
+if (!geoResult) console.log('[runtime] geo/weather collection disabled')
 
 // Collect trending topics (CN → Weibo+Zhihu, others → HN+Reddit; 1h cache)
 await collectTrending(geoResult?.location?.country_code)
 
 // Scan locally installed AI agents (Claude Code, Codex, Hermes, OpenClaw, etc.) and persist to known_agents table
-await collectAgents()
+if (cloudCapabilityEnabled('LOCAL_AGENT_SCAN')) {
+  await collectAgents()
+} else {
+  console.log('[runtime] local AI agent scan disabled')
+}
 
 // Load persisted installed tools
 await loadInstalledTools()
@@ -684,13 +709,13 @@ function buildSystemEnv(msg) {
   const text = (typeof msg === 'string' ? msg : msg?.content || '').toLowerCase()
   const blocks = []
   // 英文缩写用 \b 避免误匹配子串（os→close, ip→script, ram→program）
-  if (/系统信息|操作系统|电脑|主机名|内存|运行内存|hostname|时区|用户名|\bos\b|\bcpu\b|\bram\b|\bip\b|\bip地址\b|locale/.test(text))
+  if (cloudCapabilityEnabled('HOST_CONTEXT') && /系统信息|操作系统|电脑|主机名|内存|运行内存|hostname|时区|用户名|\bos\b|\bcpu\b|\bram\b|\bip\b|\bip地址\b|locale/.test(text))
     blocks.push(getSystemInfoBlock())
-  if (/桌面|快捷方式|桌面文件|桌面应用|已安装|浏览器|启动程序/.test(text))
+  if (cloudCapabilityEnabled('DESKTOP_SCAN') && /桌面|快捷方式|桌面文件|桌面应用|已安装|浏览器|启动程序/.test(text))
     blocks.push(getDesktopBlock())
-  if (/软件|应用|程序|客户端|工具|装了什么|用了什么|代理|科学上网|翻墙|\bvpn\b|\bproxy\b|clash|mihomo|v2ray|xray|sing-?box|shadowrocket|shadowsocks|wireguard|tailscale|zerotier|openvpn/.test(text))
+  if (cloudCapabilityEnabled('INSTALLED_SOFTWARE_SCAN') && /软件|应用|程序|客户端|工具|装了什么|用了什么|代理|科学上网|翻墙|\bvpn\b|\bproxy\b|clash|mihomo|v2ray|xray|sing-?box|shadowrocket|shadowsocks|wireguard|tailscale|zerotier|openvpn/.test(text))
     blocks.push(getInstalledSoftwareBlock())
-  if (/天气|气温|温度|下雨|下雪|晴天|气候|风力|风速|台风|位置|城市|在哪个城市/.test(text))
+  if (cloudCapabilityEnabled('GEO_WEATHER') && /天气|气温|温度|下雨|下雪|晴天|气候|风力|风速|台风|位置|城市|在哪个城市/.test(text))
     blocks.push(getGeoWeatherBlock())
   if (/热点|新闻|热搜|热榜|今天发生|最近发生|微博|知乎|头条/.test(text))
     blocks.push(getTrendingBlock())

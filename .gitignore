@@ -143,3 +143,9 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# Local Codex/test workspace
+work/
+__pycache__/
+*.pyc
+config.json

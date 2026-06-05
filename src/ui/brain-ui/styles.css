@@ -427,6 +427,37 @@ body {
   color: var(--dim);
 }
 
+.settings-download-actions {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.settings-download-link {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--cool) 26%, transparent);
+  background: color-mix(in srgb, var(--cool) 10%, transparent);
+  color: var(--ink);
+  text-decoration: none;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-download-link:hover {
+  border-color: color-mix(in srgb, var(--cool) 45%, transparent);
+  background: color-mix(in srgb, var(--cool) 16%, transparent);
+}
+
+.settings-download-link.secondary {
+  color: var(--ink2);
+  background: transparent;
+  border-color: var(--line);
+}
+
 .stream-title-text {
   font-size: 13px;
   font-weight: 600;

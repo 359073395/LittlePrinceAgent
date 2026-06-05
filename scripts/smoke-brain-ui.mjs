@@ -91,6 +91,16 @@ function createServer() {
       return
     }
 
+    if (url.pathname === '/audit/stats') {
+      sendJson(res, {
+        windowHours: Number(url.searchParams.get('hours') || 1),
+        sinceIso: new Date().toISOString(),
+        recall: { total: 0, avg_chosen: 0, zero_match_count: 0 },
+        extract: { total: 0, avg_extracted: 0, skipped_count: 0 },
+      })
+      return
+    }
+
     if (url.pathname === '/settings') {
       sendJson(res, {
         llm: { activated: true, provider: 'deepseek', model: 'smoke', models: [{ id: 'smoke', label: 'Smoke' }] },
@@ -162,6 +172,11 @@ function createServer() {
 
     if (url.pathname === '/person-card-state') {
       sendJson(res, { ok: true, state: { active: true } })
+      return
+    }
+
+    if (url.pathname === '/aivideo/history') {
+      sendJson(res, { ok: true, jobs: [] })
       return
     }
 

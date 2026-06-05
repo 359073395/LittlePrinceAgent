@@ -1,13 +1,16 @@
 import { startDiscordConnector } from './discord.js'
 import { startClawbotConnector } from './wechat-clawbot.js'
+import { cloudCapabilityEnabled } from '../runtime-mode.js'
 
 const running = new Map() // platform → connector
 
 export async function startSocialConnectors({ pushMessage, emitEvent } = {}) {
   const starters = [
     { platform: 'discord', start: () => startDiscordConnector({ pushMessage, emitEvent }) },
-    { platform: 'wechat-clawbot', start: () => startClawbotConnector({ pushMessage, emitEvent }) },
-  ]
+    cloudCapabilityEnabled('LOCAL_PRIVILEGED_TOOLS')
+      ? { platform: 'wechat-clawbot', start: () => startClawbotConnector({ pushMessage, emitEvent }) }
+      : null,
+  ].filter(Boolean)
 
   for (const { platform, start } of starters) {
     try {
@@ -35,7 +38,9 @@ export async function restartConnector(platform, { pushMessage, emitEvent } = {}
 
   const starters = {
     discord: () => startDiscordConnector({ pushMessage, emitEvent }),
-    'wechat-clawbot': () => startClawbotConnector({ pushMessage, emitEvent }),
+    ...(cloudCapabilityEnabled('LOCAL_PRIVILEGED_TOOLS')
+      ? { 'wechat-clawbot': () => startClawbotConnector({ pushMessage, emitEvent }) }
+      : {}),
   }
 
   const start = starters[platform]

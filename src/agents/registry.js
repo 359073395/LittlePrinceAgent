@@ -1,5 +1,6 @@
 import { getDB, getConfig, setConfig } from '../db.js'
 import { detectAgents } from './detector.js'
+import { cloudCapabilityEnabled } from '../runtime-mode.js'
 
 const CONFIG_KEY_ASKED = 'agent_delegation_asked'
 const CONFIG_KEY_ALLOWED = 'agent_delegation_allowed'
@@ -140,6 +141,7 @@ export async function collectAgents() {
 // ── 生成用于系统提示词注入的文本块 ────────────────────────────────────────
 
 export function buildAgentContextBlock() {
+  if (!cloudCapabilityEnabled('LOCAL_AGENT_SCAN')) return ''
   if (!isDelegationAllowed()) return ''
   const agents = getAvailableAgents()
   if (!agents.length) return ''
@@ -160,6 +162,7 @@ ${lines.join('\n')}
 // ── 生成"首次发现 Agent，需要询问用户"的方向指令文本 ─────────────────────
 
 export function buildDelegationAskDirections() {
+  if (!cloudCapabilityEnabled('LOCAL_AGENT_SCAN')) return null
   if (hasDelegationBeenAsked()) return null
   const available = getAvailableAgents()
   if (!available.length) {

@@ -729,6 +729,15 @@ const createSettingsModal = () => `
             </div>
             <p class="settings-hint">开启后发现新版本时不会弹出提示卡片，仍可在此处手动检查。</p>
           </div>
+          <div class="settings-section">
+            <div class="settings-section-label">下载客户端</div>
+            <p class="settings-hint" id="settings-download-note">Windows 安装包由服务器先缓存原项目 Release，再从服务器下载到本地。</p>
+            <div class="settings-row-action settings-download-actions">
+              <a class="settings-download-link" id="settings-download-windows" href="/downloads/windows">Windows 桌面版</a>
+              <a class="settings-download-link" id="settings-download-linux" href="/downloads/linux-install.sh">Debian / Ubuntu</a>
+              <a class="settings-download-link secondary" id="settings-download-source" href="https://github.com/359073395/LittlePrinceAgent" target="_blank" rel="noopener">源码与更新说明</a>
+            </div>
+          </div>
           <div class="settings-section" id="settings-ignored-section" style="display:none;">
             <div class="settings-section-label">已忽略的版本</div>
             <div class="settings-row">
