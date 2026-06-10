@@ -10,6 +10,7 @@ import {
   getUnconsumedUISignals,
   markUISignalsConsumed,
   getConfig,
+  getUserProfile,
   insertRecallAudit,
   searchMemories,
 } from '../db.js'
@@ -63,15 +64,18 @@ export async function runInjector({ message, state, hint = '' }) {
   const constraints = getActiveConstraints()
 
   let personMemory = null
+  let userProfile = null
   let conversationWindow = []
   let senderMemories = []
 
   if (senderId) {
     personMemory = getPersonMemory(senderId)
+    userProfile = getUserProfile(senderId)
     conversationWindow = getRecentConversation(senderId, 20, 24)
     senderMemories = getMemoriesByEntity(senderId, 10)
   } else if (message && /^TICK\s/i.test(message.trim())) {
     personMemory = getPersonMemory(PRIMARY_USER_ID)
+    userProfile = getUserProfile(PRIMARY_USER_ID)
     conversationWindow = getRecentConversationTimeline(40, L2_CONTEXT_HOURS)
     senderMemories = getMemoriesByEntity(PRIMARY_USER_ID, 10)
   }
@@ -208,7 +212,7 @@ export async function runInjector({ message, state, hint = '' }) {
     : null
 
   // 自我快照：常驻的"你刚才是怎样的你"。不分 L1/L2 / 不分 TICK，只要有 jarvis 历史就出。
-  // 注入器拿 agent_name 用作身份锚的开头（"你是 小王子。..."）。
+  // 注入器拿 agent_name 用作身份锚的开头（"你是 小白龙。..."）。
   const agentName = getConfig('agent_name') || '小王子'
   const selfSnapshot = computeSelfSnapshot({ conversationWindow, actionLog, agentName })
 
@@ -244,6 +248,7 @@ export async function runInjector({ message, state, hint = '' }) {
     recallMemories,
     conversationWindow,
     personMemory,
+    userProfile,
     directions,
     constraints,
     thought: null,

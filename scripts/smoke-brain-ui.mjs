@@ -175,6 +175,27 @@ function createServer() {
       return
     }
 
+    if (url.pathname === '/doc-panel-state') {
+      sendJson(res, { ok: true, state: { active: false, topicId: null } })
+      return
+    }
+
+    if (url.pathname === '/docs') {
+      sendJson(res, {
+        ok: true,
+        topics: [
+          {
+            id: 'voice_config',
+            title: 'Voice Config',
+            subtitle: 'Smoke docs topic',
+            icon: 'mic',
+            summary: 'Smoke documentation topic',
+          },
+        ],
+      })
+      return
+    }
+
     if (url.pathname === '/aivideo/history') {
       sendJson(res, { ok: true, jobs: [] })
       return

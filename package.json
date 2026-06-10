@@ -1,7 +1,7 @@
 {
   "name": "littleprince-agent",
   "productName": "小王子 Agent",
-  "version": "1.0.2",
+  "version": "2.1.379",
   "description": "A continuously running digital consciousness framework",
   "type": "module",
   "main": "electron/main.cjs",
@@ -19,8 +19,14 @@
     "publish": "electron-builder --win --publish always",
     "postinstall": "electron-builder install-app-deps",
     "test:rule-context": "electron ./src/test-rule-context.js",
+    "test:complex-task": "electron ./src/test-complex-task.js",
     "test:relevance": "electron ./src/test-relevance-selection.js",
     "test:section-gate": "node ./src/test-section-gate.js",
+    "test:agent-skills": "node ./src/test-agent-skills.js",
+    "test:config-upgrade": "node ./src/test-config-upgrade.js",
+    "repair:memories:dry": "electron ./scripts/repair-memory-quality.js",
+    "repair:memories": "electron ./scripts/repair-memory-quality.js --apply",
+    "probe:config-upgrade": "node ./scripts/probe-config-upgrade.mjs",
     "smoke:tools": "node scripts/smoke-tools.mjs",
     "smoke:brain-ui": "node scripts/smoke-brain-ui.mjs",
     "smoke:social": "node scripts/smoke-social.mjs"
@@ -52,6 +58,7 @@
     "files": [
       "electron/**/*",
       "src/**/*",
+      "skills/**/*",
       "scripts/seed-memories.js",
       "index.html",
       "dashboard.html",
@@ -61,6 +68,7 @@
       "systemPrompt.html",
       "activation.html",
       "focus-banner.html",
+      "turn-trace.html",
       "scripts/install-debian-ubuntu.sh",
       "build/icon.ico",
       "sandbox/**/*",
@@ -114,4 +122,3 @@
     ]
   }
 }
-

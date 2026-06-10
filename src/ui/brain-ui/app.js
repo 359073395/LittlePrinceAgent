@@ -1,5 +1,5 @@
 ﻿import { renderBrainUiApp } from "./app-shell.js";
-import { API, apiUrl } from "./api-client.js";
+import { API } from "./api-client.js";
 import { bootstrapACUI } from "./acui/bootstrap.js";
 import { initChat, friendlyChannelLabel } from "./chat.js";
 import { initPanelCollapse } from "./panel-collapse.js";
@@ -13,8 +13,8 @@ import { attachJarvisFx, isFxEnabledForVoice, setFxEnabledForVoice, getJarvisFxP
 renderBrainUiApp(document.body);
 const THEME_KEY = "jarvis-brain-ui-theme";
 const PHYSICS_STORAGE_KEY = "jarvis-brain-ui-physics";
-const ACTIVATION_WARMUP_KEY = "littleprinceagent_activation_warmup_until";
-const UI_ZOOM_STORAGE_KEY = "littleprinceagent_ui_zoom_factor";
+const ACTIVATION_WARMUP_KEY = "bailongma_activation_warmup_until";
+const UI_ZOOM_STORAGE_KEY = "bailongma_ui_zoom_factor";
 const MAX_CHAT_HISTORY = 60;
 const DEFAULT_AGENT_NAME = "小王子";
 const DEFAULT_UI_ZOOM = 1.1;
@@ -22,7 +22,7 @@ const MIN_UI_ZOOM = 0.8;
 const MAX_UI_ZOOM = 1.8;
 const UI_ZOOM_STEP = 0.1;
 const UI_ZOOM_WHEEL_STEP = 0.05;
-const MEMORY_GRAPH_STORAGE_KEY = "littleprinceagent-memory-graph-enabled";
+const MEMORY_GRAPH_STORAGE_KEY = "bailongma-memory-graph-enabled";
 const MEMORY_GRAPH_ENABLED = localStorage.getItem(MEMORY_GRAPH_STORAGE_KEY) !== "false";
 
 const themeSwitcher = document.getElementById("theme-switcher");
@@ -41,8 +41,8 @@ const focusBlockEl = document.getElementById("focus-block");
 const focusStackEl = document.getElementById("focus-stack");
 const focusDepthEl = document.getElementById("focus-depth");
 
-const IGNORED_VERSION_KEY = "littleprinceagent_ignored_update_version";
-const SUPPRESS_UPDATES_KEY = "littleprinceagent_suppress_update_notifications";
+const IGNORED_VERSION_KEY = "bailongma_ignored_update_version";
+const SUPPRESS_UPDATES_KEY = "bailongma_suppress_update_notifications";
 
 let agentName = DEFAULT_AGENT_NAME;
 let currentUiZoom = DEFAULT_UI_ZOOM;
@@ -81,7 +81,7 @@ function applyUiZoom(factor, { persist = true } = {}) {
   const nextZoom = clampZoomFactor(factor);
   currentUiZoom = nextZoom;
 
-  const bridge = window.littleprinceagent;
+  const bridge = window.bailongma;
   if (bridge?.isElectron && typeof bridge.setZoomFactor === "function") {
     bridge.setZoomFactor(nextZoom);
   } else {
@@ -97,7 +97,7 @@ function stepUiZoom(delta) {
 }
 
 function initUiZoom() {
-  const bridge = window.littleprinceagent;
+  const bridge = window.bailongma;
   const initialZoom = loadSavedUiZoom();
 
   if (!bridge?.isElectron) {
@@ -1450,10 +1450,10 @@ function handle({ type, data = {} }) {
       setAgentName(data.name);
       break;
     case "media_mode":
-      window.dispatchEvent(new CustomEvent("littleprinceagent:media", { detail: data }));
+      window.dispatchEvent(new CustomEvent("bailongma:media", { detail: data }));
       break;
     case "aivideo_mode":
-      window.dispatchEvent(new CustomEvent("littleprinceagent:aivideo", { detail: data }));
+      window.dispatchEvent(new CustomEvent("bailongma:aivideo", { detail: data }));
       break;
     case "hotspot_mode":
       setHotspotMode(!!data.active || data.action === "show" || data.action === "open", { source: "agent_event" });
@@ -1465,7 +1465,7 @@ function handle({ type, data = {} }) {
       setPersonCardMode(!!data.active || data.action === "show" || data.action === "open" || data.action === "update", { source: "agent_event", card: data.card || null });
       break;
     case "social_status":
-      window.dispatchEvent(new CustomEvent("littleprinceagent:social_status", { detail: data }));
+      window.dispatchEvent(new CustomEvent("bailongma:social_status", { detail: data }));
       break;
     case "show_wechat_popup":
       showWechatPopup();
@@ -1595,7 +1595,7 @@ let liveTurnSpeak = false;
 
 // 流式语音合成：边下边播，首包到达即出声（后端 /tts/stream 本就分块返回，
 // 这里用 MediaSource 消费，省去"等整段下载完再播"的延迟）。默认开启，可在设置关闭。
-const TTS_STREAMING_KEY = 'littleprinceagent.tts.streaming';
+const TTS_STREAMING_KEY = 'bailongma.tts.streaming';
 function isTTSStreamingEnabled() {
   try { return localStorage.getItem(TTS_STREAMING_KEY) !== '0'; } catch { return true; } // 默认开启
 }
@@ -1720,7 +1720,7 @@ function startTTSAudio(audioEl, revokeUrl, opts = {}) {
   audioEl.volume = 1.0; // ensure full volume (avoid residual duck state from previous play)
   attachJarvisFx(audioEl, activeTTSVoiceId); // 仅当该音色开启了机器人音效才叠加；否则原生播放
   // Suspend cloud ASR but keep the mic hardware open for interruption detection
-  if (manageMic) window.littleprinceagentVoice?.suspendForTTS?.();
+  if (manageMic) window.bailongmaVoice?.suspendForTTS?.();
   // 结束/出错收尾。注意：被新一轮播放替换掉的旧元素，其 onerror 可能在 pause/revoke 后迟到触发；
   // 此时全局已指向新元素，必须用 ttsAudioEl===audioEl 守卫，否则会误杀新播放的流读取器和状态。
   const finish = () => {
@@ -1730,14 +1730,14 @@ function startTTSAudio(audioEl, revokeUrl, opts = {}) {
     ttsAudioEl = null;
     if (onComplete) { onComplete(); return; } // 队列段：交回队列推进，麦克风/收尾由队列统一管
     ttsCurrentText = '';
-    if (manageMic) window.littleprinceagentVoice?.resumeAfterMedia();
+    if (manageMic) window.bailongmaVoice?.resumeAfterMedia();
   };
   audioEl.onended = finish;
   audioEl.onerror = finish;
   audioEl.play().catch(() => {
     if (ttsAudioEl !== audioEl) return;
     if (onComplete) { ttsAudioEl = null; onComplete(); return; }
-    if (manageMic) window.littleprinceagentVoice?.resumeAfterMedia();
+    if (manageMic) window.bailongmaVoice?.resumeAfterMedia();
   });
 }
 
@@ -1803,7 +1803,7 @@ async function playTTSReply(text) {
     }
   } catch {
     ttsCurrentText = '';
-    window.littleprinceagentVoice?.resumeAfterMedia();
+    window.bailongmaVoice?.resumeAfterMedia();
   }
 }
 
@@ -1884,7 +1884,7 @@ async function pumpSttsQueue() {
   sttsPlaying = true;
   sttsCurSeg = seg;
   // 麦克风只在首段挂起一次（后续段之间保持挂起，避免反复重置 bargein 缓冲/预热计时）
-  if (!sttsMicSuspended) { sttsMicSuspended = true; window.littleprinceagentVoice?.suspendForTTS?.(); }
+  if (!sttsMicSuspended) { sttsMicSuspended = true; window.bailongmaVoice?.suspendForTTS?.(); }
   const onComplete = () => {
     sttsSpoken += seg;
     sttsCurSeg = '';
@@ -1925,7 +1925,7 @@ function finalizeStreamingTTS() {
 function endStreamingTTS() {
   sttsActive = false;
   ttsStreamingMode = false;
-  if (sttsMicSuspended) { sttsMicSuspended = false; window.littleprinceagentVoice?.resumeAfterMedia(); }
+  if (sttsMicSuspended) { sttsMicSuspended = false; window.bailongmaVoice?.resumeAfterMedia(); }
   sttsQueue = []; sttsBuf = ''; sttsCurSeg = ''; sttsSpoken = ''; sttsPlaying = false;
 }
 
@@ -2670,11 +2670,11 @@ function initTTSSettings() {
     });
   }
 
-  const VOICE_LANG_KEY       = "littleprinceagent-voice-lang";
-  const VOICE_AUTO_SEND_KEY  = "littleprinceagent-voice-auto-send";
-  const VOICE_AUTO_MIC_KEY   = "littleprinceagent-voice-auto-mic";
-  const VOICE_THRESHOLD_KEY  = "littleprinceagent-voice-threshold";
-  const VOICE_PROVIDER_KEY   = "littleprinceagent-voice-provider";
+  const VOICE_LANG_KEY       = "bailongma-voice-lang";
+  const VOICE_AUTO_SEND_KEY  = "bailongma-voice-auto-send";
+  const VOICE_AUTO_MIC_KEY   = "bailongma-voice-auto-mic";
+  const VOICE_THRESHOLD_KEY  = "bailongma-voice-threshold";
+  const VOICE_PROVIDER_KEY   = "bailongma-voice-provider";
 
   function applyVoiceProviderUI(provider) {
     const panels = {
@@ -2751,7 +2751,7 @@ function initTTSSettings() {
 
     let savedProvider = localStorage.getItem(VOICE_PROVIDER_KEY) || "aliyun";
     try {
-      const resp = await fetch(apiUrl("/settings/voice"));
+      const resp = await fetch("http://127.0.0.1:3721/settings/voice");
       const data = await resp.json().catch(() => ({}));
       if (resp.ok && data?.voice?.voiceProvider) {
         savedProvider = data.voice.voiceProvider;
@@ -2783,7 +2783,7 @@ function initTTSSettings() {
       localStorage.setItem(VOICE_THRESHOLD_KEY,  String(threshold));
       localStorage.setItem(VOICE_PROVIDER_KEY,   provider);
 
-      window.dispatchEvent(new CustomEvent("littleprinceagent:voice-threshold", { detail: { threshold } }));
+      window.dispatchEvent(new CustomEvent("bailongma:voice-threshold", { detail: { threshold } }));
 
       const body = { voiceProvider: provider };
       const aliyunKey = document.getElementById("voice-aliyun-key")?.value?.trim();
@@ -2810,7 +2810,7 @@ function initTTSSettings() {
       if (Object.keys(body).length > 0) {
         try {
           saveVoiceBtn.disabled = true;
-          const resp = await fetch(apiUrl("/settings/voice"), {
+          const resp = await fetch("http://127.0.0.1:3721/settings/voice", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
@@ -3053,7 +3053,7 @@ function initTTSSettings() {
     }
   });
 
-  window.addEventListener("littleprinceagent:social_status", (e) => {
+  window.addEventListener("bailongma:social_status", (e) => {
     const d = e.detail;
     if (d?.platform !== "wechat-clawbot") return;
     if (d.status === "connected") {
@@ -3141,7 +3141,7 @@ function initTTSSettings() {
   async function loadUpdateSettings() {
     syncUpdateSettings();
     loadDownloadLinks();
-    const bridge = window.littleprinceagent;
+    const bridge = window.bailongma;
     if (!bridge?.isElectron) {
       if (settingsCurrentVersion) settingsCurrentVersion.textContent = "仅桌面端可用";
       if (settingsCheckUpdateBtn) settingsCheckUpdateBtn.disabled = true;
@@ -3213,7 +3213,7 @@ function initTTSSettings() {
   });
 
   settingsCheckUpdateBtn?.addEventListener("click", async () => {
-    const bridge = window.littleprinceagent;
+    const bridge = window.bailongma;
     if (!bridge?.isElectron) return;
     setUpdateStatusText("正在检查更新…", "checking");
     setUpdateFeedback("");
@@ -3231,7 +3231,7 @@ function initTTSSettings() {
   });
 
   settingsDownloadUpdateBtn?.addEventListener("click", async () => {
-    const bridge = window.littleprinceagent;
+    const bridge = window.bailongma;
     if (!bridge?.isElectron) return;
     setUpdateStatusText("开始下载…", "downloading");
     showUpdateButtons({ check: false });
@@ -3244,7 +3244,7 @@ function initTTSSettings() {
   });
 
   settingsInstallUpdateBtn?.addEventListener("click", () => {
-    window.littleprinceagent?.quitAndInstall?.();
+    window.bailongma?.quitAndInstall?.();
   });
 
   settingsIgnoreUpdateBtn?.addEventListener("click", () => {
@@ -3267,9 +3267,9 @@ initVoicePanel({
   getChatInput:  () => document.getElementById("msg-input"),
   getSendBtn:    () => document.getElementById("send-btn"),
   getSendMessage: (options) => chat?.send?.(options),
-  getLang:       () => localStorage.getItem("littleprinceagent-voice-lang") || "zh-CN",
-  getAutoSend:   () => localStorage.getItem("littleprinceagent-voice-auto-send") !== "false",
-  getAutoMic:    () => localStorage.getItem("littleprinceagent-voice-auto-mic") === "true",
+  getLang:       () => localStorage.getItem("bailongma-voice-lang") || "zh-CN",
+  getAutoSend:   () => localStorage.getItem("bailongma-voice-auto-send") !== "false",
+  getAutoMic:    () => localStorage.getItem("bailongma-voice-auto-mic") === "true",
 });
 
 // ── Hotspot mode ──
@@ -3388,7 +3388,7 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
     videoBtn?.classList.toggle("active", videoActive);
     if (videoActive) moveVoicePanelToBody();
     else restoreVoicePanel();
-    window.dispatchEvent(new CustomEvent("littleprinceagent:video-mode", {
+    window.dispatchEvent(new CustomEvent("bailongma:video-mode", {
       detail: { active: videoActive, kind: videoKind },
     }));
   }
@@ -3692,7 +3692,7 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
     musicActive = Boolean(visible);
     document.body.classList.toggle("music-mode", musicActive);
     musicBtn?.classList.toggle("active", musicActive);
-    window.dispatchEvent(new CustomEvent("littleprinceagent:music-mode", {
+    window.dispatchEvent(new CustomEvent("bailongma:music-mode", {
       detail: { active: musicActive },
     }));
   }
@@ -3869,8 +3869,8 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
     }
   });
 
-  window.littleprinceagentMedia = { handle: handleMediaCommand, showVideo, controlVideo, showImage, showCamera, showMusic, controlMusic };
-  window.addEventListener("littleprinceagent:media", (event) => handleMediaCommand(event.detail || {}));
+  window.bailongmaMedia = { handle: handleMediaCommand, showVideo, controlVideo, showImage, showCamera, showMusic, controlMusic };
+  window.addEventListener("bailongma:media", (event) => handleMediaCommand(event.detail || {}));
 
   // Push-to-talk：按住空格说话；Agent 正在说话时按下空格直接打断
   (() => {
@@ -3889,7 +3889,7 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
       pttHeld = true;
       // 不论是否在播，stopTTS 内部已做 no-op 守卫
       try { window.stopTTS?.(); } catch {}
-      window.littleprinceagentVoice?.pttStart?.();
+      window.bailongmaVoice?.pttStart?.();
     }, { capture: true });
 
     window.addEventListener("keyup", (e) => {
@@ -3897,14 +3897,15 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
       if (!pttHeld) return;
       pttHeld = false;
       e.preventDefault();
-      window.littleprinceagentVoice?.pttEnd?.();
+      window.bailongmaVoice?.pttEnd?.();
     }, { capture: true });
 
-    // 切到后台时如果还按着，强制释放，避免 mic 永远不关
+    // 切到后台/失焦（如点开 DevTools、切窗口）时如果还按着，强制释放 PTT，避免 mic 永远不关。
+    // 关键：用 send:false —— 失焦不是"主动松手发送"，不能把没说完的半句误发出去。
     window.addEventListener("blur", () => {
       if (!pttHeld) return;
       pttHeld = false;
-      window.littleprinceagentVoice?.pttEnd?.();
+      window.bailongmaVoice?.pttEnd?.({ send: false });
     });
   })();
 
@@ -3966,7 +3967,7 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
 
   function setActive(on){
     active=!!on; document.body.classList.toggle("aivideo-mode", active);
-    if(active){ try{ window.littleprinceagentMedia&&window.littleprinceagentMedia.controlVideo&&window.littleprinceagentMedia.controlVideo({action:"pause"}); }catch(e){} document.body.classList.remove("video-mode"); }
+    if(active){ try{ window.bailongmaMedia&&window.bailongmaMedia.controlVideo&&window.bailongmaMedia.controlVideo({action:"pause"}); }catch(e){} document.body.classList.remove("video-mode"); }
     syncDraft(true);   // 开/关状态立即同步
   }
 
@@ -4141,8 +4142,8 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
     if(action==="ready"){ job.status="done"; job.videoUrl=data.videoUrl; renderQueue(); if(!active) setActive(true); loadPlayer(job); return; }
     if(action==="error"){ job.status="fail"; job.error=data.message||"生成失败"; renderQueue(); return; }
   }
-  window.addEventListener("littleprinceagent:aivideo", function(e){ handle(e.detail||{}); });
-  window.littleprinceagentAIVideo={ handle:handle, open:openPanel, close:closePanel };
+  window.addEventListener("bailongma:aivideo", function(e){ handle(e.detail||{}); });
+  window.bailongmaAIVideo={ handle:handle, open:openPanel, close:closePanel };
 
   renderDropzone(); updateMode(); renderQueue(); autoGrow();
   hydrateHistory();   // 初始化即重建一次（覆盖 app 重启/渲染进程重载后的历史恢复）

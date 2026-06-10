@@ -727,10 +727,15 @@ body {
   background: color-mix(in srgb, var(--panel) 76%, transparent);
 }
 
+/* 工具调用出错对 AI 来说是常事、不是严重报错，用中性灰而非告警红。 */
 .line-tool .tool-status.failed {
-  color: #e07878;
-  border-color: rgba(224, 120, 120, 0.4);
-  background: rgba(224, 120, 120, 0.08);
+  color: var(--ink2);
+  border-color: var(--line-strong);
+  background: color-mix(in srgb, var(--panel) 76%, transparent);
+}
+
+.line-tool-detail.collapsed {
+  display: none;
 }
 
 .line-tool-detail.collapsed {
@@ -3651,6 +3656,16 @@ body.person-card-mode .person-card-panel,
 .dp-tabs {
   display: flex;
   gap: 4px;
+  align-items: center;
+}
+
+/* Tab 分组分隔线（配置 | 关于白龙马） */
+.dp-tab-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--line-mid);
+  flex-shrink: 0;
+  margin: 0 3px;
 }
 
 .dp-tab {
@@ -3805,6 +3820,19 @@ body.person-card-mode .person-card-panel,
   padding-left: 8px;
   margin: 3px 0;
   color: var(--text-secondary);
+}
+
+/* · / - 子项：在 ■ 分组标题下缩进一级（工具清单、架构子项） */
+.dp-subitem {
+  padding-left: 16px;
+  margin: 2px 0;
+  color: var(--text-secondary);
+}
+
+.dp-subitem-mark {
+  color: var(--text-muted);
+  opacity: 0.7;
+  margin-right: 3px;
 }
 
 .dp-list-item {

@@ -4,7 +4,7 @@ import { createDocPanel } from './doc-panel.js';
 
 const createGraphStage = () => `
 <div class="grid-overlay"></div>
-<svg id="graph" aria-label="小王子 Agent 记忆节点图"></svg>
+<svg id="graph" aria-label="Longma 记忆节点图"></svg>
 `;
 
 const createPrimaryPanel = () => `
@@ -13,7 +13,7 @@ const createPrimaryPanel = () => `
     <div class="brand-mark"></div>
     <div class="brand-copy">
       <div class="eyebrow">认知界面</div>
-      <div class="brand-title" id="agent-brand-name">小王子 Agent AI Agent</div>
+      <div class="brand-title" id="agent-brand-name">Longma AI Agent</div>
     </div>
     <button class="voice-btn" id="voice-btn" title="麦克风 开/关" type="button">🎤</button>
     <button class="video-btn" id="video-btn" title="视频模式 (V)" type="button" hidden>⊞</button>
@@ -137,7 +137,7 @@ const createConsole = () => `
   <div id="input-row">
     <div id="slash-menu" class="slash-menu" role="listbox" aria-label="命令" hidden></div>
     <span class="prompt-mark">▸</span>
-    <input id="msg-input" type="text" placeholder="向 小王子 Agent 发送消息…（输入 / 调出命令）" autocomplete="off">
+    <input id="msg-input" type="text" placeholder="向 Longma 发送消息…（输入 / 调出命令）" autocomplete="off">
     <button id="send-btn" type="button">发送</button>
   </div>
 </section>

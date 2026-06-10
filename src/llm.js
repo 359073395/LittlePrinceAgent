@@ -6,6 +6,15 @@ import { recordUsage, shouldThrottle } from './quota.js'
 import { insertActionLog } from './db.js'
 import { isTerminalInternalToolRound } from './runtime/tool-protocol.js'
 import { stripMarkers } from './runtime/markers.js'
+import { beginTurn } from './runtime/turn-trace.js'
+import { createMergedAbortSignal } from './capabilities/abort-utils.js'
+
+// 单轮流式调用的「空闲超时」：从开始到第一个 token、以及每两个 token 之间，
+// 若超过这个时长没有任何增量到达，判定为 provider 连接卡死（连接开着却不吐字节）。
+// 每收到一个 chunk 就重置，所以正常的长流式生成不受影响，只掐真正的停摆。
+// 必须显著小于 index.js 的 RUN_TURN_WATCHDOG_MS(180s)，且留够 streamOnceWithRetry 重试的余量
+// （最坏 3 次 × 该值 + 退避 仍要 < 180s）。
+const STREAM_IDLE_TIMEOUT_MS = 45_000
 
 // find_tool 命中后，把它返回的 loaded 工具 schema 原地追加进本轮 toolSchemas。
 // 已在列表里的跳过；schema 取不到的跳过。数组原地 mutate —— 调用方传的是 callLLM 的 toolSchemas
@@ -78,7 +87,35 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
     requestParams.tool_choice = 'auto'
   }
 
-  const stream = await getClient().chat.completions.create(requestParams, { signal })
+  // ── 空闲超时（连接卡死保护）──
+  // provider 连接开着却长时间不吐任何增量 = 停摆。每收到一个 chunk 就重置计时；超时则中止本轮，
+  // 交给 streamOnceWithRetry 重试，避免把整个 turn 干耗到 index.js 的 180s watchdog 才被发现。
+  // 正是这次「你有意识吗」事故的成因：第二轮请求卡死 180s，已生成的答案被一并丢弃。
+  const idleController = new AbortController()
+  let idleFired = false
+  let idleTimer = null
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => {
+      idleFired = true
+      try { idleController.abort('stream idle timeout') } catch {}
+    }, STREAM_IDLE_TIMEOUT_MS)
+  }
+  // 合并「调用方 signal（watchdog/抢占）」与「空闲超时 signal」：任一触发都中止底层请求。
+  const reqController = new AbortController()
+  const onCallerAbort = () => { try { reqController.abort(signal?.reason || 'Aborted') } catch {} }
+  const onIdleAbort = () => { try { reqController.abort('stream idle timeout') } catch {} }
+  if (signal) {
+    if (signal.aborted) reqController.abort(signal.reason || 'Aborted')
+    else signal.addEventListener('abort', onCallerAbort, { once: true })
+  }
+  idleController.signal.addEventListener('abort', onIdleAbort, { once: true })
+  const cleanupIdle = () => {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null }
+    try { signal?.removeEventListener('abort', onCallerAbort) } catch {}
+  }
+
+  armIdle()
 
   let fullContent = ''
   let fullReasoningContent = ''
@@ -91,7 +128,10 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
   let cacheMissTokens = 0
 
   try {
+  // create() 也放进 try：连接建立阶段就卡死时，idle 触发 → 这里抛 AbortError → 下方 catch 转成可重试的瞬时错误。
+  const stream = await getClient().chat.completions.create(requestParams, { signal: reqController.signal })
   for await (const chunk of stream) {
+    armIdle()  // 收到增量，重置空闲计时（正常长流式生成因此不受影响）
     if (signal?.aborted) break
     if (chunk.usage?.total_tokens) {
       usageTokens = chunk.usage.total_tokens
@@ -191,6 +231,15 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
   }
 
   } catch (err) {
+    // 空闲超时（我们自己的看门狗触发）且调用方并未中止 —— 当作瞬时错误上抛，由 streamOnceWithRetry 重试，
+    // 而不是误判成"用户中止"(aborted:true) 把本轮静默放弃。
+    if (idleFired && !signal?.aborted) {
+      if (streamStarted) onStream?.({ event: 'end' })
+      const e = new Error(`stream idle timeout after ${STREAM_IDLE_TIMEOUT_MS / 1000}s`)
+      e.code = 'ETIMEDOUT'
+      e.hadContent = fullContent.length > 0
+      throw e
+    }
     if (err.name === 'AbortError' || signal?.aborted) {
       if (streamStarted) onStream?.({ event: 'end' })
       return {
@@ -203,6 +252,8 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
     err.hadContent = fullContent.length > 0
     if (streamStarted) onStream?.({ event: 'end' })
     throw err
+  } finally {
+    cleanupIdle()
   }
 
   if (streamStarted) onStream?.({ event: 'end' })
@@ -407,6 +458,13 @@ const TOOL_LOOP_LIMITS = {
   maxSameFailures: 2,
   loopWindowSize: 8,
   loopUniqueThreshold: 2,
+  // 不确定回退（层 3，对应论文 ReAct→CoT-SC 的"在限定步数内没给出答案就退回推理"）：
+  // 不是失败计数触发，而是"做了很多步还没给用户结果"这个非收敛信号触发。模型可能每步都
+  // 成功却方向全错（论文实证 ReAct 推理错误率反而高于 CoT）——失败熔断永远抓不到这种。
+  // 跨过这个步数还没投递，就软插一次"退一步重审计划/验证假设/如实汇报"的检查点（一 turn 一次）。
+  // 阈值要避开健康任务：实测一个健康的 6 步 set_task 任务约用 14-16 次调用（含 update_task_step
+  // 等记账），所以设 18——既不误伤正常多步任务，又在 maxTotalCalls(30) 硬上限前留出抓"真不收敛"的余量。
+  uncertaintyCheckpointCalls: 18,
 }
 
 const HIGH_RISK_TOOLS = new Set([
@@ -479,7 +537,7 @@ function createToolLoopState() {
 
 // send_message/express 是 agent 向用户"汇报 blocker"的唯一通道，必须绕开跨工具的全局熔断计数。
 // 否则当 exec_command/fetch_url 等连续失败触发熔断后，agent 想 send_message 解释失败也会被一并挡掉，
-// 出现"工具调不动 + 嘴也被堵住"的死锁（lessons-littleprinceagent-silent-exit 的镜像问题）。
+// 出现"工具调不动 + 嘴也被堵住"的死锁（lessons-bailongma-silent-exit 的镜像问题）。
 // 同指纹反复失败仍由 sameFailureCounts / recentFingerprints 拦截，安全网完好。
 const REPORT_CHANNEL_TOOLS = new Set(['send_message', 'express'])
 
@@ -570,11 +628,19 @@ function recordToolLoopOutcome(state, name, fingerprint, result) {
   }
 }
 
-function buildToolLoopStopNudge(reason, lastToolResult) {
+export function buildToolLoopStopNudge(reason, lastToolResult) {
   const lastSummary = lastToolResult
     ? `${lastToolResult.name}(${formatToolArgPreview(lastToolResult.args || {})}) -> ${String(lastToolResult.result || '').slice(0, 300)}`
     : 'No successful tool result is available.'
-  return `Tool loop safety stop: ${reason}.\nLast tool result:\n${lastSummary}\n\nDo not keep retrying the same tool action. If enough information is available, call send_message and explain the outcome. If the task needs user confirmation or a different input, call send_message and ask clearly.`
+  return `Tool loop safety stop: ${reason}.\nLast tool result:\n${lastSummary}\n\nStop repeating this action — and step back: the problem may be the plan, not just this one call. Do NOT retry the same approach. Choose one, in this order:\n1. Switch to a materially different approach — a different tool, a different angle, or different input.\n2. If you are unsure your assumption even holds, verify it with one read-only tool before acting again.\n3. If you set a task with set_task, re-read current_task and adjust the steps to match reality.\n4. If you are genuinely blocked, deliver your reply now (send_message on a social channel, or plain text on a local turn) and tell the user what you tried, what failed, and what you need — clearly, do not end silently.`
+}
+
+// 不确定回退的软检查点（层 3）：步数跨过阈值仍未投递时，一 turn 注入一次。
+// 与 buildToolLoopStopNudge 的区别：后者是"反复失败/死循环"硬触发后才发，这条是在还没失败、
+// 但"做了很多步没收敛"时就提前发——抓的是论文里"看似成功却方向错"的不确定态。措辞是引导反思
+// （在 <think> 里诚实自问是否在收敛），不是命令停手。
+export function buildUncertaintyCheckpointNudge(totalCalls) {
+  return `You have run ${totalCalls} tool calls this turn and still have not delivered a result to the user. Pause for one beat — this many steps without converging is itself a signal. The issue may not be the current action; it may be the plan.\n\nIn <think>, ask yourself honestly: am I actually converging on the goal, or am I unsure and pushing forward anyway? Then pick one:\n- If the plan is off, re-read the goal (and current_task if you set one) and re-plan instead of adding more steps.\n- If you are not sure a previous step actually worked, verify it with one read-only tool rather than stacking more actions on an unverified assumption.\n- If you are genuinely stuck, tell the user what you have done, what is blocking you, and what you need — do not keep silently grinding.\nThis is a one-time internal checkpoint; do not narrate it to the user, just course-correct.`
 }
 
 function requiresToolForRequest(text = '') {
@@ -700,7 +766,26 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
     return { content: '（配额接近上限，等待窗口滚动）', toolResult: null, aborted: false, delivered: false }
   }
 
+  // 回合上下文追踪：把本 turn 每一轮模型看到的 messages[] 与思考/输出原样记下，供 /turn-trace
+  // 后台逐回合回放（专为排查"agent 把自己的话和用户的话搞混"这类生成层问题）。永不影响主流程。
+  const trace = beginTurn({
+    label: toolContext?.currentChannel || (silentSignal ? 'silent' : (mustReply ? 'turn' : 'background')),
+    channel: toolContext?.currentChannel,
+    fromId: toolContext?.currentExternalPartyId || toolContext?.currentTargetId,
+    targetId: toolContext?.currentTargetId,
+    userMessage: toolContext?.currentUserMessage || (typeof message === 'string' ? message : ''),
+    silentSignal,
+    localReply,
+    mustReply,
+    tools,
+  })
+
   let allContent = ''
+  // 可挽救草稿：社交渠道第一轮已写出一条完整回复、但还没 send_message 投递时，nudge 会把它从 allContent
+  // 挪进 messages 并清空 allContent（期望下一轮包 send_message 重发）。一旦下一轮 provider 卡死/被 watchdog
+  // 掐断，allContent 已空、草稿就丢了——「你有意识吗」事故正是如此。这里把草稿原文留一份，
+  // 作为协议兜底投递的内容来源（仅在 !delivered 时使用，不会和正常投递双发）。
+  let salvageableReply = ''
   let lastToolResult = null
   let sawToolCall = false
   let sentMessage = false
@@ -716,6 +801,8 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
   let fakeToolNudgeUsed = false
   let emptyReplyNudgeUsed = false
   let falseMemoryNudgeUsed = false
+  // 层 3：本 turn 是否已发过"不确定回退"软检查点（一 turn 一次，见 buildUncertaintyCheckpointNudge）。
+  let uncertaintyNudgeUsed = false
   // 跟踪本次 callLLM 调用中实际调过的工具名，用于检测"声称做了 X 但没真的调 X"的 false-claim。
   const calledTools = new Set()
   const toolLoopState = createToolLoopState()
@@ -735,20 +822,41 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
   let mediaPlayedKind = null   // 'music' | 'video'，决定用哪个表情
   let mediaEmojiSent = false   // 本 turn 已用表情代替过一次播放确认（一个 turn 只发一个表情）
 
+  try {
   for (let round = 0; round < TOOL_LOOP_LIMITS.maxRounds; round++) {
     throwIfAborted(signal)
 
-    const { content, reasoningContent, toolCalls, aborted } = await streamOnceWithRetry({
-      messages,
-      toolSchemas,
-      temperature,
-      topP,
-      maxTokens,
-      thinking,
-      signal,
-      onRetry,
-      onStream,  // 所有轮次均流式推送，让 UI 实时反映工具链执行过程中的模型输出
-    })
+    // 本轮开始时 messages 的长度 = 本轮模型看到的上下文边界。messages 在一个 turn 内严格
+    // append-only，所以前端用 final messages.slice(0, inputOffset) 即可精确还原"本轮看到了什么"。
+    const roundInputOffset = messages.length
+
+    let roundResult
+    try {
+      roundResult = await streamOnceWithRetry({
+        messages,
+        toolSchemas,
+        temperature,
+        topP,
+        maxTokens,
+        thinking,
+        signal,
+        onRetry,
+        onStream,  // 所有轮次均流式推送，让 UI 实时反映工具链执行过程中的模型输出
+      })
+    } catch (err) {
+      // 只要**前面的轮次已攒到可投递的回复**（典型：社交渠道第一轮已出答案、第二轮包 send_message 时
+      // provider 卡死/报错，甚至重试退避期间被 watchdog 掐），就不能让这个错误/中止把已生成的答案一起
+      // 带走——跳出循环走下方协议兜底投递（aborted 时它会用全新 signal 投递）。allContent 此刻可能已被
+      // nudge 清空，故同时认 salvageableReply。两者皆空才无可挽救，照旧上抛（含真正的 AbortError）。
+      if (allContent.trim() || salvageableReply.trim()) {
+        console.warn(`[LLM] 轮内请求中断/失败(${(err?.message || String(err)).slice(0, 80)})，已有可投递回复 —— 跳出走兜底投递`)
+        break
+      }
+      throw err
+    }
+    const { content, reasoningContent, toolCalls, aborted } = roundResult
+
+    trace.recordRound({ round, inputOffset: roundInputOffset, content, reasoningContent, toolCalls, aborted })
 
     // 跨轮累积 content 时的去重保护：如果新段已经是 allContent 末尾的字面重复，
     // 跳过追加，避免 [Round N: "X"] + [Round N+1: "X"] 拼成 "X\nX"。
@@ -803,6 +911,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       // 那会逼出一整轮多余的 LLM 调用，正是要消除的延迟来源。只有社交渠道才需要这条 nudge。
       if (!localReply && mustReply && !sawToolCall && !sentMessage && allContent.trim() && !plainTextReplyNudgeUsed) {
         const draft = allContent.trim()
+        salvageableReply = draft   // 清空 allContent 前留一份，供下一轮失败时兜底投递
         if (content) messages.push({ role: 'assistant', content })
         allContent = ''
         messages.push({
@@ -976,16 +1085,28 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
           // 耗时工具即时回应：用户消息触发了一个会让人干等的工具（下载/搜索/生成/跑命令）时，
           // 本 turn 第一次就先替模型"应一声"。系统直接投递，不依赖模型在工具链中途主动开口
           // （实测它不会）。一个 turn 只发一次；模型已先回过话（delivered）则跳过，不重复。
-          if (!ackSent && !delivered && mustReply && !silentSignal
+          //
+          // 本地渠道（localReply）的去重承重墙：本地/语音轮的回复是"流式纯文本"，不走 send_message，
+          // 因此整个工具循环里 delivered 恒为 false（真正投递发生在文末兜底）。如果模型在调耗时工具前
+          // 已经流出过可见正文（allContent 非空，用户已经在气泡里看到了），再补一次 ack 就会和模型自己
+          // 那句话撞车——尤其 ack 文案本就模仿自然口吻（exec_command 的 ack 恰好就是"我跑一下～"），
+          // 撞出两条一模一样的消息。所以本地渠道下"已流出可见正文"等价于 delivered，同样跳过 ack。
+          const localAlreadySpoke = localReply && !!allContent.trim()
+          if (!ackSent && !delivered && !localAlreadySpoke && mustReply && !silentSignal
               && toolContext?.currentTargetId && isSlowAckTool(tc.name, normalizedArgs)) {
             ackSent = true
             try {
-              await executeTool(
-                'send_message',
-                { target_id: toolContext.currentTargetId, content: slowAckText(tc.name, normalizedArgs) },
-                { ...toolContext, signal, source: 'ack' },
-              )
-              delivered = true
+              const ackArgs = { target_id: toolContext.currentTargetId, content: slowAckText(tc.name, normalizedArgs) }
+              const ackResult = await executeTool('send_message', ackArgs, { ...toolContext, signal, source: 'ack' })
+              // 关键：ack 不置 delivered。ack 是"承诺稍后汇报"，不是汇报本身——
+              // 把它当投递会让文末兜底（!delivered 守卫）跳过，模型生成的最终汇报被静默丢弃。
+              // 实测（2026-06-10 排障四连静默）：r19 已生成完整收尾汇报，因 ack 置了 delivered
+              // 而从未送达用户。重复 ack 由 ackSent 防住，不需要 delivered 参与。
+              // ack 也要回调 onToolCall：语音自动 TTS 只挂在 onToolCall 里（index.js），ack 走直投通道
+              // 会绕过它——结果 ack 只在 UI 显示成文字、却不被念出来（语音轮用户听不到"我查一下…"）。
+              // 镜像协议兜底的做法（见文末 __fallback 分支）：补一次带 __ack 标记的 onToolCall 触发 TTS，
+              // 标记供遥测分类，executeTool 收到的是干净的 ackArgs。
+              if (onToolCall) onToolCall('send_message', { ...ackArgs, __ack: true }, ackResult)
             } catch { /* ack 投递失败不影响主流程 */ }
           }
           // 真正开始执行前通知 UI —— 让用户知道当前停留在哪一步的工具上
@@ -1165,10 +1286,21 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
           content: 'Message sent. Default action: end the round now — to end, just stop: emit no further tool call and no text.\n\nDo NOT send a second message just to add a closing pleasantry ("有需要随时叫我", "希望对你有帮助", "祝你...好"), a follow-up check ("还有什么需要吗", "明白了吗"), or to restate what you already said. Those are pure noise — the user sees them as filler and the conversation degrades.\n\nAbove all, do NOT narrate your own decision to stop. Lines like "已经和用户打过招呼了，不需要再发第二条" / "安静等待" / "I\'ll stay quiet now" are INTERNAL REASONING, not messages — they belong in your thinking and must never be sent through send_message or written as a reply. If you have decided not to reply, the correct way to express that is to send nothing at all.\n\nOnly call send_message again if you have genuinely NEW substantive information the user does not yet know — e.g., a tool result that came back after your reply and materially changes the answer, or a different recipient that also needs to hear from you.',
         })
       } else if (mustReply) {
-        messages.push({
-          role: 'user',
-          content: `Tool results have returned. Continue completing the user request based on the available results. If the information is sufficient, ${deliverInstruction}. For files, directories, commands, or network requests, state only facts verified by tool results, such as ok/verified/path/bytes/exit_code/status. Do not claim completion of any action without tool evidence. If a tool failed or the data is insufficient, explain the limitation and next suggested step; do not end silently.`,
-        })
+        // 层 3：步数跨过阈值仍未投递 → 先插一次"不确定回退"软检查点，引导退一步重审计划，
+        // 而不是继续往前撞。一 turn 只发一次；之后回到普通"继续"nudge。
+        if (toolLoopState.totalCalls >= TOOL_LOOP_LIMITS.uncertaintyCheckpointCalls && !uncertaintyNudgeUsed) {
+          uncertaintyNudgeUsed = true
+          console.log(`[不确定回退] 已执行 ${toolLoopState.totalCalls} 次工具仍未投递，注入重审检查点`)
+          messages.push({
+            role: 'user',
+            content: buildUncertaintyCheckpointNudge(toolLoopState.totalCalls),
+          })
+        } else {
+          messages.push({
+            role: 'user',
+            content: `Tool results have returned. Continue completing the user request based on the available results. If the information is sufficient, ${deliverInstruction}. For files, directories, commands, or network requests, state only facts verified by tool results, such as ok/verified/path/bytes/exit_code/status. Do not claim completion of any action without tool evidence. If a tool failed or the data is insufficient, explain the limitation and next suggested step; do not end silently.`,
+          })
+        }
       }
     }
     if (terminalInternalRound) break
@@ -1187,8 +1319,16 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
   //   #4 不双发 —— 仅 !delivered 时触发；一旦投出立刻 delivered=true，index.js 不会再补。
   //   #5 投递前剥离 <think>/[RECALL:] 等协议标记。
   //   #8 source:'fallback' 由 executeTool→tool-audit 自动写入 action_log，区分协议兜底与显式调用。
-  if (mustReply && !silentSignal && !delivered && !aborted) {
-    let fallbackContent = stripProtocolMarkersForDelivery(allContent)
+  //
+  // 中断恢复（去掉了旧的 !aborted 守卫）：watchdog 超时/高优先级抢占会把本 turn 的 signal abort。
+  // 但若模型在被掐断前**已经生成好了一条可投递的答案**（典型：社交渠道第一轮出了纯文本、第二轮包
+  // send_message 时卡死被 watchdog 掐），这条答案不应凭空丢掉——「你有意识吗」事故就是这么蒸发的。
+  // 此时原 signal 已废，复用它会让 send_message 立刻 AbortError 失败，所以中断兜底改走一条全新的、
+  // 带 30s 超时的干净 signal，确保已生成的答案仍能送达。
+  if (mustReply && !silentSignal && !delivered) {
+    // 内容来源：优先本轮累积的 allContent；若它已被 nudge 清空（草稿挪进了 messages），
+    // 退回 salvageableReply —— 这正是中断/卡死时把"已生成但没发出"的答案救回来的关键。
+    let fallbackContent = stripProtocolMarkersForDelivery(allContent.trim() ? allContent : salvageableReply)
     const fallbackTarget = toolContext?.currentTargetId
     // 播放收尾一致性：视频流程里模型常不调 send_message 而是留 body 走兜底（音乐则习惯调
     // send_message 被 isMediaCloser 替换）。这里对兜底 body 做同样处理——本 turn 播放过媒体、
@@ -1198,14 +1338,25 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       mediaEmojiSent = true
     }
     if (fallbackContent && fallbackTarget) {
-      // localReply 渠道：纯文本直投是设计内的快路径（省掉 send_message 那一轮），不是协议违规；
-      // 社交渠道走到这里才是模型漏调 send_message 的兜底。日志分级表达，避免把正常路径当告警噪声。
-      if (localReply) console.log(`[local reply] 纯文本直投给 ${fallbackTarget}（本地渠道无需 send_message）`)
-      else console.warn(`[protocol fallback] 模型未调 send_message —— callLLM 代为投递给 ${fallbackTarget}`)
+      // 中断恢复路径：原 signal 已 abort，另起一条带超时的干净 signal 兜底投递。
+      let fbSignal = signal
+      let fbCleanup = null
+      if (aborted) {
+        const fresh = createMergedAbortSignal(null, 30_000)
+        fbSignal = fresh?.signal
+        fbCleanup = fresh?.cleanup
+        console.warn(`[protocol fallback] 本轮被中断但已生成回复 —— 用独立 signal 兜底投递给 ${fallbackTarget}`)
+      } else if (localReply) {
+        // localReply 渠道：纯文本直投是设计内的快路径（省掉 send_message 那一轮），不是协议违规。
+        console.log(`[local reply] 纯文本直投给 ${fallbackTarget}（本地渠道无需 send_message）`)
+      } else {
+        // 社交渠道未中断却走到这里 = 模型漏调 send_message 的常规兜底。
+        console.warn(`[protocol fallback] 模型未调 send_message —— callLLM 代为投递给 ${fallbackTarget}`)
+      }
       try {
         const fbArgs = { target_id: fallbackTarget, content: fallbackContent }
         // source:'fallback' 让 tool-audit 把这条 action_log 标记为协议兜底（不变量 #8）。
-        const fbResult = await executeTool('send_message', fbArgs, { ...toolContext, signal, source: 'fallback' })
+        const fbResult = await executeTool('send_message', fbArgs, { ...toolContext, signal: fbSignal, source: 'fallback' })
         // 兜底也是"真正执行过的 send_message"：置 delivered，并触发与正常路径同样的
         //   onToolCall 回调（语音渠道自动 TTS、UI tool_call 事件、toolCallLog 登记都在那里）。
         //   __fallback 标记仅给 onToolCall 用于遥测分类；executeTool 收到的是干净的 fbArgs。
@@ -1213,11 +1364,20 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         lastToolResult = { name: 'send_message', args: fbArgs, result: fbResult }
         if (onToolCall) onToolCall('send_message', { ...fbArgs, __fallback: true }, fbResult)
       } catch (err) {
-        if (err?.name === 'AbortError') throw err
+        // 中断恢复用的是独立 signal，其超时/中止不应再往上抛（本 turn 本就在收尾）。
+        // 仅在正常路径(非 aborted)下保留原语义：调用方 signal 的 AbortError 继续上抛。
+        if (err?.name === 'AbortError' && !aborted) throw err
         console.warn('[protocol fallback] callLLM 兜底投递失败:', err?.message || err)
+      } finally {
+        fbCleanup?.()
       }
     }
   }
 
+  trace.end({ messages, delivered, aborted })
   return { content: allContent, toolResult: lastToolResult, aborted, delivered }
+  } finally {
+    // 异常 / abort / 任何提前退出路径的兜底收尾（end 内部幂等，正常路径已 end 过则无副作用）。
+    trace.end({ messages, delivered, aborted: signal?.aborted })
+  }
 }

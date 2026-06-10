@@ -27,6 +27,7 @@ import { createCloudASRSession } from './voice/cloud-asr.js'
 import { getHotspots, setHotspotPanelState, getHotspotPanelState } from './hotspots.js'
 import { getPersonCard, setPersonCardPanelState, getPersonCardPanelState } from './person-cards.js'
 import { setDocPanelState, getDocPanelState, DOC_TOPICS } from './docs.js'
+import { getTraces, getTrace, clearTraces, getTraceStatus } from './runtime/turn-trace.js'
 
 export { emitEvent }
 
@@ -38,6 +39,7 @@ const BRAIN_UI_PATH      = paths.brainUiHtml
 const WEBSITE_PATH       = paths.websiteHtml
 const SYSTEM_PROMPT_PATH = paths.systemPromptHtml
 const ACTIVATION_PATH    = paths.activationHtml
+const TURN_TRACE_PATH    = paths.turnTraceHtml
 const BRAIN_UI_ASSET_ROOT = paths.brainUiAssetRoot
 const D3_VENDOR_PATH     = path.join(paths.resourcesDir, 'node_modules', 'd3', 'dist', 'd3.min.js')
 const INSTALL_SCRIPT_PATH = path.join(paths.resourcesDir, 'scripts', 'install-debian-ubuntu.sh')
@@ -55,11 +57,11 @@ const SILENT_CARD_ACTIONS = new Set([
 ])
 
 function getApiHost() {
-  return String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_HOST || DEFAULT_API_HOST).trim() || DEFAULT_API_HOST
+  return String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_HOST || globalThis.process?.env?.BAILONGMA_HOST || DEFAULT_API_HOST).trim() || DEFAULT_API_HOST
 }
 
 function isLanAccessEnabled() {
-  return /^(1|true|yes|on)$/i.test(String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_ALLOW_LAN || '').trim())
+  return /^(1|true|yes|on)$/i.test(String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_ALLOW_LAN || globalThis.process?.env?.BAILONGMA_ALLOW_LAN || '').trim())
 }
 
 function normalizeRemoteAddress(address = '') {
@@ -76,7 +78,7 @@ function isLoopbackAddress(address = '') {
 }
 
 function isLoopbackRequest(req) {
-  return isLoopbackAddress(req.socket?.remoteAddress)
+  return isLoopbackAddress(getClientAddress(req))
 }
 
 function isPrivateLanAddress(address = '') {
@@ -99,7 +101,7 @@ function isPrivateLanAddress(address = '') {
 }
 
 function isLanRequest(req) {
-  return isLanAccessEnabled() && isPrivateLanAddress(req.socket?.remoteAddress)
+  return isLanAccessEnabled() && isPrivateLanAddress(getClientAddress(req))
 }
 
 function isLoopbackOrigin(origin = '') {
@@ -135,7 +137,18 @@ function isAllowedOrigin(origin = '', req = null) {
 }
 
 function getAuthToken() {
-  return String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_API_TOKEN || '').trim()
+  return String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_API_TOKEN || globalThis.process?.env?.BAILONGMA_API_TOKEN || '').trim()
+}
+
+function getClientAddress(req) {
+  if (process.env.LITTLE_PRINCE_AGENT_TRUST_PROXY || process.env.BAILONGMA_TRUST_PROXY) {
+    const forwarded = req.headers['x-forwarded-for']
+    if (forwarded) {
+      const ips = String(forwarded).split(',').map(s => s.trim()).filter(Boolean)
+      if (ips.length > 0) return ips[0]
+    }
+  }
+  return req.socket?.remoteAddress
 }
 
 function getCookie(req, name) {
@@ -346,7 +359,7 @@ async function resolveWindowsDownloadAsset() {
   if (!response.ok) throw new Error(`GitHub release lookup failed: HTTP ${response.status}`)
   const release = await response.json()
   const assets = Array.isArray(release.assets) ? release.assets : []
-  const asset = assets.find(a => /\.(exe|msi)$/i.test(a.name || '') && /setup|installer|小王子|agent/i.test(a.name || ''))
+  const asset = assets.find(a => /\.(exe|msi)$/i.test(a.name || '') && /setup|installer|小王子|agent|bailongma/i.test(a.name || ''))
     || assets.find(a => /\.(exe|msi)$/i.test(a.name || ''))
   if (!asset?.browser_download_url) throw new Error('latest GitHub Release has no Windows installer asset')
   return {
@@ -532,15 +545,22 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
           rows = db.prepare(`
             SELECT m.* FROM memories m
             JOIN memories_fts ON memories_fts.rowid = m.id
-            WHERE memories_fts MATCH ?
+            WHERE memories_fts MATCH ? AND m.visibility = 1
             ORDER BY bm25(memories_fts), m.created_at DESC LIMIT ?
           `).all(search, limit)
         } catch {
-          rows = db.prepare(`SELECT * FROM memories WHERE content LIKE ? OR detail LIKE ? ORDER BY created_at DESC LIMIT ?`)
-            .all(`%${search}%`, `%${search}%`, limit)
+          rows = db.prepare(`
+            SELECT * FROM memories
+            WHERE (
+              title LIKE ? OR mem_id LIKE ? OR content LIKE ? OR detail LIKE ?
+              OR entities LIKE ? OR concepts LIKE ? OR tags LIKE ?
+            )
+            AND visibility = 1
+            ORDER BY created_at DESC LIMIT ?
+          `).all(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, limit)
         }
       } else {
-        rows = db.prepare('SELECT * FROM memories ORDER BY created_at DESC LIMIT ?').all(limit)
+        rows = db.prepare('SELECT * FROM memories WHERE visibility = 1 ORDER BY created_at DESC LIMIT ?').all(limit)
       }
       jsonResponse(res, 200, rows)
       return
@@ -581,6 +601,41 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         recall: getRecallAuditStats({ sinceIso }) || {},
         extract: getExtractAuditStats({ sinceIso }) || {},
       })
+      return
+    }
+
+    // GET /turn-trace, /turn-trace.html — 回合上下文取证页（逐回合回放每轮 messages[] 与思考）
+    if (req.method === 'GET' && (url.pathname === '/turn-trace' || url.pathname === '/turn-trace.html')) {
+      try {
+        const html = fs.readFileSync(TURN_TRACE_PATH, 'utf-8')
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(html)
+      } catch {
+        res.writeHead(404)
+        res.end('turn-trace.html not found')
+      }
+      return
+    }
+
+    // GET /admin/traces?limit=80 — 最近 turn 摘要列表
+    if (req.method === 'GET' && url.pathname === '/admin/traces') {
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '80'), 80)
+      jsonResponse(res, 200, { ok: true, status: getTraceStatus(), traces: getTraces(limit) })
+      return
+    }
+
+    // GET /admin/traces/:id — 单个 turn 完整记录（每轮 offset + 模型输出 + 最终 messages 快照）
+    if (req.method === 'GET' && url.pathname.startsWith('/admin/traces/')) {
+      const id = decodeURIComponent(url.pathname.slice('/admin/traces/'.length))
+      const trace = getTrace(id)
+      if (!trace) return jsonResponse(res, 404, { ok: false, error: 'trace not found' })
+      jsonResponse(res, 200, { ok: true, trace })
+      return
+    }
+
+    // POST /admin/traces-clear — 清空所有追踪记录（含落盘文件）
+    if (req.method === 'POST' && url.pathname === '/admin/traces-clear') {
+      jsonResponse(res, 200, clearTraces())
       return
     }
 
@@ -1355,7 +1410,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     if (req.method === 'POST' && url.pathname === '/admin/restart') {
       jsonResponse(res, 200, { ok: true, message: 'Restarting…' })
       setTimeout(() => {
-        const restart = globalThis.littleprinceagentAppControl?.restart
+        const restart = globalThis.bailongmaAppControl?.restart
         if (typeof restart === 'function') {
           restart()
           return
@@ -1682,7 +1737,11 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
             (errMsg) => {
               try { ws.send(JSON.stringify({ type: 'error', message: errMsg })) } catch {}
             },
-            () => { try { ws.close() } catch {} }
+            () => { try { ws.close() } catch {} },
+            // onEvent：把云端非转录事件（task-started/finished/failed）转发到前端诊断
+            (event, info) => {
+              try { ws.send(JSON.stringify({ type: 'diag', event, info })) } catch {}
+            }
           )
           configured = true
         } catch {}

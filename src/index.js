@@ -3,13 +3,18 @@ import { callLLM } from './llm.js'
 import { buildSystemPrompt, buildContextBlock, combinePromptForPreview } from './prompt.js'
 import { enqueueTurnForRecognition, configureRecognizerScheduler } from './memory/recognizer-scheduler.js'
 import { runInjector, formatMemoriesForPrompt, formatTaskKnowledge, formatPrefetchedItems, formatActiveUICards, formatTemporalRecall, formatAIVideoPanel } from './memory/injector.js'
-import { updateFocusFrame } from './memory/focus.js'
-import { compressPoppedFrame } from './memory/focus-compress.js'
+import {
+  ensureThreadState, attributeUserMessage, buildThreadView, getForegroundThread,
+  getThreadById, openCommitment, closeCommitment, touchCommitmentThread,
+  latestOpenCommitment, mergeThreads, migrateFocusStackToThreads, describeThread,
+} from './memory/threads.js'
+import { summarizeThread } from './memory/thread-summarize.js'
+import { classifyThreadAttribution } from './memory/thread-classifier.js'
 import { runMemoryRefreshLoop } from './memory/refresh-loop.js'
 import { startConsolidationLoop } from './memory/consolidation-loop.js'
 import { runRuntimeInjector } from './context/runtime-injector.js'
 import { selectContextSections } from './context/section-gate.js'
-import { getDB, getConfig, setConfig, getKnownEntities, getOrInitBirthTime, insertConversation, insertMemory, getRecentConversationPartners, getDueReminders, markReminderFired, advanceReminderDueAt, getNextPendingReminder, getMemoryCount, getRecentConversationTimeline, loadFocusStack, saveFocusStack, setCurrentFocusTopic, updateUserMessageFocusTopic, insertActionLog } from './db.js'
+import { getDB, getConfig, setConfig, getKnownEntities, getOrInitBirthTime, insertConversation, insertMemory, getRecentConversationPartners, getDueReminders, markReminderFired, advanceReminderDueAt, getNextPendingReminder, getMemoryCount, getRecentConversationTimeline, loadFocusStack, loadThreadState, saveThreadState, setCurrentFocusTopic, setCurrentThreadId, updateUserMessageFocusTopic, reassignConversationsThread, insertActionLog } from './db.js'
 import { calculateNextDueAt, autoSpeakForVoiceReply, detectOpenFollowupQuestion } from './capabilities/executor.js'
 import { popMessage, hasMessages, hasUserMessages, getQueueSnapshot, setInterruptCallback, requeueMessage, pushMessage } from './queue.js'
 import { startTUI } from './tui.js'
@@ -35,11 +40,14 @@ import { collectLocalResources } from './local-resources-scanner.js'
 import { collectGeoWeather, getGeoWeatherBlock } from './geo-weather.js'
 import { collectTrending, getTrendingBlock } from './trending.js'
 import { collectAgents, buildAgentContextBlock, buildDelegationAskDirections } from './agents/registry.js'
+import { refreshSkills, selectSkillsForMessage, formatSkillsForContext } from './skills/registry.js'
 import { tryAutoConfigureKey } from './key-auto-config.js'
 import { PRIMARY_USER_ID, formatPresenceForPrompt, normalizeChannel, isExternalChannel } from './identity.js'
 import { truncateToolResultForUI } from './runtime/tool-result-preview.js'
 import { buildLLMMessages } from './runtime/messages.js'
 import { parseMarkers } from './runtime/markers.js'
+import { extractVerbatimPayload, findRecentVerbatimPayload, hasInlineVerbatimPayload, isVerbatimOutputRequest, isVerbatimSetup, isVerbatimStart } from './runtime/verbatim.js'
+import { refreshUserProfile } from './profile/infer.js'
 import { cloudCapabilityEnabled, isCloudMode, runtimeModeSummary } from './runtime-mode.js'
 
 // On first launch, copy sandbox seed files from the resource directory to the user data directory (Electron install)
@@ -112,6 +120,10 @@ if (cloudCapabilityEnabled('LOCAL_AGENT_SCAN')) {
 // Load persisted installed tools
 await loadInstalledTools()
 
+// Load Agent Skills metadata. Full SKILL.md bodies are injected only when a turn matches.
+const startupSkills = refreshSkills()
+console.log(`[skills] Loaded ${startupSkills.length} Agent Skill(s)`)
+
 // AbortController for the current LLM call (used to interrupt the main loop)
 let currentAbortController = null
 let currentExecution = null
@@ -120,7 +132,7 @@ let currentExecution = null
 // 没传 AbortSignal 也没自己超时）。触发后强 abort，把 processing 清掉，主循环能继续
 // 处理后续消息。不修复挂着的 promise（它会留在内存里直到 GC 或自行结束），但保证 UI
 // "思考中"永远在有限时间内解锁、用户的下一句话能被正常处理。
-const RUN_TURN_WATCHDOG_MS = 180_000
+const RUN_TURN_WATCHDOG_MS = 600_000
 
 const PRIORITY = {
   tick: 10,
@@ -139,6 +151,7 @@ if (getMemoryCount() === 0) {
   await import('../scripts/seed-memories.js')
 }
 const birthTime = getOrInitBirthTime()
+refreshUserProfile(PRIMARY_USER_ID)
 
 // Awakening phase: first 10 heartbeat ticks after initial activation run at a fixed 10s cadence
 const AWAKENING_CONFIG_KEY = 'awakening_ticks_remaining'
@@ -231,10 +244,40 @@ const state = {
   recentActions: [], // summaries of recent turns, format: { ts, summary }
   thoughtStack: [],  // thought stack, max 3 entries, format: { concept, line }
   startupSelfCheck: null,
+  pendingVerbatimRecital: null,
   pendingConfidenceHint: null,  // 上一轮 refresh-loop 的 confidence，供下次 runInjector 调整召回数量后清空
   tickCounter: 0,             // 累计 TICK 计数（每次进 isTick 路径自增）
   lastTaskRefreshTick: -10,   // 上次 TICK 路径触发 refresh-loop 时的 tickCounter；初值 -10 保证首个 TICK 立刻可触发（差值 = 0 - (-10) = 10 >= 5）
-  focusStack: loadFocusStack(),  // 动态上下文记忆池第 3b/5c 步：注意力焦点栈（栈底 → 栈顶），重启从 db 恢复
+  threadState: initThreadState(),  // 线索模型（DynamicMemoryPool.md 第 8 章）：threads + 前台指针 + 承诺，重启从 db 恢复
+}
+
+// 启动时恢复线索状态；threads 表为空但旧 focus_stack 有货 → 一次性迁移（栈顶=前台）。
+function initThreadState() {
+  const loaded = loadThreadState()
+  if (loaded) return loaded
+  try {
+    const legacy = loadFocusStack()
+    if (Array.isArray(legacy) && legacy.length > 0) {
+      const migrated = migrateFocusStackToThreads(legacy)
+      saveThreadState(migrated)
+      console.log(`[threads] 从专注栈迁移 ${migrated.threads.length} 条线索（前台 = 原栈顶）`)
+      return migrated
+    }
+  } catch (e) {
+    console.warn('[threads] focus_stack 迁移失败:', e?.message || e)
+  }
+  return { threads: [], foregroundId: null, commitments: [] }
+}
+
+// brain-ui 兼容：把线索状态派生成"栈视图"（后台按活跃时间升序 + 前台垫底=栈顶），
+// focus_frame 事件 payload 形状不变，专注帧观察面板零改动。
+function deriveStackView(state) {
+  const ts = ensureThreadState(state)
+  const background = ts.threads
+    .filter(t => t.id !== ts.foregroundId)
+    .sort((a, b) => Date.parse(a.lastEventAt || 0) - Date.parse(b.lastEventAt || 0))
+  const fg = getForegroundThread(state)
+  return fg ? [...background, fg] : background
 }
 
 const TASK_IDLE_TICK_LIMIT = 5  // auto-clear task after N consecutive task ticks with no tool calls
@@ -243,6 +286,9 @@ const TASK_IDLE_TICK_LIMIT = 5  // auto-clear task after N consecutive task tick
 configureRecognizerScheduler({
   onResult: (memories) => {
     emitEvent('memories_written', { count: memories?.length || 0, memories: memories || [] })
+    if (Array.isArray(memories) && memories.length > 0) {
+      refreshUserProfile(PRIMARY_USER_ID)
+    }
   },
 })
 
@@ -265,6 +311,40 @@ function summarizeToolCall(t = {}) {
   return `${t.name || 'tool'}${status}`
 }
 
+// 线索模型：task 生命周期 ↔ 承诺生命周期。
+// set_task = "好的我去做"的工程化时刻（单 Agent 版 spawn）：给前台线索挂承诺，钉住温度；
+// 任务完成/取消 = 交差：关承诺，线索按 lastEventAt 自然降温——没有任何突变动作。
+function openTaskCommitment(description) {
+  try {
+    const commitment = openCommitment(state, { text: String(description || ''), tick: state.tickCounter || 0 })
+    // task ↔ 承诺绑定：task 槽是单例（set_task B 会覆盖 A），但承诺是多例的——
+    // 收尾时必须按 id 精确关"当前 task 的承诺"，否则 closeCommitment 默认关最老的
+    // open 承诺，任务 B 完成会误关任务 A 的承诺（被覆盖的 A 承诺保持 open：
+    // 用户没取消 A，承诺仍未兑现，线索保持 warm 等用户回来问）。
+    state.taskCommitmentId = commitment?.id || null
+    // 跨重启持久化：task 从 config 恢复、承诺从 db 恢复，绑定关系也得跟着活下来，
+    // 否则重启后收尾退化回"关最老的 open 承诺"。
+    setConfig('current_task_commitment_id', commitment?.id || '')
+    saveThreadState(state.threadState)
+  } catch (e) {
+    console.log('[threads] openCommitment failed:', e?.message || e)
+  }
+}
+function closeTaskCommitment(status = 'done') {
+  try {
+    const boundId = state.taskCommitmentId || getConfig('current_task_commitment_id') || null
+    const closed = closeCommitment(state, {
+      commitmentId: boundId,
+      status,
+    })
+    state.taskCommitmentId = null
+    setConfig('current_task_commitment_id', '')
+    if (closed) saveThreadState(state.threadState)
+  } catch (e) {
+    console.log('[threads] closeCommitment failed:', e?.message || e)
+  }
+}
+
 function autoCompleteTask(reason) {
   const clearedTask = state.task
   state.task = null
@@ -273,6 +353,7 @@ function autoCompleteTask(reason) {
   state.taskIdleTickCount = 0
   setConfig('current_task', '')
   setConfig('current_task_steps', '[]')
+  closeTaskCommitment('done')
   console.log(`[task] Auto-cleared (${reason}): ${clearedTask}`)
   emitEvent('task_cleared', { task: clearedTask, summary: `Auto-cleared: ${reason}` })
   if (clearedTask) {
@@ -421,6 +502,7 @@ async function tryHandleDirectWeatherTurn(input, msg, { finishTurn } = {}) {
   //   即将写入的 jarvis 回复打上"天气"焦点标签；否则 conversationWindow 里
   //   这两行 focus_topic 永远是空，破坏话题边界标注。
   setCurrentFocusTopic('天气')
+  setCurrentThreadId('')  // 天气是一次性叶子，不归属任何线索
   try { updateUserMessageFocusTopic(msg.fromId, msg.timestamp, '天气') } catch {}
 
   const timestamp = nowTimestamp()
@@ -478,12 +560,17 @@ function buildToolContextForProcess(msg, injection) {
     // 自我感知信号：传给工具执行层（如 upsert_memory 守门），让"镜像污染"在写入长期记忆前就被拦截
     selfPerception: injection.selfPerception || null,
 
+    // 审视分身（review_work）取证用：当前任务目标 + 每步状态。让审视分身能拿到主 Agent 自己的
+    // 计划做对照，看"声称完成"与每步证据是否一致。只读快照，不可被主 Agent 改写。
+    getTaskState: () => ({ task: state.task, steps: state.taskSteps }),
+
     onSetTask: (description, steps) => {
       state.task = description
       state.lastTaskRefreshTick = -10
       state.taskSteps = steps.map(s => ({ text: s, status: 'pending', note: '' }))
       setConfig('current_task', description)
       setConfig('current_task_steps', JSON.stringify(state.taskSteps))
+      openTaskCommitment(description)
       console.log(`[task] Started: ${description} (${steps.length} step(s))`)
       emitEvent('task_set', { task: description, steps })
     },
@@ -495,6 +582,7 @@ function buildToolContextForProcess(msg, injection) {
       state.taskIdleTickCount = 0
       setConfig('current_task', '')
       setConfig('current_task_steps', '[]')
+      closeTaskCommitment('done')
       console.log(`[task] Completed: ${clearedTask}`)
       emitEvent('task_cleared', { task: clearedTask, summary })
       if (clearedTask) {
@@ -512,13 +600,27 @@ function buildToolContextForProcess(msg, injection) {
       if (!state.taskSteps[idx]) return { error: `Step ${idx + 1} does not exist (${state.taskSteps.length} total)` }
       state.taskSteps[idx] = { ...state.taskSteps[idx], status, note }
       setConfig('current_task_steps', JSON.stringify(state.taskSteps))
+      const total = state.taskSteps.length
       const done = state.taskSteps.filter(s => s.status === 'done').length
-      emitEvent('task_step_updated', { index: idx, status, note, progress: `${done}/${state.taskSteps.length}` })
+      emitEvent('task_step_updated', { index: idx, status, note, progress: `${done}/${total}` })
       // Option C: auto-clear task when all steps reach a terminal state
       const terminal = ['done', 'failed', 'skipped']
-      const allTerminal = state.taskSteps.length > 0 && state.taskSteps.every(s => terminal.includes(s.status))
+      const allTerminal = total > 0 && state.taskSteps.every(s => terminal.includes(s.status))
+      // 在 autoCompleteTask 清空 taskSteps 之前先算好"下一步/是否有失败"，回传给 executor，
+      // 让 update_task_step 的返回串把模型推进下一个 执行→观察→判断 微循环（ReAct 驱动）。
+      const nextIndex = state.taskSteps.findIndex(s => s.status === 'pending')
+      const nextStep = nextIndex >= 0 ? state.taskSteps[nextIndex].text : null
+      const anyFailed = state.taskSteps.some(s => s.status === 'failed')
       if (allTerminal) autoCompleteTask('all steps complete')
-      return {}
+      return {
+        total,
+        done,
+        progress: `${done}/${total}`,
+        allTerminal,
+        nextIndex: nextIndex >= 0 ? nextIndex : null,
+        nextStep,
+        anyFailed,
+      }
     },
 
     startupSelfCheck: state.startupSelfCheck,
@@ -596,8 +698,60 @@ function voiceTurnNeedsSendMessage(text) {
   return EXTERNAL_SEND_HINTS.some(k => b.includes(k.toLowerCase()))
 }
 
+function deliverDirectReply(msg, content, finishTurn) {
+  const timestamp = nowTimestamp()
+  if (isVoiceChannel(msg?.channel)) autoSpeakForVoiceReply(content)
+  deliverFallbackReply(msg, content, timestamp)
+  finishTurn?.(content)
+}
+
+function tryHandleVerbatimTurn(input, msg, { finishTurn, conversationWindow = [] } = {}) {
+  if (!msg || msg.silent === true) return false
+  const text = String(input || '').trim()
+  if (!text) return false
+
+  if (isVerbatimStart(text) && state.pendingVerbatimRecital?.text) {
+    const reply = state.pendingVerbatimRecital.text
+    state.pendingVerbatimRecital = null
+    deliverDirectReply(msg, reply, finishTurn)
+    return true
+  }
+
+  const payload = extractVerbatimPayload(text)
+  if (isVerbatimSetup(text) && payload.length >= 20) {
+    state.pendingVerbatimRecital = {
+      text: payload,
+      sourceTimestamp: msg.timestamp || nowTimestamp(),
+      createdAt: Date.now(),
+    }
+    deliverDirectReply(msg, '收到，准备好了。说"开始"我就读。', finishTurn)
+    return true
+  }
+
+  if (isVerbatimOutputRequest(text)) {
+    const reply = (hasInlineVerbatimPayload(text) && payload.length >= 20)
+      ? payload
+      : (state.pendingVerbatimRecital?.text || findRecentVerbatimPayload(conversationWindow, msg))
+    if (reply) {
+      state.pendingVerbatimRecital = null
+      deliverDirectReply(msg, reply, finishTurn)
+      return true
+    }
+  }
+
+  return false
+}
+
 function isFastUserMessage(msg) {
   return !!msg && getProcessPriority(msg) >= PRIORITY.user
+}
+
+function stableFocusTopic(frame) {
+  if (!frame || !Array.isArray(frame.topic) || frame.topic.length === 0) return ''
+  const hitCount = Number(frame.hitCount || 0)
+  const hasConclusion = Array.isArray(frame.conclusions) && frame.conclusions.length > 0
+  if (hitCount < 2 && !hasConclusion) return ''
+  return frame.topic.slice(0, 3).join(',')
 }
 
 function shouldPreemptFor(entry) {
@@ -709,13 +863,13 @@ function buildSystemEnv(msg) {
   const text = (typeof msg === 'string' ? msg : msg?.content || '').toLowerCase()
   const blocks = []
   // 英文缩写用 \b 避免误匹配子串（os→close, ip→script, ram→program）
-  if (cloudCapabilityEnabled('HOST_CONTEXT') && /系统信息|操作系统|电脑|主机名|内存|运行内存|hostname|时区|用户名|\bos\b|\bcpu\b|\bram\b|\bip\b|\bip地址\b|locale/.test(text))
+  if (/系统信息|操作系统|电脑|主机名|内存|运行内存|hostname|时区|用户名|\bos\b|\bcpu\b|\bram\b|\bip\b|\bip地址\b|locale/.test(text))
     blocks.push(getSystemInfoBlock())
-  if (cloudCapabilityEnabled('DESKTOP_SCAN') && /桌面|快捷方式|桌面文件|桌面应用|已安装|浏览器|启动程序/.test(text))
+  if (/桌面|快捷方式|桌面文件|桌面应用|已安装|浏览器|启动程序/.test(text))
     blocks.push(getDesktopBlock())
-  if (cloudCapabilityEnabled('INSTALLED_SOFTWARE_SCAN') && /软件|应用|程序|客户端|工具|装了什么|用了什么|代理|科学上网|翻墙|\bvpn\b|\bproxy\b|clash|mihomo|v2ray|xray|sing-?box|shadowrocket|shadowsocks|wireguard|tailscale|zerotier|openvpn/.test(text))
+  if (/软件|应用|程序|客户端|工具|装了什么|用了什么|代理|科学上网|翻墙|\bvpn\b|\bproxy\b|clash|mihomo|v2ray|xray|sing-?box|shadowrocket|shadowsocks|wireguard|tailscale|zerotier|openvpn/.test(text))
     blocks.push(getInstalledSoftwareBlock())
-  if (cloudCapabilityEnabled('GEO_WEATHER') && /天气|气温|温度|下雨|下雪|晴天|气候|风力|风速|台风|位置|城市|在哪个城市/.test(text))
+  if (/天气|气温|温度|下雨|下雪|晴天|气候|风力|风速|台风|位置|城市|在哪个城市/.test(text))
     blocks.push(getGeoWeatherBlock())
   if (/热点|新闻|热搜|热榜|今天发生|最近发生|微博|知乎|头条/.test(text))
     blocks.push(getTrendingBlock())
@@ -753,6 +907,11 @@ async function runTurn(input, label, msg = null) {
 
     if (isTick) ensureStartupSelfCheckState()
 
+    const earlyConversationWindow = msg ? getRecentConversationTimeline(12, 2, { includeAbsorbed: true }) : []
+    if (!isTick && tryHandleVerbatimTurn(input, msg, { finishTurn, conversationWindow: earlyConversationWindow })) {
+      return
+    }
+
     // Key auto-config: if the user message contains an API key, silently configure it, purge the DB entry, notify frontend, and skip LLM
     let keyConfigFailDir = null
     if (!isTick && msg) {
@@ -784,85 +943,95 @@ async function runTurn(input, label, msg = null) {
     const injection = await runInjector({ message: input, state })
     throwIfAborted(controller.signal)
 
-    // 1b. Focus stack —— 动态上下文记忆池第 3b/3c 步：多帧栈 + 压缩回填
-    // 在 runInjector 之后、buildContextBlock 之前更新，让 <focus> / <focus-history> 段拿到最新栈。
+    // 1b. 线索模型（DynamicMemoryPool.md 第 8 章）—— 专注栈的继任者。
+    // 只有用户消息走归属判定（纯启发式，零 LLM 延迟）；TICK 永不参与判定也永不触发降温
+    // ——温度是读时算出来的（buildThreadView），没有"stale 清理"这个动作。
     try {
-      // Focus classifier 策略（Wave 1 优化：全路径 async）：
-      //   - 始终启用 LLM 仲裁（除非用户显式关掉 state.focusClassifierDisabled）
-      //   - 所有路径都走 async：v0 同步建帧零延迟，LLM 后台 patch refined topic
-      //   - 历史上 TICK/background 走 sync 是想让 LLM 在主上下文构建前就 refine 一次
-      //     但 log 显示 800ms 硬超时常发，回退到 v0 等于"白等 800ms"
-      //   - async 不改栈结构、只 patch topic，当前轮看 v0 ngram，下一轮看 refined
-      //     代价小（焦点信号粗 1 轮），收益大（TICK 路径砍掉 800ms）
-      //   - LLM 失败/超时/解析失败：focus-classifier 内部打日志后回退 v0，绝不阻塞主流程
-      const classifierDisabled = state.focusClassifierDisabled === true
-      const focusResult = await updateFocusFrame(state, input, {
-        isTick,
-        tickCounter: state.tickCounter || 0,
-        classifierEnabled: !classifierDisabled,
-        classifierMode: 'async',
-        onClassifierRefined: () => {
-          // async 模式 LLM 回填 topic 后保存到 db，让下次启动恢复时也能拿到 refined topic
+      const saveState = () => saveThreadState(state.threadState)
+      let threadResult = { event: 'noop', thread: null, switchedFrom: null }
+      if (!isTick) {
+        threadResult = attributeUserMessage(state, input, {
+          tick: state.tickCounter || 0,
+          channel: msg ? normalizeChannel(msg.channel || '') : '',
+        })
+      }
+      const foregroundThread = getForegroundThread(state)
+      emitEvent('focus_frame', {
+        focusStack: deriveStackView(state),
+        topFrame: foregroundThread,
+        threadState: state.threadState,
+        event: threadResult?.event || 'noop',
+      })
+
+      // 写时归属印章：本轮所有 insertConversation 自动带 thread_id + focus_topic。
+      // TICK 轮（自主干活）归属到开放承诺的线索——Agent 干活本身就是注意力事件。
+      const stampThread = !isTick
+        ? foregroundThread
+        : (() => {
+            const oc = latestOpenCommitment(state)
+            return (oc && getThreadById(state, oc.threadId)) || foregroundThread
+          })()
+      const stampTopicStr = stableFocusTopic(stampThread)
+      setCurrentFocusTopic(stampTopicStr)
+      setCurrentThreadId(stampThread?.id || '')
+      if (!isTick && msg?.fromId && msg?.timestamp && stampThread) {
+        try { updateUserMessageFocusTopic(msg.fromId, msg.timestamp, stampTopicStr, stampThread.id) } catch {}
+      }
+
+      if (threadResult?.event && threadResult.event !== 'noop') {
+        saveState()
+      }
+
+      // 前台切走 → 旧前台做一次增量摘要（fire-and-forget；只增加表示，不隐藏任何对话）。
+      if (threadResult?.switchedFrom) {
+        const switched = threadResult.switchedFrom
+        ;(async () => {
           try {
-            saveFocusStack(state.focusStack || [])
+            await summarizeThread(switched, { sessionRef, emitEvent, saveState })
+          } catch {}
+        })().catch(() => {})
+      }
+
+      // 弱信号候选（与某后台线索重叠=1）→ 后台 LLM 仲裁。
+      // same → 合并（线索无栈序不变量，合并永远安全）；different → 用语义化 label/topic 润色新线索。
+      if (threadResult?.ambiguousWith && state.focusClassifierDisabled !== true) {
+        const createdThread = threadResult.thread
+        const candidate = threadResult.ambiguousWith
+        const body = msg?.content || input || ''
+        ;(async () => {
+          try {
+            const verdict = await classifyThreadAttribution({
+              newMessage: body,
+              candidateThread: candidate,
+              createdTopic: createdThread?.topic || [],
+              signal: controller.signal,
+            })
+            if (!verdict) return
+            const ts = ensureThreadState(state)
+            if (verdict.verdict === 'same' && ts.threads.includes(createdThread) && ts.threads.includes(candidate)) {
+              mergeThreads(state, createdThread.id, candidate.id)
+              try { reassignConversationsThread(createdThread.id, candidate.id) } catch {}
+              ts.mergedAwayIds = [...(ts.mergedAwayIds || []), createdThread.id]
+              setCurrentThreadId(candidate.id)
+              saveState()
+              ts.mergedAwayIds = []   // db 行已标 merged，清掉避免每次 save 重复 UPDATE
+            } else if (ts.threads.includes(createdThread)) {
+              if (verdict.label) createdThread.label = verdict.label
+              if (verdict.topic.length > 0) createdThread.topic = verdict.topic
+              saveState()
+            }
             emitEvent('focus_frame', {
-              focusStack: state.focusStack || [],
-              topFrame: state.focusStack && state.focusStack.length > 0
-                ? state.focusStack[state.focusStack.length - 1]
-                : null,
+              focusStack: deriveStackView(state),
+              topFrame: getForegroundThread(state),
+              threadState: state.threadState,
               event: 'refined',
             })
-          } catch (e) {
-            console.log('[focus] saveFocusStack after async refine failed:', e?.message || 'unknown')
-          }
-        },
-        signal: controller.signal,
-      })
-      const topFrame = state.focusStack && state.focusStack.length > 0
-        ? state.focusStack[state.focusStack.length - 1]
-        : null
-      emitEvent('focus_frame', {
-        focusStack: state.focusStack || [],
-        topFrame,
-        event: focusResult?.event || 'noop',
-      })
-
-      // P0-1：把"当前焦点 topic"广播给 db.js，之后本轮所有 insertConversation
-      // 自动带上该 topic。同时回填本轮触发判定的 user 消息（pushMessage 时焦点还没算）。
-      const topTopicStr = topFrame && Array.isArray(topFrame.topic)
-        ? topFrame.topic.slice(0, 3).join(',')
-        : ''
-      setCurrentFocusTopic(topTopicStr)
-      if (!isTick && msg?.fromId && msg?.timestamp && topTopicStr) {
-        try { updateUserMessageFocusTopic(msg.fromId, msg.timestamp, topTopicStr) } catch {}
-      }
-
-      // 5c 步：持久化焦点栈到 db。noop 路径不写库（DELETE+INSERT 0 行也是无意义 IO）。
-      // 任何 push/pop/touch/refresh 都视为栈状态变化，写一次。better-sqlite3 同步，
-      // 写入 ~ ms 级；失败 saveFocusStack 内部 console.warn 后吞掉。
-      if (focusResult?.event && focusResult.event !== 'noop') {
-        saveFocusStack(state.focusStack || [])
-      }
-
-      // 压缩回填：每帧 pop 异步压缩成一句话结论，挂回新栈顶 + 沉淀到长期记忆。
-      // fire-and-forget，参考 recognizer.js:196 的双层 catch 模式，绝不能阻塞主对话。
-      if (focusResult?.poppedFrames?.length > 0) {
-        for (const popped of focusResult.poppedFrames) {
-          ;(async () => {
-            try {
-              // saveStack 回调：compress 把 conclusion push 进 currentTopFrame 后调用，
-              // 把更新后的栈写回 db。focus-compress 不直接依赖 state。
-              const saveStack = () => saveFocusStack(state.focusStack || [])
-              await compressPoppedFrame(popped, topFrame, { sessionRef, emitEvent, saveStack })
-            } catch {
-              // 压缩失败 → 当作"那帧没沉淀"继续，不打扰用户
-            }
-          })().catch(() => {})
-        }
+          } catch {}
+        })().catch(() => {})
       }
     } catch (e) {
-      // 焦点判断不应该影响主流程；任何异常吞掉、记录日志即可
-      console.log('[focus] updateFocusFrame failed:', e.message)
+      // 线索判断不应该影响主流程；任何异常吞掉、记录日志即可
+      console.log('[threads] attributeUserMessage failed:', e.message)
     }
 
     const directions = [...(injection.directions || [])]
@@ -905,7 +1074,8 @@ async function runTurn(input, label, msg = null) {
       directions.push('Voice mode style: speak like a person in the room. Default to one or two short sentences. No Markdown, no bullets, no headings, no process acknowledgement, no repeated summary. Say the situation, then stop.')
       directions.push('The current user message came from voice input. Speak naturally and concisely — like talking to a person, not writing an article. Get to the point, avoid filler phrases, and do not use Markdown formatting (no bullet points, asterisks, or headers). Say what needs to be said and stop.')
       directions.push('For voice input, do not send process acknowledgements like "I will look" or "let me check" before the answer. Send one compact answer unless you truly need a slow tool and have no result yet.')
-      directions.push('If the voice input is clearly a speech recognition error (meaningless noise, garbled syllables, random characters) OR appears to be ambient speech not directed at you — such as someone nearby talking to another person, background conversation, or utterances with no plausible intent to address an AI assistant — silently ignore it: do NOT call send_message or any other tool. Only respond when the input is reasonably addressed to you.')
+      directions.push('If the user asks you to read, repeat, or output exact text for recording, reply with the exact text as normal chat text. Do not call the speak tool; this voice channel already turns assistant text into audio automatically. Do not paraphrase, summarize, shorten, or add commentary.')
+      directions.push('If the voice input is clearly a speech recognition error (meaningless noise, garbled syllables, random characters) OR appears to be ambient speech not directed at you — such as someone nearby talking to another person, background conversation, or utterances with no plausible intent to address an AI assistant — treat it as noise and stay genuinely silent. Do NOT call send_message or any other tool. Critically, do NOT write any spoken sentence about it either: on a voice/local turn your plain text reply is read aloud by TTS, so explaining "this looks like recognition noise, so I will stay silent" is self-defeating — that explanation itself becomes spoken sound, which is the opposite of silence. Instead reply with a SINGLE emoji and nothing else — prefer 👂 — with no words, punctuation, or reasoning before or after it. A lone emoji gives TTS nothing meaningful to speak, so it stays effectively silent while still showing on screen that you registered the input and deliberately chose not to act on it. Only answer normally when the input is reasonably addressed to you.')
     }
 
     if (keyConfigFailDir) directions.unshift(keyConfigFailDir)
@@ -980,6 +1150,7 @@ async function runTurn(input, label, msg = null) {
       personMemory: injection.personMemory
         ? { content: injection.personMemory.content, detail: injection.personMemory.detail || '' }
         : null,
+      userProfile: injection.userProfile || null,
       fastUserPath,
     })
 
@@ -995,6 +1166,22 @@ async function runTurn(input, label, msg = null) {
     const entities = getKnownEntities()
     const hasActiveTask = !!state.task
     const extraContextJoined = [presenceText, runtimeInjection.contextText, prefetchText, injection.uiSignalSummary, formatActiveUICards(injection.activeUICards), formatAIVideoPanel(getAIVideoPanelState())].filter(Boolean).join('\n\n')
+    const skillSelection = selectSkillsForMessage(msg?.content || input || '')
+    const agentSkillsText = formatSkillsForContext(skillSelection)
+    if (skillSelection.active.length > 0 || skillSelection.catalogRequested) {
+      emitEvent('agent_skills_selected', {
+        active: skillSelection.active.map(s => ({
+          id: s.id,
+          name: s.name,
+          description: s.description,
+          source: s.source,
+          relativeDir: s.relativeDir,
+          score: s.score,
+        })),
+        catalogRequested: skillSelection.catalogRequested,
+        total: skillSelection.catalog.length,
+      })
+    }
 
     // system 只留稳定硬底线（agent_name / persona）—— 让 DeepSeek prefix cache
     // 真正命中。currentTime / existenceDesc / systemEnv / security 改走 <runtime> 段（每轮变化）。
@@ -1008,6 +1195,7 @@ async function runTurn(input, label, msg = null) {
     const systemPrompt = buildSystemPrompt({
       agentName,
       persona,
+      birthTime,
       userMessage: msg?.content || input || '',
       currentChannel: msg ? normalizeChannel(msg.channel || '') : '',
       hasWechatHistory: false,
@@ -1015,6 +1203,9 @@ async function runTurn(input, label, msg = null) {
       currentCountryCode: geoResult?.location?.country_code || '',
       currentTimezone: geoResult?.location?.timezone || '',
       currentTools: injection.tools || [],
+      // 编程纪律内化的信号源二/三：task 文本 + 最近动作摘要（TICK 干活轮也能命中）
+      currentTaskText: state.task || '',
+      recentActionsSummary: (state.recentActions || []).map(a => a?.summary || '').join(' | '),
     })
 
     const baseContextArgs = {
@@ -1023,6 +1214,7 @@ async function runTurn(input, label, msg = null) {
       directions: directionsText,
       constraints: injection.constraints || [],
       personMemory: injection.personMemory || null,
+      userProfile: injection.userProfile || null,
       thoughtStack: state.thoughtStack,
       entities,
       hasActiveTask,
@@ -1030,7 +1222,8 @@ async function runTurn(input, label, msg = null) {
       taskKnowledge: taskKnowledgeText,
       extraContext: extraContextJoined,
       awakeningTicks: getAwakeningTicks(),
-      focusStack: state.focusStack || [],
+      threadView: buildThreadView(state),
+      agentSkills: agentSkillsText,
       // Runtime info：从 system 迁来的每轮变化字段，集中放 <context><runtime>
       currentTime: nowTimestamp(),
       existenceDesc: describeExistence(birthTime),
@@ -1047,9 +1240,7 @@ async function runTurn(input, label, msg = null) {
     // 在 buildContextBlock 渲染之前，对"几乎常驻但常无关"的 section 做相关度门控 + 全段埋点。
     // 参照系 = 本轮 user 消息正文 + 当前焦点 topic（编排器已蒸馏的"在关注什么"）。
     // 参照系信号不足时 selectContextSections 内部会自动跳过门控、保留全部（守连续感红线）。
-    const focusTopicWords = Array.isArray(state.focusStack) && state.focusStack.length
-      ? (state.focusStack[state.focusStack.length - 1]?.topic || []).join(' ')
-      : ''
+    const focusTopicWords = (getForegroundThread(state)?.topic || []).join(' ')
     const referenceFrame = [msg?.content || input || '', focusTopicWords].filter(Boolean).join(' ')
     const gateResult = selectContextSections(baseContextArgs, {
       referenceFrame,
@@ -1071,10 +1262,7 @@ async function runTurn(input, label, msg = null) {
     //   - conversationWindow 每条消息 marker 上的 topic 标签
     //   - 当前 user 消息 marker 上的 "topic switch" 提示
     //   - 过期未答悬念的判断（话题切走时直接标 [expired]）
-    const currentTopicStr = (state.focusStack && state.focusStack.length > 0
-      && Array.isArray(state.focusStack[state.focusStack.length - 1].topic))
-      ? state.focusStack[state.focusStack.length - 1].topic.slice(0, 3).join(',')
-      : ''
+    const currentTopicStr = stableFocusTopic(getForegroundThread(state))
 
     const buildMessagesWithContext = (ctxBlock) => buildLLMMessages({
       systemPrompt,
@@ -1140,6 +1328,10 @@ async function runTurn(input, label, msg = null) {
 
     // 3. Call Jarvis LLM (can be interrupted by a new message)
     const toolContext = buildToolContextForProcess(msg, injection)
+    // 审视分身取证：把本轮正在累积的工具日志数组引用挂进 toolContext。execReviewWork 在循环中途
+    // 被调时读它，即可拿到"主 Agent 到此为止实际做了什么"的真实证据（数组按引用传递，调用时已填充）。
+    // 这是审视独立性的承重墙——主 Agent 无法在 review_work 参数里粉饰或省略它做过的事。
+    toolContext.turnToolLog = toolCallLog
     const voiceTurn = isVoiceChannel(msg?.channel)
     // localReply：本地渠道（语音 / TUI，非社交）下纯文本即回复，模型无需调 send_message——
     // runtime 协议兜底会替它真正投递（含语音 TTS）。社交渠道（微信/Discord/飞书/企微）才必须
@@ -1189,13 +1381,17 @@ async function runTurn(input, label, msg = null) {
         // callLLM 的协议兜底会用 __fallback 标记它代为投递的那次 send_message，
         // 让下方遥测能区分"模型自己发的"与"runtime 兜底发的"。该标记不进 UI 事件。
         const isFallbackDelivery = !!(args && args.__fallback)
-        const cleanArgs = isFallbackDelivery ? { ...args } : args
+        // __ack：耗时工具的即时回应（"我查一下…"）由 llm.js 直投后补调本回调，仅为触发语音 TTS
+        // （TTS 只挂在这里）。标记需剥离，避免泄进 tool_call 事件 / toolCallLog。
+        const isAckDelivery = !!(args && args.__ack)
+        const cleanArgs = (isFallbackDelivery || isAckDelivery) ? { ...args } : args
         if (isFallbackDelivery) delete cleanArgs.__fallback
+        if (isAckDelivery) delete cleanArgs.__ack
         // 截断策略：保证 JSON 仍可解析，否则前端格式化器会回退展示原始 JSON 文本。
         // 优先压缩 stdout/stderr/content/snippet 等长字段，再整体 stringify，而非粗暴 slice。
         const resultForEvent = truncateToolResultForUI(parsed, resultText)
         emitEvent('tool_call', { name, args: cleanArgs, result: resultForEvent, ok })
-        toolCallLog.push({ name, args: cleanArgs, result: resultText.slice(0, 500), ok, fallback: isFallbackDelivery })
+        toolCallLog.push({ name, args: cleanArgs, result: resultText.slice(0, 500), ok, fallback: isFallbackDelivery, ack: isAckDelivery })
         // 注：send_message 的 conversations 写入已由 executor.js 内统一处理（带 channel + external_party_id）
         // 这里仅处理语音输入的 TTS 自动回放
         // 语音渠道才自动播报。本轮若流出过正文（sawTextStream），说明前端已边出边逐句流式合成，
@@ -1324,6 +1520,7 @@ async function runTurn(input, label, msg = null) {
   if (markers.setTask !== null) {
     state.task = markers.setTask.trim()
     setConfig('current_task', state.task)
+    openTaskCommitment(state.task)
     console.log(`[system] Task set: ${state.task}`)
     emitEvent('task_set', { task: state.task })
   }
@@ -1334,6 +1531,7 @@ async function runTurn(input, label, msg = null) {
     state.task = null
     state.taskIdleTickCount = 0
     setConfig('current_task', '')
+    closeTaskCommitment('done')
     // Write a task_complete memory to prevent old task memories from making Jarvis think the task is still active
     if (clearedTask) {
       insertMemory({
@@ -1351,6 +1549,15 @@ async function runTurn(input, label, msg = null) {
     const summary = toolCallLog.map(summarizeToolCall).join(', ')
     state.recentActions.push({ ts: nowTimestamp(), summary })
     if (state.recentActions.length > 5) state.recentActions.shift()
+
+    // 线索模型（认识论修正）：Agent 干活本身就是注意力事件——行动者直接声明，不经过归属判定。
+    // touch 开放承诺的线索（没有就 touch 前台），刷新 lastEventAt。
+    // 这一条消灭了专注栈时代的"干活时帧饿死"（task 模式 30s/tick × 20 = 10 分钟即失焦）。
+    try {
+      if (touchCommitmentThread(state, { tick: state.tickCounter || 0 })) {
+        saveThreadState(state.threadState)
+      }
+    } catch {}
   }
 
   // Option B: task idle detection — auto-clear after N consecutive ticks with no tool calls
@@ -1594,13 +1801,14 @@ async function startConsciousnessLoop({ runImmediateTick = true } = {}) {
 async function main() {
   console.log('Jarvis starting...')
 
-  // 5c 步：启动时打印恢复的专注栈，便于"重启不丢栈"的直观验证。
-  if (state.focusStack && state.focusStack.length > 0) {
-    const path = state.focusStack
-      .map(f => Array.isArray(f.topic) ? f.topic.join(',') : '')
-      .filter(Boolean)
-      .join(' > ')
-    console.log(`[focus] 恢复 ${state.focusStack.length} 帧专注栈：${path}`)
+  // 启动时打印恢复的线索状态，便于"重启不丢线索/承诺"的直观验证。
+  {
+    const ts = ensureThreadState(state)
+    if (ts.threads.length > 0) {
+      const fg = getForegroundThread(state)
+      const open = ts.commitments.filter(c => c.status === 'open').length
+      console.log(`[threads] 恢复 ${ts.threads.length} 条线索（前台：${fg ? describeThread(fg) : '无'}；开放承诺 ${open} 个）`)
+    }
   }
 
   // Sync ACUI skill memories (compare AGENT_GUIDE.md hash, update skill-ui-* entries as needed)
@@ -1614,7 +1822,7 @@ async function main() {
   }
 
   // Start HTTP API — must start regardless of activation status; the activation page depends on it
-  const apiPort = Number(process.env.LITTLE_PRINCE_AGENT_PORT) || 3721
+  const apiPort = Number(process.env.LITTLE_PRINCE_AGENT_PORT || process.env.BAILONGMA_PORT) || 3721
   startAPI(apiPort, {
     getStateSnapshot: () => ({
       action: state.action,
