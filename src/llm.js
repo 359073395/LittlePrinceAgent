@@ -1,13 +1,15 @@
 import OpenAI from 'openai'
-import { config } from './config.js'
+import { config, MIMO_PROVIDER, ZHIPU_PROVIDER, getProviderModelFallbacks, shouldOmitSamplingForProviderModel, shouldSendThinkingDisabledForProviderModel, shouldUseMaxCompletionTokensForProviderModel, switchModel } from './config.js'
 import { executeTool } from './capabilities/executor.js'
 import { getToolSchemas } from './capabilities/schemas.js'
 import { recordUsage, shouldThrottle } from './quota.js'
 import { insertActionLog } from './db.js'
 import { isTerminalInternalToolRound } from './runtime/tool-protocol.js'
-import { stripMarkers } from './runtime/markers.js'
+import { sanitizeAssistantReplyForDelivery, createAssistantReplyStreamSanitizer } from './runtime/markers.js'
 import { beginTurn } from './runtime/turn-trace.js'
 import { createMergedAbortSignal } from './capabilities/abort-utils.js'
+import { filterStrictEvaluationTools, isToolForbiddenInStrictEvaluation, makeStrictForbiddenToolResult } from './runtime/strict-evaluation.js'
+import { streamWriteFileArgumentPreview, streamXmlFileWriteArgumentPreview } from './write-file-preview.js'
 
 // 单轮流式调用的「空闲超时」：从开始到第一个 token、以及每两个 token 之间，
 // 若超过这个时长没有任何增量到达，判定为 provider 连接卡死（连接开着却不吐字节）。
@@ -19,7 +21,7 @@ const STREAM_IDLE_TIMEOUT_MS = 45_000
 // find_tool 命中后，把它返回的 loaded 工具 schema 原地追加进本轮 toolSchemas。
 // 已在列表里的跳过；schema 取不到的跳过。数组原地 mutate —— 调用方传的是 callLLM 的 toolSchemas
 // 引用，push 后下一轮 streamOnceWithRetry 自动带上这些新工具，模型即可直接调用。
-function injectFoundToolSchemas(result, toolSchemas) {
+function injectFoundToolSchemas(result, toolSchemas, strictEvaluation = null, toolPromptHints = null) {
   try {
     const parsed = JSON.parse(result)
     const loaded = parsed?.loaded
@@ -27,7 +29,11 @@ function injectFoundToolSchemas(result, toolSchemas) {
     const present = new Set(toolSchemas.map(s => s?.function?.name).filter(Boolean))
     for (const name of loaded) {
       if (typeof name !== 'string' || present.has(name)) continue
-      const schema = getToolSchemas([name])[0]
+      if (isToolForbiddenInStrictEvaluation(strictEvaluation, name)) {
+        console.log(`[find_tool] strict evaluation skipped forbidden tool → ${name}`)
+        continue
+      }
+      const schema = getToolSchemas([name], { toolPromptHints })[0]
       if (schema) {
         toolSchemas.push(schema)
         present.add(name)
@@ -58,35 +64,72 @@ function shouldEnableDeepSeekThinking(thinking) {
   return true
 }
 
-// 单次流式调用，返回 { content, toolCalls, aborted }
-async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens, thinking = true, signal, onStream }) {
+function normalizeTemperatureForProvider(temperature, model = config.model) {
+  if (typeof temperature !== 'number') return temperature
+  if (shouldOmitSamplingForProviderModel(config.provider, model)) return undefined
+  if (config.provider !== ZHIPU_PROVIDER) return temperature
+  return Math.max(0, Math.min(1, Number(temperature.toFixed(2))))
+}
+
+function buildChatCompletionRequestParams({ messages, toolSchemas = [], temperature, topP, maxTokens, thinking = true, model = config.model }) {
+  const providerTemperature = normalizeTemperatureForProvider(temperature, model)
   const requestParams = {
-    model: config.model,
-    temperature,
+    model,
     messages,
     stream: true,
-    stream_options: { include_usage: true },
+  }
+  if (typeof providerTemperature === 'number') {
+    requestParams.temperature = providerTemperature
+  }
+  if (config.provider !== ZHIPU_PROVIDER) {
+    requestParams.stream_options = { include_usage: true }
   }
 
-  if (typeof topP === 'number' && topP > 0) requestParams.top_p = topP
+  if (
+    typeof topP === 'number'
+    && topP > 0
+    && config.provider !== ZHIPU_PROVIDER
+    && !shouldOmitSamplingForProviderModel(config.provider, model)
+  ) {
+    requestParams.top_p = topP
+  }
   if (config.provider === 'deepseek') {
     const thinkingEnabled = shouldEnableDeepSeekThinking(thinking)
     if (thinkingEnabled) {
       requestParams.reasoning_effort = 'high'
       requestParams.thinking = { type: 'enabled' }
     } else {
-      // DeepSeek 拒绝 reasoning_effort 与 thinking.type='disabled' 组合
       requestParams.thinking = { type: 'disabled' }
     }
-  } else {
-    if (!thinking) requestParams.thinking = { type: 'disabled' }
+  } else if (!thinking && shouldSendThinkingDisabledForProviderModel(config.provider, model)) {
+    requestParams.thinking = { type: 'disabled' }
   }
-  if (maxTokens) requestParams.max_tokens = maxTokens
+  if (maxTokens) {
+    if (shouldUseMaxCompletionTokensForProviderModel(config.provider, model)) {
+      requestParams.max_completion_tokens = maxTokens
+    } else {
+      requestParams.max_tokens = maxTokens
+    }
+  }
   if (toolSchemas.length > 0) {
     requestParams.tools = toolSchemas
     requestParams.tool_choice = 'auto'
+    if (config.provider === ZHIPU_PROVIDER) requestParams.tool_stream = true
   }
+  return requestParams
+}
 
+// 单次流式调用，返回 { content, toolCalls, aborted }
+async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens, thinking = true, signal, onStream, model = config.model }) {
+  const requestParams = buildChatCompletionRequestParams({
+    model,
+    messages,
+    toolSchemas,
+    temperature,
+    topP,
+    maxTokens,
+    thinking,
+  })
   // ── 空闲超时（连接卡死保护）──
   // provider 连接开着却长时间不吐任何增量 = 停摆。每收到一个 chunk 就重置计时；超时则中止本轮，
   // 交给 streamOnceWithRetry 重试，避免把整个 turn 干耗到 index.js 的 180s watchdog 才被发现。
@@ -120,12 +163,28 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
   let fullContent = ''
   let fullReasoningContent = ''
   let toolCallsMap = {}
+  const writeFilePreviewStates = new Map()
+  const writeFilePreviewSession = { cleared: false }
+  const xmlWriteFilePreviewState = { session: writeFilePreviewSession }
   let inThink = false
   let thinkDone = false
   let streamStarted = false
   let usageTokens = 0
   let cacheHitTokens = 0
   let cacheMissTokens = 0
+  const textStreamSanitizer = createAssistantReplyStreamSanitizer()
+  const emitTextChunk = (rawText) => {
+    const cleanText = textStreamSanitizer.push(rawText)
+    if (!cleanText) return
+    if (!streamStarted) { onStream?.({ event: 'start', mode: 'text' }); streamStarted = true }
+    onStream?.({ event: 'chunk', text: cleanText })
+  }
+  const flushTextStream = () => {
+    const cleanText = textStreamSanitizer.flush()
+    if (!cleanText) return
+    if (!streamStarted) { onStream?.({ event: 'start', mode: 'text' }); streamStarted = true }
+    onStream?.({ event: 'chunk', text: cleanText })
+  }
 
   try {
   // create() 也放进 try：连接建立阶段就卡死时，idle 触发 → 这里抛 AbortError → 下方 catch 转成可重试的瞬时错误。
@@ -145,6 +204,7 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
 
     // 工具调用增量
     if (delta?.tool_calls) {
+      flushTextStream()
       if (streamStarted) {
         onStream?.({ event: 'end' })
         streamStarted = false
@@ -165,12 +225,15 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
           }
         }
         if (tc.function?.arguments) toolCallsMap[idx].arguments += tc.function.arguments
+        const previewState = writeFilePreviewStates.get(idx) || {}
+        previewState.session ||= writeFilePreviewSession
+        writeFilePreviewStates.set(idx, streamWriteFileArgumentPreview(toolCallsMap[idx], previewState))
       }
       continue
     }
 
     // DeepSeek reasoner 思考内容（独立字段，不在 content 里）
-    const reasoningText = delta?.reasoning_content
+    const reasoningText = delta?.reasoning_content || delta?.reasoningContent || delta?.reasoning
     if (reasoningText) {
       fullReasoningContent += reasoningText
       if (!thinkDone) {
@@ -193,6 +256,7 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
     }
 
     fullContent += text
+    streamXmlFileWriteArgumentPreview(fullContent, xmlWriteFilePreviewState)
 
     // 解析 <think> 标签流式推送
     if (!thinkDone) {
@@ -215,8 +279,7 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
           streamStarted = false
           const afterThink = fullContent.split('</think>').slice(1).join('</think>').trimStart()
           if (afterThink) {
-            onStream?.({ event: 'start', mode: 'text' }); streamStarted = true
-            onStream?.({ event: 'chunk', text: afterThink })
+            emitTextChunk(afterThink)
           }
         } else {
           if (!streamStarted) { onStream?.({ event: 'start', mode: 'think' }); streamStarted = true }
@@ -226,14 +289,14 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
       }
     }
 
-    if (!streamStarted) { onStream?.({ event: 'start', mode: 'text' }); streamStarted = true }
-    onStream?.({ event: 'chunk', text })
+    emitTextChunk(text)
   }
 
   } catch (err) {
     // 空闲超时（我们自己的看门狗触发）且调用方并未中止 —— 当作瞬时错误上抛，由 streamOnceWithRetry 重试，
     // 而不是误判成"用户中止"(aborted:true) 把本轮静默放弃。
     if (idleFired && !signal?.aborted) {
+      flushTextStream()
       if (streamStarted) onStream?.({ event: 'end' })
       const e = new Error(`stream idle timeout after ${STREAM_IDLE_TIMEOUT_MS / 1000}s`)
       e.code = 'ETIMEDOUT'
@@ -241,21 +304,24 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
       throw e
     }
     if (err.name === 'AbortError' || signal?.aborted) {
+      flushTextStream()
       if (streamStarted) onStream?.({ event: 'end' })
       return {
-        content: fullContent,
+        content: sanitizeAssistantReplyForDelivery(fullContent),
         reasoningContent: fullReasoningContent,
         toolCalls: Object.values(toolCallsMap),
         aborted: true
       }
     }
     err.hadContent = fullContent.length > 0
+    flushTextStream()
     if (streamStarted) onStream?.({ event: 'end' })
     throw err
   } finally {
     cleanupIdle()
   }
 
+  flushTextStream()
   if (streamStarted) onStream?.({ event: 'end' })
   if (usageTokens > 0) {
     recordUsage(usageTokens)
@@ -267,11 +333,15 @@ async function streamOnce({ messages, toolSchemas, temperature, topP, maxTokens,
   }
 
   return {
-    content: fullContent,
+    content: sanitizeAssistantReplyForDelivery(fullContent),
     reasoningContent: fullReasoningContent,
     toolCalls: Object.values(toolCallsMap),
     aborted: false
   }
+}
+
+export const __internals = {
+  buildChatCompletionRequestParams,
 }
 
 // 判断是否为瞬时错误（5xx / 网络抖动 / 超时），429 交给外层 setRateLimited
@@ -283,6 +353,12 @@ function isTransientError(err) {
   if (code && ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE'].includes(code)) return true
   const msg = err.message || ''
   return /timeout|timed out|socket hang up|fetch failed|network error|upstream/i.test(msg)
+}
+
+function isAuthenticationError(err) {
+  const status = err.status ?? err.response?.status
+  const msg = err.message || ''
+  return status === 401 || /unauthoriz|invalid.*api.*key|authentication/i.test(msg)
 }
 
 function abortableSleep(ms, signal) {
@@ -326,6 +402,48 @@ async function streamOnceWithRetry(args) {
 }
 
 // XML 格式工具调用的参数名别名映射（某些模型使用不同参数名）
+async function streamOnceWithModelFallback(args) {
+  if (config.provider !== MIMO_PROVIDER) return await streamOnceWithRetry(args)
+
+  const models = getProviderModelFallbacks(config.provider, args.model || config.model)
+  if (models.length <= 1) return await streamOnceWithRetry({ ...args, model: models[0] || config.model })
+
+  let lastErr
+  for (let idx = 0; idx < models.length; idx++) {
+    const model = models[idx]
+    try {
+      const result = await streamOnceWithRetry({ ...args, model })
+      if (model !== config.model) {
+        try {
+          switchModel(model)
+        } catch (persistErr) {
+          console.warn(`[LLM] MiMo fallback model "${model}" worked but could not be saved: ${persistErr.message || persistErr}`)
+        }
+        console.warn(`[LLM] MiMo model fallback selected "${model}"`)
+      }
+      return result
+    } catch (err) {
+      if (err.name === 'AbortError' || args.signal?.aborted) throw err
+      if (err.hadContent || isAuthenticationError(err)) throw err
+      lastErr = err
+      const nextModel = models[idx + 1]
+      if (!nextModel) break
+      args.onRetry?.({
+        attempt: idx + 1,
+        nextAttempt: idx + 2,
+        maxAttempts: models.length,
+        delayMs: 0,
+        error: err.message || String(err),
+        modelFallback: true,
+        model,
+        nextModel,
+      })
+      console.warn(`[LLM] MiMo model "${model}" failed before content; falling back to "${nextModel}": ${(err.message || String(err)).slice(0, 120)}`)
+    }
+  }
+  throw lastErr
+}
+
 const PARAM_ALIASES = {
   send_message: { to: 'target_id', message: 'content', text: 'content', recipient: 'target_id' },
   read_file: { file: 'path', filename: 'path', filepath: 'path' },
@@ -448,7 +566,7 @@ function shouldPersistActionLog(toolName) {
 // 文本标记后返回正文。内容本身不做客套裁剪 / 行去重 / 改写。
 function stripProtocolMarkersForDelivery(text) {
   // 单一真相源：src/runtime/markers.js。剥离语义（含末尾 trim）与原正则完全一致。
-  return stripMarkers(text)
+  return sanitizeAssistantReplyForDelivery(text)
 }
 
 const TOOL_LOOP_LIMITS = {
@@ -478,7 +596,6 @@ const HIGH_RISK_TOOLS = new Set([
   'generate_lyrics',
   'generate_music',
   'generate_image',
-  'ui_register',
 ])
 
 function stableStringify(value) {
@@ -547,7 +664,7 @@ const REPORT_CHANNEL_TOOLS = new Set(['send_message', 'express'])
 // 这些工具一旦被调用，就由运行时在执行前替它"应一声"——一个 turn 只发一次（见 callLLM 的
 // ackSent）。只覆盖真正会让人等的工具；秒回的普通问答不在此列，避免把简单对话变啰嗦。
 const SLOW_ACK_TOOLS = new Set([
-  'generate_video', 'generate_image', 'generate_music', 'generate_lyrics',
+  'generate_image', 'generate_music', 'generate_lyrics',
   'web_search', 'fetch_url', 'browser_read', 'deep_research', 'exec_command',
 ])
 function isSlowAckTool(name, args) {
@@ -560,7 +677,6 @@ function slowAckText(name, args) {
     return s ? `在找《${s}》了，稍等一下～` : '在找了，稍等一下～'
   }
   if (name === 'generate_image') return '在画了，稍等一下～'
-  if (name === 'generate_video') return '在生成视频了，稍等一下～'
   if (name === 'generate_music' || name === 'generate_lyrics') return '在创作了，稍等一下～'
   if (name === 'web_search' || name === 'fetch_url' || name === 'browser_read' || name === 'deep_research') {
     const q = String(args?.query || args?.q || args?.url || '').trim()
@@ -643,62 +759,25 @@ export function buildUncertaintyCheckpointNudge(totalCalls) {
   return `You have run ${totalCalls} tool calls this turn and still have not delivered a result to the user. Pause for one beat — this many steps without converging is itself a signal. The issue may not be the current action; it may be the plan.\n\nIn <think>, ask yourself honestly: am I actually converging on the goal, or am I unsure and pushing forward anyway? Then pick one:\n- If the plan is off, re-read the goal (and current_task if you set one) and re-plan instead of adding more steps.\n- If you are not sure a previous step actually worked, verify it with one read-only tool rather than stacking more actions on an unverified assumption.\n- If you are genuinely stuck, tell the user what you have done, what is blocking you, and what you need — do not keep silently grinding.\nThis is a one-time internal checkpoint; do not narrate it to the user, just course-correct.`
 }
 
-function requiresToolForRequest(text = '') {
-  const input = String(text || '')
-  const fileIntent = /(sandbox|文件|目录|创建|新建|写入|读取|删除|列出|保存|test-\d+|\.txt|\.json|\.md|\.js|\.html|\.css)/i.test(input)
-    && /(创建|新建|写入|读取|删除|列出|保存|改|修改|生成|create|write|read|delete|list|save)/i.test(input)
-  const commandIntent = /(执行命令|运行命令|跑命令|exec|command|npm|node|git|powershell|cmd)/i.test(input)
-  const webIntent = /(打开网页|抓取|联网|搜索|查询最新|fetch|url|https?:\/\/)/i.test(input)
-  return fileIntent || commandIntent || webIntent
-}
+// 中途纠正 nudge 是以 role:'user' 注入的，模型容易误当成"用户在说话"而生成一句面向用户的
+// 反应（如"你说得对…"），把它当成回复发出去。所有这类内部纠正都追加这句，明确它是运行时内部
+// 指令、不要向用户复述/道歉/引用——只管纠正动作。对齐 buildUncertaintyCheckpointNudge 的做法。
+const INTERNAL_NUDGE_SUFFIX = '\n\n(This is an internal runtime instruction, not a message from the user. Do not quote it, apologize for it, or mention it to the user — just produce the corrected action/reply.)'
 
-function buildMissingToolNudge(userMessage = '') {
-  return `The user's request requires a real tool call, not a textual claim. Do not say it is done unless the tool result proves it.\nUser request:\n${String(userMessage || '').slice(0, 600)}\n\nCall the appropriate tool now. For sandbox file creation or editing, call write_file with the exact path and content, then call send_message after the write_file result returns.`
-}
-
-// 检测模型是否在文字中"描述"了工具调用而没有真正调用
-// 返回检测到的规范工具名，或 null
-function detectFakeToolCall(content, toolNames) {
-  if (!content || !toolNames.length) return null
-
-  // 去掉下划线后做模糊匹配（处理模型写成 settickinterval 而非 set_tick_interval 的情况）
-  const normalizedContent = content.toLowerCase().replace(/[_\s]/g, '')
-  for (const name of toolNames) {
-    if (name.length < 5) continue  // 太短的名字容易误判
-    if (normalizedContent.includes(name.toLowerCase().replace(/_/g, ''))) {
-      return name
-    }
-  }
-
-  // 检测中文动作括号伪调用，如 [心跳启动中] [调用成功] [执行中]
-  if (/[\[【][^\]】]{2,20}(中|完成|成功|ing)[\]】]/.test(content)) {
-    return '(action claim)'
-  }
-
-  return null
-}
-
-function buildFakeToolCallNudge(toolName, toolSchemas = []) {
-  const isGeneric = toolName === '(action claim)'
-  const header = isGeneric
-    ? 'You wrote a bracketed action description (e.g. [xxx中]) but did not call any tool.'
-    : `Your reply mentioned the tool "${toolName}" in text but did not invoke it through the function-call mechanism.`
-
-  let schemaHint = ''
-  if (!isGeneric) {
-    const schema = toolSchemas.find(s => s?.function?.name === toolName)
-    if (schema) {
-      const props = schema.function?.parameters?.properties || {}
-      const required = schema.function?.parameters?.required || []
-      const paramList = Object.entries(props)
-        .map(([k, v]) => `${required.includes(k) ? k + '*' : k} (${v.type || 'any'})`)
-        .join(', ')
-      if (paramList) schemaHint = `\nRequired call format: ${toolName}({ ${paramList} })  (* = required)`
-    }
-  }
-
-  return `${header} Writing text about what a tool does has no effect on the system — the action did not happen.\n\nYou must now invoke the tool using the function-call interface, not describe it in prose.${schemaHint}`
-}
+// 设计决策（2026-06，第一性原理重构）：此处曾有三支"猜测模型在假装干活"的检测，现已全部删除：
+//   1. detectFakeToolCall：扫模型正文、匹配工具名子串 → 判"嘴上说调了实际没调"
+//   2. 假记忆检测：扫正文匹配"记住了/完成"关键词且没调 upsert_memory → 判假承诺
+//   3. missingToolNudge：扫**用户**消息（requiresToolForRequest 的文件/命令/联网关键词）∧ !sawToolCall
+//      → 判"用户要求了动作但模型没真正执行"，于是 allContent='' 抹掉答案 + 以 role:'user' 逼调工具
+// 三者是同一个错的层：自由文本（无论模型的还是用户的）本身欠定"是否在断言/要求一次动作"。
+// 第 3 支看似只读"真相信号 sawToolCall"，但它的另一半 requiresToolForRequest 仍是关键词扫描——
+// "你有几个执行命令的工具""你会联网搜索吗"这类**关于工具的元问题**必然含"执行命令/搜索"等词，
+// 于是被误判成动作请求。后果与前两支完全一致、且更隐蔽：它会 allContent='' 抹掉已成形（语音轮
+// 甚至已经念出口）的正确答案，再以 role:'user' 追问，模型误以为被质疑，吐出"你说得对…"重答一遍
+// ——用户那边就是"同一个问题被回答两遍、第二遍像重启"。详见 test-no-fake-tool-detection.js 场景 3。
+//
+// 真相源是运行时的工具日志（sawToolCall / toolCallLog），不是任何一方的散文。"该调没调"这件事
+// 无法从文本可靠推断，因此不再做这层检测；漏调 send_message 仍有文末协议兜底真正投递，不会静默。
 
 function throwIfAborted(signal) {
   if (!signal?.aborted) return
@@ -742,8 +821,10 @@ function isCloserPattern(content) {
 //   refresh agent 的上下文"，**不**期望模型回复用户。当 silentSignal=true 时，
 //   runtime 直接拦截 send_message 调用（不让它真投递），并在工具结果里告知
 //   "本轮是 silent 系统信号，不要 send_message"，让模型从这次拒绝里学到边界。
-export async function callLLM({ systemPrompt, message, messages: inputMessages = null, temperature = 0.5, topP = 0.9, tools = [], maxTokens, thinking = true, signal, onToolCall, onToolExecute, onStream, onRetry, toolContext = {}, mustReply = false, silentSignal = false, localReply = false }) {
-  const toolSchemas = getToolSchemas(tools)
+export async function callLLM({ systemPrompt, message, messages: inputMessages = null, temperature = 0.5, topP = 0.9, tools = [], maxTokens, thinking = true, signal, onToolCall, onToolExecute, onStream, onRetry, toolContext = {}, mustReply = false, silentSignal = false, localReply = false, _streamOnceForTest = null }) {
+  const strictEvaluation = toolContext?.strictEvaluation || null
+  const toolPromptHints = toolContext?.toolPromptHints || null
+  const toolSchemas = getToolSchemas(filterStrictEvaluationTools(tools, strictEvaluation), { toolPromptHints })
 
   // 本地渠道（语音 / TUI）下纯文本即回复：模型直接产出 text 就算回复，runtime 协议兜底会替它
   // 真正投递（含语音 TTS）。社交渠道（微信/Discord/飞书/企微）必须显式 send_message 才能送达外部平台。
@@ -789,6 +870,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
   let lastToolResult = null
   let sawToolCall = false
   let sentMessage = false
+  let toolDeliveredFinalReply = false
   // delivered 语义：本次 callLLM 调用中是否**真正投递过**至少一条回复给用户。
   //   = 「≥1 次未被 silent / closer 拦截、且未熔断的 send_message 执行过」。
   //   这是"用户到底有没有收到实质回复"的**单一权威信号**，调用方不准再从 toolCallLog 二次推导。
@@ -796,15 +878,10 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
   //   delivered 是"整轮有没有发出去过"（用于决定要不要兜底）。closer 被拦时主回复通常已把 delivered 置 true。
   let delivered = false
   let finalNudgeUsed = false
-  let missingToolNudgeUsed = false
   let plainTextReplyNudgeUsed = false
-  let fakeToolNudgeUsed = false
   let emptyReplyNudgeUsed = false
-  let falseMemoryNudgeUsed = false
   // 层 3：本 turn 是否已发过"不确定回退"软检查点（一 turn 一次，见 buildUncertaintyCheckpointNudge）。
   let uncertaintyNudgeUsed = false
-  // 跟踪本次 callLLM 调用中实际调过的工具名，用于检测"声称做了 X 但没真的调 X"的 false-claim。
-  const calledTools = new Set()
   const toolLoopState = createToolLoopState()
   // Turn-level send_message 历史：target_id → [{ length, isCloser }]。
   // 用于 closer dedup 安全网：当 LLM 在已经发过实质消息后又试图补一条短客套尾巴
@@ -832,17 +909,30 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
 
     let roundResult
     try {
-      roundResult = await streamOnceWithRetry({
-        messages,
-        toolSchemas,
-        temperature,
-        topP,
-        maxTokens,
-        thinking,
-        signal,
-        onRetry,
-        onStream,  // 所有轮次均流式推送，让 UI 实时反映工具链执行过程中的模型输出
-      })
+      roundResult = _streamOnceForTest
+        ? await _streamOnceForTest({
+            messages,
+            toolSchemas,
+            temperature,
+            topP,
+            maxTokens,
+            thinking,
+            signal,
+            onRetry,
+            onStream,
+            round,
+          })
+        : await streamOnceWithModelFallback({
+            messages,
+            toolSchemas,
+            temperature,
+            topP,
+            maxTokens,
+            thinking,
+            signal,
+            onRetry,
+            onStream,  // 所有轮次均流式推送，让 UI 实时反映工具链执行过程中的模型输出
+          })
     } catch (err) {
       // 只要**前面的轮次已攒到可投递的回复**（典型：社交渠道第一轮已出答案、第二轮包 send_message 时
       // provider 卡死/报错，甚至重试退避期间被 watchdog 掐），就不能让这个错误/中止把已生成的答案一起
@@ -890,15 +980,6 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
 
     // 无工具调用：本轮结束；若工具后空回复，再补一轮明确的最终回复指令。
     if (effectiveToolCalls.length === 0) {
-      if (!sawToolCall && requiresToolForRequest(message) && !missingToolNudgeUsed) {
-        allContent = ''
-        messages.push({
-          role: 'user',
-          content: buildMissingToolNudge(message),
-        })
-        missingToolNudgeUsed = true
-        continue
-      }
       // 用户消息回复但只产出了 plain text，完全没调任何工具（包括 send_message）。
       //
       // 与 finalNudge 的区别：finalNudge 处理"调过工具但最后没补 send_message"（sawToolCall=true），
@@ -916,40 +997,14 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         allContent = ''
         messages.push({
           role: 'user',
-          content: `You produced reply text but did NOT call the send_message tool. Plain assistant text in this runtime is only debug exhaust — it does not reach the user through the normal channel. To actually deliver the reply you must wrap it in a send_message tool call.\n\nYour draft was:\n"""\n${draft.slice(0, 1000)}\n"""\n\nCall send_message now with target_id = the user who sent the previous message and content = the same text (or a tightened version). Do not write more prose this turn — only invoke the tool.`,
+          content: `You produced reply text but did NOT call the send_message tool. Plain assistant text in this runtime is only debug exhaust — it does not reach the user through the normal channel. To actually deliver the reply you must wrap it in a send_message tool call.\n\nYour draft was:\n"""\n${draft.slice(0, 1000)}\n"""\n\nCall send_message now with target_id = the user who sent the previous message and content = the same text (or a tightened version). Do not write more prose this turn — only invoke the tool.${INTERNAL_NUDGE_SUFFIX}`,
         })
         plainTextReplyNudgeUsed = true
         continue
       }
-      // 检测伪工具调用：模型在文字里描述了调用但没有真正发起 function-call
-      if (!fakeToolNudgeUsed && content) {
-        const fakeToolName = detectFakeToolCall(content, tools)
-        if (fakeToolName) {
-          console.log(`[伪调用检测] 模型文字中发现 "${fakeToolName}"，注入修正 nudge`)
-          messages.push({ role: 'assistant', content })
-          messages.push({ role: 'user', content: buildFakeToolCallNudge(fakeToolName, toolSchemas) })
-          allContent = ''
-          fakeToolNudgeUsed = true
-          continue
-        }
-      }
-      // 检测"声称记住了但根本没调 upsert_memory"的 false-claim：用户基于这条承诺做决策，
-      // 但记忆其实没存进数据库——下次问就找不到了。trace 实证过这个 bug（search_memory 后
-      // 直接生成"记住了..."文本，memories_written count=0）。
-      if (!falseMemoryNudgeUsed && content && tools.includes('upsert_memory') && !calledTools.has('upsert_memory')) {
-        const falseMemoryClaim = /(?:记住了|记下了?|已记住|已经记住|我会记着|我记下了|存好了|存下了|已存)/
-        if (falseMemoryClaim.test(content)) {
-          console.log('[假记忆检测] 模型声称记住但未调 upsert_memory，注入修正 nudge')
-          messages.push({ role: 'assistant', content })
-          messages.push({
-            role: 'user',
-            content: 'You wrote "记住了" (or a similar memory-claim) but you did NOT actually call upsert_memory. That claim is false — the fact is not in the database, and the user will not see it next time. Call upsert_memory NOW with the fact you said you would remember, then call send_message to confirm to the user.',
-          })
-          allContent = ''
-          falseMemoryNudgeUsed = true
-          continue
-        }
-      }
+      // 注：原"伪工具调用检测""假记忆声称检测""missingToolNudge"三支已全部删除——它们都靠扫
+      // 模型正文或用户输入的关键词来猜动作，必然误伤"列出你的工具""你有几个执行命令的工具"这类
+      // 正确回答/元问题（详见文件上方 INTERNAL_NUDGE_SUFFIX 前的设计决策注释）。
       // 安全网：工具已结束、最近一次工具不是 send_message、且模型本轮也没继续动作。
       // 不再用 !allContent.trim() 做守卫——跨轮累积的旁白会让这个守卫错误地静默 break，
       // 真正可靠的信号是 sentMessage（line 691 在每个工具后维护）。
@@ -967,7 +1022,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         allContent = ''
         messages.push({
           role: 'user',
-          content: `Tool results have returned, but you have not given the user a final reply yet. Based on the available tool results, ${deliverInstruction}. If information is insufficient, explain what was found, the failure source, and the limitations; do not end silently.${localReply ? '' : ' Do NOT repeat what you just wrote in plain text — wrap your reply in a send_message call.'}`,
+          content: `Tool results have returned, but you have not given the user a final reply yet. Based on the available tool results, ${deliverInstruction}. If information is insufficient, explain what was found, the failure source, and the limitations; do not end silently.${localReply ? '' : ' Do NOT repeat what you just wrote in plain text — wrap your reply in a send_message call.'}${INTERNAL_NUDGE_SUFFIX}`,
         })
         finalNudgeUsed = true
         continue
@@ -975,7 +1030,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       if (mustReply && !sentMessage && !allContent.trim() && !emptyReplyNudgeUsed) {
         messages.push({
           role: 'user',
-          content: `You ended this user-message turn without producing any reply. You must now ${deliverInstruction}, with a brief, useful response. If no tools are needed, answer directly. Do not end silently.`,
+          content: `You ended this user-message turn without producing any reply. You must now ${deliverInstruction}, with a brief, useful response. If no tools are needed, answer directly. Do not end silently.${INTERNAL_NUDGE_SUFFIX}`,
         })
         emptyReplyNudgeUsed = true
         continue
@@ -1011,6 +1066,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       let closerSuppressed = false
       let silentSignalSuppressed = false
       let mediaCloserSuppressed = false
+      let strictSuppressed = false
       if (stopReason) {
         result = makeToolLoopStoppedResult(tc.name, stopReason)
         console.log(`[工具熔断] ${tc.name}: ${stopReason}`)
@@ -1018,6 +1074,11 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         // （比如换 read_file 查日志、search_memory 找历史经验）。同指纹反复失败仍由 sameFailureCounts
         // 拦截，跨工具死循环仍由 recentFingerprints 的 unique threshold 拦截——安全网未失效。
         toolLoopState.consecutiveFailures = 0
+      } else if (isToolForbiddenInStrictEvaluation(strictEvaluation, tc.name)) {
+        strictSuppressed = true
+        result = makeStrictForbiddenToolResult(tc.name, strictEvaluation)
+        recordToolLoopOutcome(toolLoopState, tc.name, fingerprint, result)
+        console.log(`[strict evaluation] 拦截 forbidden tool ${tc.name}`)
       } else {
         // Silent system signal 拦截：本轮是 silent APP_SIGNAL（如 confirm_security_change /
         //   cancel_security_change / app:saveState 等），系统只是在悄悄 refresh agent 上下文，
@@ -1112,13 +1173,22 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
           // 真正开始执行前通知 UI —— 让用户知道当前停留在哪一步的工具上
           onToolExecute?.(tc.name, normalizedArgs)
           result = await executeTool(tc.name, normalizedArgs, { ...toolContext, signal })
+          let deliveredByToolResult = false
+          try {
+            const parsedResult = JSON.parse(String(result || '{}'))
+            deliveredByToolResult = parsedResult?.delivered === true && parsedResult?.message_sent === true
+          } catch {}
           recordToolLoopOutcome(toolLoopState, tc.name, fingerprint, result)
           // 单一权威：一次未被 silent/closer 拦截、未熔断的 send_message 真正执行过 →
           //   用户确实收到了回复。这是 delivered 唯一被置 true 的地方（除文末协议兜底外）。
-          if (tc.name === 'send_message') delivered = true
+          if (tc.name === 'send_message' && !strictSuppressed && !isToolFailure(result)) delivered = true
+          if (deliveredByToolResult && !strictSuppressed) {
+            delivered = true
+            toolDeliveredFinalReply = true
+          }
           // find_tool 动态装载：把搜到的工具 schema 当场注入本轮 toolSchemas（数组原地 push，
           // 下一轮 streamOnceWithRetry 即带上），模型下一步就能直接调用搜出来的工具。
-          if (tc.name === 'find_tool') injectFoundToolSchemas(result, toolSchemas)
+          if (tc.name === 'find_tool') injectFoundToolSchemas(result, toolSchemas, strictEvaluation, toolPromptHints)
         }
       }
       throwIfAborted(signal)
@@ -1128,11 +1198,17 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       // 这样 line ~641 的"沉默退出 nudge"才能在该补刀时正确触发。
       // 被 closer dedup 拦截的 send_message 也算 sentMessage=true（最后一个动作意图是
       // 发消息，主回复已经发过——下一轮注入 "默认结束本轮" nudge 是合适的）。
-      if (tc.name === 'send_message') {
+      let deliveredByToolResultForTurn = false
+      try {
+        const parsedResult = JSON.parse(String(result || '{}'))
+        deliveredByToolResultForTurn = parsedResult?.delivered === true && parsedResult?.message_sent === true
+      } catch {}
+      if ((tc.name === 'send_message' || deliveredByToolResultForTurn) && !strictSuppressed) {
         sentMessage = true
         // 仅对真实发出的（未被 dedup 拦截的）send_message 记录到 turn 历史，避免被拦截的
         // closer / silent signal / media-closer 反过来污染后续判断（已经被拦截的就当没发生）。
-        if (!closerSuppressed && !silentSignalSuppressed && !mediaCloserSuppressed) {
+        if (!closerSuppressed && !silentSignalSuppressed && !mediaCloserSuppressed
+            && (deliveredByToolResultForTurn || (tc.name === 'send_message' && !isToolFailure(result)))) {
           const target = normalizedArgs.target_id
           const content = String(normalizedArgs.content || '')
           if (target) {
@@ -1144,7 +1220,6 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       } else {
         sentMessage = false
       }
-      calledTools.add(tc.name)
       // 标记本 turn 播放过音乐/视频——之后模型补的播放确认短收尾会被静音（见上面 mediaCloser 判定）。
       if (tc.name === 'media_mode') {
         const m = String(normalizedArgs.mode || '')
@@ -1154,7 +1229,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
           mediaPlayedKind = m
         }
       }
-      if (shouldPersistActionLog(tc.name)) {
+      if (!strictSuppressed && shouldPersistActionLog(tc.name)) {
         insertActionLog({
           timestamp: new Date().toISOString(),
           tool: tc.name,
@@ -1222,6 +1297,14 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
       }
     }
     throwIfAborted(signal)
+    if (toolDeliveredFinalReply) {
+      return {
+        content: '',
+        toolResult: lastToolResult,
+        aborted: signal?.aborted ?? false,
+        delivered: true,
+      }
+    }
 
     // 将本轮 assistant 消息（含工具调用）加入对话
     // 若是 XML 解析的工具调用，assistant 消息用文本形式（避免 MiniMax 不支持 tool_calls 格式回放）
@@ -1360,7 +1443,7 @@ export async function callLLM({ systemPrompt, message, messages: inputMessages =
         // 兜底也是"真正执行过的 send_message"：置 delivered，并触发与正常路径同样的
         //   onToolCall 回调（语音渠道自动 TTS、UI tool_call 事件、toolCallLog 登记都在那里）。
         //   __fallback 标记仅给 onToolCall 用于遥测分类；executeTool 收到的是干净的 fbArgs。
-        delivered = true
+        delivered = !isToolFailure(fbResult)
         lastToolResult = { name: 'send_message', args: fbArgs, result: fbResult }
         if (onToolCall) onToolCall('send_message', { ...fbArgs, __fallback: true }, fbResult)
       } catch (err) {

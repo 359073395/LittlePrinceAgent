@@ -2,32 +2,39 @@
 import fs from 'fs'
 import path from 'path'
 import net from 'net'
+import crypto from 'crypto'
+import { fileURLToPath } from 'url'
 import { Readable } from 'stream'
 import { pipeline } from 'stream/promises'
-import { fileURLToPath } from 'url'
 import { WebSocketServer } from 'ws'
+import { handleSceneConnection, setSceneIntentHandler } from './scene/scene-server.js'
+import { sceneStore } from './scene/scene-store.js'
 import { pushMessage } from './queue.js'
 import { getDB, getConfig, setConfig, insertUISignal, upsertMediaHistory, getMediaHistory, updateLastJarvisConversationContent, getRecentRecallAudits, getRecentExtractAudits, getRecallAuditStats, getExtractAuditStats } from './db.js'
-import { emitEvent, addSSEClient, removeSSEClient, addACUIClient, removeACUIClient, removeActiveUICard, emitUICommand, flushStickyEvents, setStickyEvent } from './events.js'
+import { emitEvent, addSSEClient, removeSSEClient, flushStickyEvents, setStickyEvent } from './events.js'
 import { getQuotaStatus } from './quota.js'
 import { isRunning, stopLoop, startLoop } from './control.js'
 import { buildHeartbeatSystemPromptPreview } from './system-prompt-preview.js'
 import { paths } from './paths.js'
-import { config, activate as activateLLM, getActivationStatus, switchModel, setTemperature, getMinimaxKey, setMinimaxKey, getSocialConfig, setSocialConfig, getVoiceConfig, setVoiceConfig, getTTSConfig, setTTSConfig, getTTSCredentials, getProviderSummaries, getSecurity, setSecurity, getEmbeddingConfig, setEmbeddingConfig, EMBEDDING_PROVIDER_PRESETS, getWebSearchConfig, setWebSearchConfig } from './config.js'
-import { streamTTS, TTS_PROVIDERS, TTS_VOICES } from './voice/tts-providers.js'
+import { config, activate as activateLLM, prepareActivation as prepareLLMActivation, commitPreparedActivation, getActivationStatus, switchModel, saveLLMSettings, setTemperature, setThinking, getMinimaxKey, setMinimaxKey, getSocialConfig, setSocialConfig, getVoiceConfig, setVoiceConfig, getTTSConfig, setTTSConfig, getTTSCredentials, getProviderSummaries, getSecurity, setSecurity, getNetworkConfig, setNetworkConfig, getEmbeddingConfig, setEmbeddingConfig, EMBEDDING_PROVIDER_PRESETS, getWebSearchConfig, setWebSearchConfig } from './config.js'
+import { streamTTS, TTS_PROVIDERS, TTS_VOICES, validateTTSConfig } from './voice/tts-providers.js'
 import { restartConnector } from './social/index.js'
 // manager.js (Whisper local server) removed
 import { replaceProvider } from './providers/registry.js'
-import { persistAppState } from './capabilities/executor.js'
-import { execGenerateVideo, saveGeneratedVideo, setAIVideoPanelState, getVideoHistory } from './capabilities/tools/media.js'
+import { execGenerateVideo, saveGeneratedVideo, setAIVideoPanelState, getVideoHistory, stripMarkdownForSpeech } from './capabilities/tools/media.js'
 import { MinimaxProvider } from './providers/minimax.js'
 import { handleSocialWebhook, isSocialWebhookPath } from './social/webhooks.js'
 import { getClawbotQR, logoutClawbot } from './social/wechat-clawbot.js'
+import { getFeishuStatus } from './social/feishu-ws.js'
 import { createCloudASRSession } from './voice/cloud-asr.js'
 import { getHotspots, setHotspotPanelState, getHotspotPanelState } from './hotspots.js'
+import { getWorldcup, setWorldcupPanelState, getWorldcupPanelState } from './worldcup.js'
 import { getPersonCard, setPersonCardPanelState, getPersonCardPanelState } from './person-cards.js'
 import { setDocPanelState, getDocPanelState, DOC_TOPICS } from './docs.js'
 import { getTraces, getTrace, clearTraces, getTraceStatus } from './runtime/turn-trace.js'
+import { getTerminalStreamSnapshot } from './terminal-stream.js'
+import { getSelfEvolutionSnapshot } from './memory/self-evolution.js'
+import { markdownImage, mimeFromChatMediaExt, persistChatMediaDataUrl } from './chat-media.js'
 
 export { emitEvent }
 
@@ -41,27 +48,57 @@ const SYSTEM_PROMPT_PATH = paths.systemPromptHtml
 const ACTIVATION_PATH    = paths.activationHtml
 const TURN_TRACE_PATH    = paths.turnTraceHtml
 const BRAIN_UI_ASSET_ROOT = paths.brainUiAssetRoot
+const SCENE_SHELL_ASSET_ROOT = path.join(paths.resourcesDir, 'src', 'ui', 'scene-shell')
+const TERMINAL_STREAM_PATH = path.join(paths.resourcesDir, 'src', 'ui', 'terminal-stream', 'index.html')
 const D3_VENDOR_PATH     = path.join(paths.resourcesDir, 'node_modules', 'd3', 'dist', 'd3.min.js')
-const INSTALL_SCRIPT_PATH = path.join(paths.resourcesDir, 'scripts', 'install-debian-ubuntu.sh')
-const DOWNLOAD_CACHE_DIR = path.join(paths.dataDir, 'downloads')
 const SANDBOX_PATH       = paths.sandboxDir
+const INSTALL_SCRIPT_PATH = path.join(paths.resourcesDir, 'scripts', 'install-debian-ubuntu.sh')
+const DOWNLOAD_CACHE_DIR = path.join(paths.userDir, 'downloads', 'client-cache')
 const DEFAULT_AGENT_NAME = '小王子'
 const DEFAULT_API_HOST = '127.0.0.1'
+const INBOUND_MESSAGE_DEDUPE_TTL_MS = 10_000
+const INBOUND_MESSAGE_FALLBACK_DEDUPE_MS = 1_500
+const MAX_INBOUND_CHAT_MEDIA = 8
+const recentInboundMessages = new Map()
+
+function pruneRecentInboundMessages(now = Date.now()) {
+  for (const [key, entry] of recentInboundMessages) {
+    if (!entry || now - entry.timestamp > INBOUND_MESSAGE_DEDUPE_TTL_MS) {
+      recentInboundMessages.delete(key)
+    }
+  }
+}
+
+function normalizeClientMessageId(value = '') {
+  const text = String(value || '').trim()
+  return /^[a-zA-Z0-9._:-]{8,128}$/.test(text) ? text : ''
+}
+
+function claimInboundMessage({ fromId, channel, content, clientMessageId }) {
+  const now = Date.now()
+  pruneRecentInboundMessages(now)
+  const explicitId = normalizeClientMessageId(clientMessageId)
+  const key = explicitId
+    ? `id:${explicitId}`
+    : `body:${JSON.stringify([fromId || '', channel || '', content || ''])}`
+  const existing = recentInboundMessages.get(key)
+  const ttl = explicitId ? INBOUND_MESSAGE_DEDUPE_TTL_MS : INBOUND_MESSAGE_FALLBACK_DEDUPE_MS
+  if (existing && now - existing.timestamp <= ttl) return { claimed: false, key }
+  recentInboundMessages.set(key, { timestamp: now })
+  return { claimed: true, key }
+}
 
 // card.action signals that are lifecycle/system-internal — stored in DB for passive injector use only, not pushed to the agent queue
-const SILENT_CARD_ACTIONS = new Set([
-  'card.dismissed',  // card closed (components should use acui:dismiss; this is a fallback guard)
-  'card.mounted',    // mount complete
-  'card.dwell',      // dwell heartbeat
-  'card.error',      // render error (already handled by the card.error type signal)
-])
-
 function getApiHost() {
-  return String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_HOST || globalThis.process?.env?.BAILONGMA_HOST || DEFAULT_API_HOST).trim() || DEFAULT_API_HOST
+  const envHost = String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_HOST || globalThis.process?.env?.BAILONGMA_HOST || '').trim()
+  if (envHost) return envHost
+  return getNetworkConfig().allowLanAccess ? '0.0.0.0' : DEFAULT_API_HOST
 }
 
 function isLanAccessEnabled() {
-  return /^(1|true|yes|on)$/i.test(String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_ALLOW_LAN || globalThis.process?.env?.BAILONGMA_ALLOW_LAN || '').trim())
+  return getNetworkConfig().allowLanAccess
+    || /^(1|true|yes|on)$/i.test(String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_ALLOW_LAN || '').trim())
+    || /^(1|true|yes|on)$/i.test(String(globalThis.process?.env?.BAILONGMA_ALLOW_LAN || '').trim())
 }
 
 function normalizeRemoteAddress(address = '') {
@@ -78,7 +115,7 @@ function isLoopbackAddress(address = '') {
 }
 
 function isLoopbackRequest(req) {
-  return isLoopbackAddress(getClientAddress(req))
+  return isLoopbackAddress(req.socket?.remoteAddress)
 }
 
 function isPrivateLanAddress(address = '') {
@@ -101,7 +138,7 @@ function isPrivateLanAddress(address = '') {
 }
 
 function isLanRequest(req) {
-  return isLanAccessEnabled() && isPrivateLanAddress(getClientAddress(req))
+  return isLanAccessEnabled() && isPrivateLanAddress(req.socket?.remoteAddress)
 }
 
 function isLoopbackOrigin(origin = '') {
@@ -114,19 +151,12 @@ function isLoopbackOrigin(origin = '') {
   }
 }
 
-function isSameHostOrigin(req, origin = '') {
-  if (!origin || origin === 'null') return false
-  try {
-    const parsed = new URL(origin)
-    return parsed.host === req.headers.host
-  } catch {
-    return false
-  }
-}
-
-function isAllowedOrigin(origin = '', req = null) {
+function isAllowedOrigin(origin = '') {
   if (isLoopbackOrigin(origin)) return true
-  if (req && isSameHostOrigin(req, origin)) return true
+  try {
+    const publicUrl = String(process.env.LITTLE_PRINCE_AGENT_PUBLIC_URL || '').trim()
+    if (publicUrl && new URL(origin).origin === new URL(publicUrl).origin) return true
+  } catch {}
   if (!isLanAccessEnabled()) return false
   try {
     const parsed = new URL(origin)
@@ -140,43 +170,16 @@ function getAuthToken() {
   return String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_API_TOKEN || globalThis.process?.env?.BAILONGMA_API_TOKEN || '').trim()
 }
 
-function getClientAddress(req) {
-  if (process.env.LITTLE_PRINCE_AGENT_TRUST_PROXY || process.env.BAILONGMA_TRUST_PROXY) {
-    const forwarded = req.headers['x-forwarded-for']
-    if (forwarded) {
-      const ips = String(forwarded).split(',').map(s => s.trim()).filter(Boolean)
-      if (ips.length > 0) return ips[0]
-    }
-  }
-  return req.socket?.remoteAddress
-}
-
 function getCookie(req, name) {
-  const raw = String(req.headers.cookie || '')
-  const parts = raw.split(';')
-  for (const part of parts) {
-    const index = part.indexOf('=')
-    if (index < 0) continue
-    const key = decodeURIComponent(part.slice(0, index).trim())
-    if (key === name) return decodeURIComponent(part.slice(index + 1).trim())
+  const header = String(req.headers.cookie || '')
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=')
+    if (idx <= 0) continue
+    const key = part.slice(0, idx).trim()
+    if (key !== name) continue
+    try { return decodeURIComponent(part.slice(idx + 1).trim()) } catch { return part.slice(idx + 1).trim() }
   }
   return ''
-}
-
-function setAuthCookieIfQueryToken(req, res, url) {
-  const expected = getAuthToken()
-  const queryToken = url.searchParams.get('token')
-  if (!expected || queryToken !== expected) return
-  const secure = /^(1|true|yes|on)$/i.test(String(globalThis.process?.env?.LITTLE_PRINCE_AGENT_SECURE_COOKIE || '').trim())
-  const cookie = [
-    `lp_agent_token=${encodeURIComponent(queryToken)}`,
-    'Path=/',
-    'HttpOnly',
-    'SameSite=Lax',
-    'Max-Age=2592000',
-    secure ? 'Secure' : '',
-  ].filter(Boolean).join('; ')
-  res.setHeader('Set-Cookie', cookie)
 }
 
 function hasValidAuthToken(req, url) {
@@ -190,7 +193,7 @@ function hasValidAuthToken(req, url) {
 }
 
 function requireLocalOrToken(req, res, url) {
-  if (hasAllowedAccess(req, url)) return true
+  if (isLoopbackRequest(req) || hasValidAuthToken(req, url)) return true
   jsonResponse(res, 403, { ok: false, error: 'forbidden' })
   return false
 }
@@ -201,6 +204,7 @@ function hasAllowedAccess(req, url) {
 
 function isSensitivePath(pathname) {
   return pathname === '/activate'
+    || pathname === '/activate/prepare'
     || pathname === '/settings'
     || pathname.startsWith('/settings/')
     || pathname.startsWith('/admin/')
@@ -219,13 +223,53 @@ function jsonResponse(res, status, body) {
   res.end(JSON.stringify(body))
 }
 
+function getRequestCharset(contentType = '') {
+  const match = String(contentType || '').match(/(?:^|;)\s*charset\s*=\s*"?([^";\s]+)"?/i)
+  return match?.[1]?.trim().toLowerCase() || ''
+}
+
+function decodeRequestBody(buffer, contentType = '') {
+  if (!buffer || buffer.length === 0) return ''
+
+  if (buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF) {
+    return buffer.slice(3).toString('utf8')
+  }
+  if (buffer[0] === 0xFF && buffer[1] === 0xFE) {
+    return buffer.slice(2).toString('utf16le')
+  }
+  if (buffer[0] === 0xFE && buffer[1] === 0xFF) {
+    try { return new TextDecoder('utf-16be').decode(buffer.slice(2)) } catch {}
+  }
+
+  const charset = getRequestCharset(contentType)
+  if (charset === 'utf8' || charset === 'utf-8' || charset === '') {
+    const decoded = buffer.toString('utf8')
+    if (!charset && decoded.includes('\uFFFD')) {
+      try {
+        const fallback = new TextDecoder('gbk', { fatal: true }).decode(buffer)
+        if (fallback && !fallback.includes('\uFFFD')) return fallback
+      } catch {}
+    }
+    return decoded
+  }
+  if (charset === 'utf16le' || charset === 'utf-16le' || charset === 'ucs-2' || charset === 'utf16') {
+    return buffer.toString('utf16le')
+  }
+
+  try {
+    return new TextDecoder(charset, { fatal: true }).decode(buffer)
+  } catch {
+    return buffer.toString('utf8')
+  }
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
     req.on('data', chunk => chunks.push(chunk))
     req.on('end', () => {
       try {
-        const raw = Buffer.concat(chunks).toString('utf-8')
+        const raw = decodeRequestBody(Buffer.concat(chunks), req.headers['content-type'])
         resolve(raw ? JSON.parse(raw) : {})
       } catch (err) {
         reject(err)
@@ -235,8 +279,63 @@ function readJsonBody(req) {
   })
 }
 
+function collectInboundChatMedia(body = {}) {
+  const out = []
+  const push = (item, fallbackAlt = 'image') => {
+    if (!item) return
+    if (typeof item === 'string') {
+      out.push({ dataUrl: item, alt: fallbackAlt })
+      return
+    }
+    if (typeof item !== 'object') return
+    const dataUrl = item.data_url || item.dataUrl || item.url || item.src || item.image
+    if (!dataUrl) return
+    out.push({
+      dataUrl: String(dataUrl),
+      alt: item.alt || item.name || item.filename || fallbackAlt,
+    })
+  }
+
+  if (Array.isArray(body.attachments)) {
+    for (const item of body.attachments) push(item, 'attachment')
+  }
+  if (Array.isArray(body.images)) {
+    for (const item of body.images) push(item, 'image')
+  }
+  push(body.image_data_url || body.imageDataUrl || body.image, 'image')
+  push(body.screenshot_data_url || body.screenshotDataUrl || body.screenshot, 'system screenshot')
+
+  return out
+    .filter(item => /^data:image\//i.test(String(item.dataUrl || '').trim()))
+    .slice(0, MAX_INBOUND_CHAT_MEDIA)
+}
+
+function appendInboundChatMediaMarkdown(content = '', body = {}) {
+  const media = []
+  for (const item of collectInboundChatMedia(body)) {
+    try {
+      const stored = persistChatMediaDataUrl(item.dataUrl)
+      media.push({
+        ...stored,
+        alt: item.alt || 'image',
+        markdown: markdownImage(stored.url, item.alt || 'image'),
+      })
+    } catch (err) {
+      console.warn('[message] inbound chat media ignored:', err?.message || err)
+    }
+  }
+  if (media.length === 0) return { content, media }
+  return {
+    content: `${media.map(item => item.markdown).join('\n')}\n\n${content.trim()}`.trim(),
+    media,
+  }
+}
+
 function contentTypeFor(filePath) {
   switch (path.extname(filePath).toLowerCase()) {
+    case '.html':
+    case '.htm':
+      return 'text/html; charset=utf-8'
     case '.js':
       return 'text/javascript; charset=utf-8'
     case '.css':
@@ -261,37 +360,52 @@ function getAgentName() {
   return (getConfig('agent_name') || '').trim() || DEFAULT_AGENT_NAME
 }
 
-function safeJsonParse(value, fallback) {
-  if (value === null || value === undefined) return fallback
-  try { return JSON.parse(value) } catch { return fallback }
+function validateAgentName(agentName) {
+  const trimmedName = String(agentName || '').trim()
+  if (!trimmedName) return ''
+  if (trimmedName.length > 32) {
+    throw new Error('AI 名字不能超过 32 个字符')
+  }
+  if (!/^[一-龥A-Za-z0-9 _-]+$/.test(trimmedName)) {
+    throw new Error('AI 名字只允许中文、英文字母、数字、空格、下划线、短横线')
+  }
+  return trimmedName
+}
+
+function publicActivationInfo(info) {
+  return {
+    provider: info.provider,
+    model: info.model,
+    models: info.models,
+  }
 }
 
 function getPackageMeta() {
   try {
-    return safeJsonParse(fs.readFileSync(path.join(paths.resourcesDir, 'package.json'), 'utf-8'), {})
+    return JSON.parse(fs.readFileSync(path.join(paths.resourcesDir, 'package.json'), 'utf8'))
   } catch {
     return {}
   }
 }
 
-function getPublicBaseUrl(req = null) {
+function getPublicBaseUrl(req) {
   const configured = String(process.env.LITTLE_PRINCE_AGENT_PUBLIC_URL || '').trim().replace(/\/+$/, '')
   if (configured) return configured
-  if (!req?.headers?.host) return ''
-  const protoHeader = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim()
-  const proto = protoHeader || (req.socket?.encrypted ? 'https' : 'http')
-  return `${proto}://${req.headers.host}`
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http'
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim()
+  return host ? `${proto}://${host}` : ''
 }
 
 function publicUrl(req, pathname) {
   const base = getPublicBaseUrl(req)
-  return base ? new URL(pathname, `${base}/`).toString() : pathname
+  return base ? `${base}${pathname}` : pathname
 }
 
-function getDownloadInfo(req = null) {
+function getDownloadInfo(req) {
   const pkg = getPackageMeta()
-  const owner = process.env.LITTLE_PRINCE_AGENT_GITHUB_OWNER || pkg.build?.publish?.[0]?.owner || '359073395'
-  const repo = process.env.LITTLE_PRINCE_AGENT_GITHUB_REPO || pkg.build?.publish?.[0]?.repo || 'LittlePrinceAgent'
+  const publish = Array.isArray(pkg.build?.publish) ? pkg.build.publish[0] : null
+  const owner = process.env.LITTLE_PRINCE_AGENT_GITHUB_OWNER || publish?.owner || '359073395'
+  const repo = process.env.LITTLE_PRINCE_AGENT_GITHUB_REPO || publish?.repo || 'LittlePrinceAgent'
   const branch = process.env.LITTLE_PRINCE_AGENT_GITHUB_BRANCH || 'main'
   const repoUrl = (process.env.LITTLE_PRINCE_AGENT_REPO_URL || `https://github.com/${owner}/${repo}`).replace(/\.git$/i, '')
   const latestReleaseUrl = process.env.LITTLE_PRINCE_AGENT_RELEASES_URL || `${repoUrl}/releases/latest`
@@ -299,7 +413,7 @@ function getDownloadInfo(req = null) {
   const linuxInstallUrl = process.env.LITTLE_PRINCE_AGENT_LINUX_INSTALL_URL || publicUrl(req, '/downloads/linux-install.sh')
   return {
     ok: true,
-    version: pkg.version || '0.0.0',
+    version: pkg.version || 'unknown',
     repo: { owner, name: repo, branch, url: repoUrl },
     downloads: {
       windows: {
@@ -326,83 +440,85 @@ function getDownloadInfo(req = null) {
 
 function sanitizeFileName(name = '') {
   return String(name || '')
-    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 160) || 'littleprince-agent-setup.exe'
+    .slice(0, 160) || 'LittlePrinceAgent-Setup.exe'
 }
 
-function fileNameFromUrl(url = '', fallback = 'littleprince-agent-setup.exe') {
+function fileNameFromUrl(url = '') {
   try {
     const parsed = new URL(url)
-    const last = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '')
-    return sanitizeFileName(last || fallback)
+    const base = decodeURIComponent(path.basename(parsed.pathname))
+    return sanitizeFileName(base)
   } catch {
-    return fallback
+    return 'LittlePrinceAgent-Setup.exe'
   }
 }
 
-async function resolveWindowsDownloadAsset() {
-  const info = getDownloadInfo()
+async function resolveWindowsDownloadAsset(req) {
   const directUrl = String(process.env.LITTLE_PRINCE_AGENT_WINDOWS_DOWNLOAD_URL || '').trim()
-  if (/\.(exe|msi)(?:[?#].*)?$/i.test(directUrl)) {
-    return { url: directUrl, fileName: fileNameFromUrl(directUrl), source: 'env' }
-  }
+  if (directUrl) return { url: directUrl, fileName: fileNameFromUrl(directUrl) }
 
-  const apiUrl = `https://api.github.com/repos/${info.repo.owner}/${info.repo.name}/releases/latest`
-  const headers = {
-    'Accept': 'application/vnd.github+json',
-    'User-Agent': 'littleprince-agent-download-cache',
-  }
-  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`
-  const response = await fetch(apiUrl, { headers })
-  if (!response.ok) throw new Error(`GitHub release lookup failed: HTTP ${response.status}`)
+  const info = getDownloadInfo(req)
+  const apiUrl = process.env.LITTLE_PRINCE_AGENT_RELEASES_API_URL
+    || `https://api.github.com/repos/${info.repo.owner}/${info.repo.name}/releases/latest`
+  const response = await fetch(apiUrl, {
+    headers: {
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'LittlePrinceAgent-download-cache',
+    },
+  })
+  if (!response.ok) throw new Error(`GitHub Release 查询失败: HTTP ${response.status}`)
   const release = await response.json()
   const assets = Array.isArray(release.assets) ? release.assets : []
-  const asset = assets.find(a => /\.(exe|msi)$/i.test(a.name || '') && /setup|installer|小王子|agent|bailongma/i.test(a.name || ''))
+  const asset = assets.find(a => /\.(exe|msi)$/i.test(a.name || '') && /setup|windows|win|小王子|littleprince|bailongma/i.test(a.name || ''))
     || assets.find(a => /\.(exe|msi)$/i.test(a.name || ''))
-  if (!asset?.browser_download_url) throw new Error('latest GitHub Release has no Windows installer asset')
-  return {
-    url: asset.browser_download_url,
-    fileName: sanitizeFileName(asset.name || fileNameFromUrl(asset.browser_download_url)),
-    source: 'github-release',
-  }
+    || assets.find(a => /\.(zip|7z)$/i.test(a.name || ''))
+  if (!asset?.browser_download_url) throw new Error('GitHub Release 中没有找到 Windows 安装包资产')
+  return { url: asset.browser_download_url, fileName: sanitizeFileName(asset.name || fileNameFromUrl(asset.browser_download_url)) }
 }
 
-async function ensureCachedWindowsInstaller() {
-  fs.mkdirSync(DOWNLOAD_CACHE_DIR, { recursive: true })
-  const asset = await resolveWindowsDownloadAsset()
-  const filePath = path.join(DOWNLOAD_CACHE_DIR, asset.fileName)
-  const metaPath = `${filePath}.json`
-  if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
-    return { ...asset, filePath, cached: true }
-  }
+async function ensureCachedWindowsInstaller(req) {
+  await fs.promises.mkdir(DOWNLOAD_CACHE_DIR, { recursive: true })
+  const asset = await resolveWindowsDownloadAsset(req)
+  const fileName = sanitizeFileName(asset.fileName)
+  const filePath = path.join(DOWNLOAD_CACHE_DIR, fileName)
+  const metaPath = path.join(DOWNLOAD_CACHE_DIR, 'windows.json')
+
+  try {
+    const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'))
+    const stat = await fs.promises.stat(meta.filePath)
+    if (meta.url === asset.url && stat.isFile() && stat.size > 0) {
+      return { filePath: meta.filePath, fileName: meta.fileName || fileName, size: stat.size, url: asset.url }
+    }
+  } catch {}
 
   const tmpPath = `${filePath}.download`
-  const response = await fetch(asset.url, {
-    headers: { 'User-Agent': 'littleprince-agent-download-cache' },
-    redirect: 'follow',
-  })
-  if (!response.ok || !response.body) throw new Error(`installer download failed: HTTP ${response.status}`)
+  const response = await fetch(asset.url, { headers: { 'User-Agent': 'LittlePrinceAgent-download-cache' } })
+  if (!response.ok || !response.body) throw new Error(`Windows 安装包下载失败: HTTP ${response.status}`)
   await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(tmpPath))
-  fs.renameSync(tmpPath, filePath)
-  fs.writeFileSync(metaPath, JSON.stringify({
-    ...asset,
-    cachedAt: new Date().toISOString(),
-    size: fs.statSync(filePath).size,
-  }, null, 2), 'utf-8')
-  return { ...asset, filePath, cached: false }
+  const stat = await fs.promises.stat(tmpPath)
+  if (!stat.size) throw new Error('Windows 安装包下载为空')
+  await fs.promises.rename(tmpPath, filePath)
+  await fs.promises.writeFile(metaPath, JSON.stringify({ url: asset.url, fileName, filePath, size: stat.size, cachedAt: new Date().toISOString() }, null, 2))
+  return { filePath, fileName, size: stat.size, url: asset.url }
 }
 
-function serveLocalDownload(res, filePath, downloadName, contentType) {
+function serveLocalDownload(res, filePath, fileName, contentType = 'application/octet-stream') {
   const stat = fs.statSync(filePath)
   res.writeHead(200, {
     'Content-Type': contentType,
     'Content-Length': stat.size,
-    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
-    'Cache-Control': 'no-cache',
+    'Content-Disposition': `attachment; filename="${encodeURIComponent(fileName)}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+    'Cache-Control': 'private, max-age=300',
   })
   fs.createReadStream(filePath).pipe(res)
+}
+
+function safeJsonParse(value, fallback) {
+  if (value === null || value === undefined) return fallback
+  try { return JSON.parse(value) } catch { return fallback }
 }
 
 function stripAssistantHistoryLabels(content) {
@@ -415,6 +531,28 @@ function stripAssistantHistoryLabels(content) {
 export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = null } = {}) {
   const onActivatedCallback = onActivated
   const host = getApiHost()
+  let pendingActivation = null
+
+  function storePreparedActivation({ apiKey, info }) {
+    pendingActivation = {
+      token: crypto.randomUUID(),
+      apiKey: String(apiKey || '').trim(),
+      info,
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    }
+    return pendingActivation
+  }
+
+  function getPreparedActivation(token, apiKey) {
+    if (!pendingActivation) return null
+    if (pendingActivation.expiresAt <= Date.now()) {
+      pendingActivation = null
+      return null
+    }
+    if (!token || pendingActivation.token !== token) return null
+    if (pendingActivation.apiKey !== String(apiKey || '').trim()) return null
+    return pendingActivation
+  }
 
   // 启动时把 DB 里的当前 agent_name 写进 sticky，
   // 这样后续每个新连上的 SSE 客户端（含 brain-ui 首次加载）能立即拿到正确名字
@@ -426,12 +564,64 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     const base = `http://localhost:${port}`
     const url = new URL(req.url, base)
     const origin = req.headers.origin
-    setAuthCookieIfQueryToken(req, res, url)
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': origin && isAllowedOrigin(origin) ? origin : '*',
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Credentials': 'true',
+      })
+      return res.end()
+    }
+
+    const tokenFromQuery = url.searchParams.get('token')
+    if (tokenFromQuery && tokenFromQuery === getAuthToken()) {
+      const secure = /^(1|true|yes|on)$/i.test(String(process.env.LITTLE_PRINCE_AGENT_SECURE_COOKIE || '').trim())
+      res.setHeader('Set-Cookie', `lp_agent_token=${encodeURIComponent(tokenFromQuery)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secure ? '; Secure' : ''}`)
+    }
+
+    // Public download metadata and relay endpoints. These stay public so a
+    // fresh server can distribute clients before the user has activated the app.
+    if (req.method === 'GET' && url.pathname === '/downloads') {
+      return jsonResponse(res, 200, getDownloadInfo(req))
+    }
+
+    if (req.method === 'GET' && url.pathname === '/downloads/linux-install.sh') {
+      if (!fs.existsSync(INSTALL_SCRIPT_PATH)) {
+        return jsonResponse(res, 404, { ok: false, error: 'install script not found' })
+      }
+      const content = fs.readFileSync(INSTALL_SCRIPT_PATH)
+      res.writeHead(200, {
+        'Content-Type': 'text/x-shellscript; charset=utf-8',
+        'Content-Length': content.length,
+        'Content-Disposition': 'attachment; filename="install-littleprince-agent.sh"',
+        'Cache-Control': 'no-cache',
+      })
+      return res.end(content)
+    }
+
+    if (req.method === 'GET' && url.pathname === '/downloads/windows') {
+      try {
+        const cached = await ensureCachedWindowsInstaller(req)
+        return serveLocalDownload(res, cached.filePath, cached.fileName)
+      } catch (err) {
+        console.warn('[downloads] Windows installer relay failed:', err?.message || err)
+        return jsonResponse(res, 502, { ok: false, error: err?.message || String(err) })
+      }
+    }
 
     // GET /social/wechat-clawbot/qr — get current QR code status and URL
     if (req.method === 'GET' && url.pathname === '/social/wechat-clawbot/qr') {
       if (!hasAllowedAccess(req, url)) return jsonResponse(res, 403, { ok: false, error: 'forbidden' })
       return jsonResponse(res, 200, { ok: true, ...getClawbotQR() })
+    }
+
+    // GET /social/feishu/status — 飞书长连接当前状态 + 是否已配置凭据（配置弹窗用）
+    if (req.method === 'GET' && url.pathname === '/social/feishu/status') {
+      if (!hasAllowedAccess(req, url)) return jsonResponse(res, 403, { ok: false, error: 'forbidden' })
+      const configured = !!(process.env.FEISHU_APP_ID && process.env.FEISHU_APP_SECRET)
+      return jsonResponse(res, 200, { ok: true, status: getFeishuStatus(), configured })
     }
 
     // POST /social/wechat-clawbot/logout — clear credentials and disconnect
@@ -446,41 +636,15 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return handleSocialWebhook(req, res, url)
     }
 
-    if (origin && !isAllowedOrigin(origin, req)) {
+    if (origin && !isAllowedOrigin(origin)) {
       return jsonResponse(res, 403, { ok: false, error: 'forbidden origin' })
-    }
-
-    // Public client downloads. These do not expose user data and must work for
-    // curl/download clients that do not have the web auth cookie yet.
-    if (req.method === 'GET' && url.pathname === '/downloads') {
-      jsonResponse(res, 200, getDownloadInfo(req))
-      return
-    }
-
-    if (req.method === 'GET' && url.pathname === '/downloads/windows') {
-      try {
-        const asset = await ensureCachedWindowsInstaller()
-        serveLocalDownload(res, asset.filePath, asset.fileName, 'application/vnd.microsoft.portable-executable')
-      } catch (err) {
-        jsonResponse(res, 502, { ok: false, error: err.message })
-      }
-      return
-    }
-
-    if (req.method === 'GET' && url.pathname === '/downloads/linux-install.sh') {
-      try {
-        serveLocalDownload(res, INSTALL_SCRIPT_PATH, 'install-debian-ubuntu.sh', 'text/x-shellscript; charset=utf-8')
-      } catch (err) {
-        jsonResponse(res, 404, { ok: false, error: err.message })
-      }
-      return
     }
 
     if (!hasAllowedAccess(req, url)) {
       return jsonResponse(res, 403, { ok: false, error: 'forbidden' })
     }
 
-    if (isAllowedOrigin(origin, req)) {
+    if (isAllowedOrigin(origin)) {
       res.setHeader('Access-Control-Allow-Origin', origin || 'null')
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
@@ -496,21 +660,34 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
 
     // POST /message — send message to agent
     if (req.method === 'POST' && url.pathname === '/message') {
-      const chunks = []
-      req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
-        try {
-          const body = Buffer.concat(chunks).toString('utf-8')
-          const { from_id = 'ID:000001', content, channel = 'API' } = JSON.parse(body)
-          if (!content?.trim()) return jsonResponse(res, 400, { error: 'content required' })
-          const trimmed = content.trim()
-          pushMessage(from_id, trimmed, channel)
-          emitEvent('message_in', { from_id, content: trimmed, channel, timestamp: new Date().toISOString() })
-          jsonResponse(res, 200, { ok: true, agent_name: getAgentName() })
-        } catch (e) {
-          jsonResponse(res, 400, { error: e.message })
+      let claim = null
+      try {
+        const body = await readJsonBody(req)
+        const { from_id = 'ID:000001', content = '', channel = 'API' } = body
+        const trimmed = String(content || '').trim()
+        const enhanced = appendInboundChatMediaMarkdown(trimmed, body)
+        const queuedContent = enhanced.content
+        if (!queuedContent.trim()) return jsonResponse(res, 400, { error: 'content or image required' })
+        const clientMessageId = body.client_message_id ?? body.clientMessageId ?? ''
+        claim = claimInboundMessage({ fromId: from_id, channel, content: queuedContent, clientMessageId })
+        if (!claim.claimed) {
+          return jsonResponse(res, 200, { ok: true, duplicate: true, agent_name: getAgentName() })
         }
-      })
+        const strictEvaluation = body.strict_evaluation ?? body.strictEvaluation
+          ?? (String(body.evaluation_mode || body.evaluationMode || '').toLowerCase() === 'strict' ? true : undefined)
+        const forbiddenTools = body.forbidden_tools ?? body.forbiddenTools
+        const meta = {}
+        if (strictEvaluation !== undefined) meta.strictEvaluation = strictEvaluation
+        if (Array.isArray(forbiddenTools)) meta.forbiddenTools = forbiddenTools
+        if (enhanced.media.length) meta.attachments = enhanced.media
+        const queued = pushMessage(from_id, queuedContent, channel, meta)
+        const conversationId = queued?.conversationId || 0
+        emitEvent('message_in', { from_id, content: queuedContent, channel, timestamp: new Date().toISOString(), conversation_id: conversationId, attachments: enhanced.media })
+        jsonResponse(res, 200, { ok: true, agent_name: getAgentName(), conversation_id: conversationId, attachments: enhanced.media })
+      } catch (e) {
+        if (claim?.claimed && claim.key) recentInboundMessages.delete(claim.key)
+        jsonResponse(res, 400, { error: e.message })
+      }
       return
     }
 
@@ -531,6 +708,12 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         clearInterval(keepAlive)
         removeSSEClient(res)
       })
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/terminal-stream/history') {
+      const streamId = url.searchParams.get('stream_id') || 'default'
+      jsonResponse(res, 200, getTerminalStreamSnapshot(streamId))
       return
     }
 
@@ -667,7 +850,19 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     if (req.method === 'GET' && url.pathname === '/status') {
       const db = getDB()
       const { n } = db.prepare('SELECT COUNT(*) as n FROM memories').get()
-      jsonResponse(res, 200, { ok: true, memory_count: n, running: isRunning() })
+      jsonResponse(res, 200, {
+        ok: true,
+        memory_count: n,
+        running: isRunning(),
+        self_evolution: getSelfEvolutionSnapshot({ maxRecent: 5 }),
+      })
+      return
+    }
+
+    // GET /self-evolution — recent memory-backed behavior improvements
+    if (req.method === 'GET' && (url.pathname === '/self-evolution' || url.pathname === '/memory/self-evolution')) {
+      const limit = Math.max(1, Math.min(parseInt(url.searchParams.get('limit') || '20'), 24))
+      jsonResponse(res, 200, { ok: true, ...getSelfEvolutionSnapshot({ maxRecent: limit }) })
       return
     }
 
@@ -705,6 +900,41 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
               ? body.active
               : /^(1|true|yes|open|show)$/i.test(String(body.active || ''))
             const state = setHotspotPanelState({ active, source: body.source || 'brain-ui' })
+            jsonResponse(res, 200, { ok: true, state })
+          })
+          .catch((err) => jsonResponse(res, 400, { ok: false, error: err.message }))
+        return
+      }
+    }
+
+    // GET /worldcup — World Cup schedule/scores/standings (zhibo8, live-aware cache)
+    if (req.method === 'GET' && url.pathname === '/worldcup') {
+      getWorldcup({
+        force: /^(1|true|yes)$/i.test(url.searchParams.get('refresh') || ''),
+        viewed: /^(1|true|yes)$/i.test(url.searchParams.get('viewed') || ''),
+      })
+        .then((worldcup) => jsonResponse(res, 200, worldcup))
+        .catch((err) => jsonResponse(res, 502, {
+          ok: false,
+          error: err.message,
+          matches: [],
+          standings: {},
+        }))
+      return
+    }
+
+    if (url.pathname === '/worldcup-state') {
+      if (req.method === 'GET') {
+        jsonResponse(res, 200, { ok: true, state: getWorldcupPanelState() })
+        return
+      }
+      if (req.method === 'POST') {
+        readJsonBody(req)
+          .then((body) => {
+            const active = typeof body.active === 'boolean'
+              ? body.active
+              : /^(1|true|yes|open|show)$/i.test(String(body.active || ''))
+            const state = setWorldcupPanelState({ active, source: body.source || 'brain-ui' })
             jsonResponse(res, 200, { ok: true, state })
           })
           .catch((err) => jsonResponse(res, 400, { ok: false, error: err.message }))
@@ -1038,6 +1268,35 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return
     }
 
+    // GET /media/chat/:filename — serve content-addressed chat media from data/media
+    //   收发消息时把图片/媒体按 sha256 落到 paths.mediaDir，这里按文件名回读。
+    //   文件名即 <sha256>.<ext>，basename 已去掉任何路径分隔；再做一次目录逃逸校验兜底。
+    if (req.method === 'GET' && url.pathname.startsWith('/media/chat/')) {
+      const raw = url.pathname.slice('/media/chat/'.length)
+      const filename = path.basename(decodeURIComponent(raw))
+      const mediaDir = paths.mediaDir
+      const filePath = path.join(mediaDir, filename)
+      const resolvedFile = path.resolve(filePath)
+      const resolvedDir  = path.resolve(mediaDir)
+      if (!resolvedFile.startsWith(resolvedDir + path.sep)) {
+        res.writeHead(403); res.end('forbidden'); return
+      }
+      const contentType = mimeFromChatMediaExt(path.extname(filename).toLowerCase())
+      try {
+        const stat = fs.statSync(filePath)
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Content-Length': stat.size,
+          // 内容寻址：同名文件内容永不改变，可长缓存。
+          'Cache-Control': 'public, max-age=31536000, immutable',
+        })
+        fs.createReadStream(filePath).pipe(res)
+      } catch {
+        res.writeHead(404); res.end('media not found')
+      }
+      return
+    }
+
     // GET /audio/:filename — serve sandbox audio files
     if (req.method === 'GET' && url.pathname.startsWith('/audio/')) {
       const filename = path.basename(url.pathname)
@@ -1063,6 +1322,30 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return
     }
 
+    // POST /activate/prepare — validate and cache activation without entering the app
+    if (req.method === 'POST' && url.pathname === '/activate/prepare') {
+      const chunks = []
+      req.on('data', chunk => chunks.push(chunk))
+      req.on('end', async () => {
+        try {
+          const body = Buffer.concat(chunks).toString('utf-8')
+          const { apiKey, model, provider, baseURL } = JSON.parse(body || '{}')
+          const info = await prepareLLMActivation({ provider, apiKey, model, baseURL })
+          const pending = storePreparedActivation({ apiKey, info })
+          jsonResponse(res, 200, {
+            ok: true,
+            token: pending.token,
+            ...publicActivationInfo(info),
+            agent_name: getAgentName(),
+            expiresAt: pending.expiresAt,
+          })
+        } catch (err) {
+          jsonResponse(res, 400, { ok: false, error: err.message })
+        }
+      })
+      return
+    }
+
     // POST /activate — submit API key to complete activation
     if (req.method === 'POST' && url.pathname === '/activate') {
       const chunks = []
@@ -1070,19 +1353,15 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       req.on('end', async () => {
         try {
           const body = Buffer.concat(chunks).toString('utf-8')
-          const { apiKey, model, provider, baseURL, agentName } = JSON.parse(body || '{}')
+          const { apiKey, model, provider, baseURL, agentName, preparedToken } = JSON.parse(body || '{}')
 
-          const trimmedName = String(agentName || '').trim()
-          if (trimmedName) {
-            if (trimmedName.length > 32) {
-              return jsonResponse(res, 400, { ok: false, error: 'AI 名字不能超过 32 个字符' })
-            }
-            if (!/^[一-龥A-Za-z0-9 _-]+$/.test(trimmedName)) {
-              return jsonResponse(res, 400, { ok: false, error: 'AI 名字只允许中文、英文字母、数字、空格、下划线、短横线' })
-            }
-          }
+          const trimmedName = validateAgentName(agentName)
 
-          const info = await activateLLM({ provider, apiKey, model, baseURL })
+          const prepared = getPreparedActivation(preparedToken, apiKey)
+          const info = prepared
+            ? commitPreparedActivation(prepared.info)
+            : await activateLLM({ provider, apiKey, model, baseURL })
+          if (prepared) pendingActivation = null
 
           if (trimmedName) {
             try {
@@ -1112,6 +1391,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       const status = getActivationStatus()
       const minimaxKey = getMinimaxKey()
       jsonResponse(res, 200, {
+        agent_name: getAgentName(),
         llm: {
           activated: status.activated,
           provider: status.provider,
@@ -1119,11 +1399,34 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
           baseURL: status.baseURL,
           models: status.models,
           temperature: config.temperature,
+          thinking: config.thinking === true,
+          apiKey: config.apiKey || '',
         },
         providers: getProviderSummaries(),
         minimax: {
           configured: !!(globalThis.process?.env?.MINIMAX_API_KEY || minimaxKey),
         },
+        network: getNetworkConfig(),
+      })
+      return
+    }
+
+    // POST /settings/agent-name — update the persisted display name
+    if (req.method === 'POST' && url.pathname === '/settings/agent-name') {
+      const chunks = []
+      req.on('data', chunk => chunks.push(chunk))
+      req.on('end', () => {
+        try {
+          const { agentName, agent_name } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+          const trimmedName = validateAgentName(agentName ?? agent_name)
+          if (trimmedName) setConfig('agent_name', trimmedName)
+          const name = getAgentName()
+          setStickyEvent('agent_name_updated', { name })
+          emitEvent('agent_name_updated', { name })
+          jsonResponse(res, 200, { ok: true, agent_name: name })
+        } catch (err) {
+          jsonResponse(res, 400, { ok: false, error: err.message })
+        }
       })
       return
     }
@@ -1132,10 +1435,12 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     if (req.method === 'POST' && url.pathname === '/settings/model') {
       const chunks = []
       req.on('data', chunk => chunks.push(chunk))
-      req.on('end', () => {
+      req.on('end', async () => {
         try {
-          const { model } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
-          const result = switchModel(model)
+          const { provider, apiKey, model, baseURL } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+          const result = provider || apiKey || baseURL
+            ? await saveLLMSettings({ provider, apiKey, model, baseURL })
+            : switchModel(model)
           emitEvent('model_switched', result)
           jsonResponse(res, 200, { ok: true, ...result })
         } catch (err) {
@@ -1161,10 +1466,26 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return
     }
 
+    // POST /settings/thinking — toggle the model's thinking (reasoning) mode
+    if (req.method === 'POST' && url.pathname === '/settings/thinking') {
+      const chunks = []
+      req.on('data', chunk => chunks.push(chunk))
+      req.on('end', () => {
+        try {
+          const { thinking } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+          const result = setThinking(thinking)
+          jsonResponse(res, 200, { ok: true, ...result })
+        } catch (err) {
+          jsonResponse(res, 400, { ok: false, error: err.message })
+        }
+      })
+      return
+    }
+
     // GET /settings/security — read security sandbox configuration
     if (req.method === 'GET' && url.pathname === '/settings/security') {
       if (!hasAllowedAccess(req, url)) return jsonResponse(res, 403, { ok: false, error: 'forbidden' })
-      jsonResponse(res, 200, { ok: true, security: getSecurity() })
+      jsonResponse(res, 200, { ok: true, security: getSecurity(), network: getNetworkConfig() })
       return
     }
 
@@ -1177,7 +1498,10 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         try {
           const updates = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
           const result = setSecurity(updates)
-          jsonResponse(res, 200, { ok: true, security: result })
+          const network = Object.prototype.hasOwnProperty.call(updates, 'allowLanAccess')
+            ? setNetworkConfig({ allowLanAccess: !!updates.allowLanAccess })
+            : getNetworkConfig()
+          jsonResponse(res, 200, { ok: true, security: result, network })
         } catch (err) {
           jsonResponse(res, 400, { ok: false, error: err.message })
         }
@@ -1198,6 +1522,15 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       req.on('end', async () => {
         try {
           const updates = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+          // 飞书凭据是否「真的变了」——必须在 setSocialConfig 覆盖 env 之前快照旧值。
+          // 用户在弹窗里反复点「连接」会用相同凭据多次 POST；飞书长连接是 cluster 模式，
+          // 每次重启都 close 旧连接再开新连接，连发会抖、入站消息可能投到正被顶掉的连接上。
+          // 因此飞书只在凭据确实变化时才重启（与 discord 的 truthy 重启分开处理）。
+          const feishuTouched = ('FEISHU_APP_ID' in updates) || ('FEISHU_APP_SECRET' in updates)
+          const feishuChanged = feishuTouched && (
+            (updates.FEISHU_APP_ID || '') !== (process.env.FEISHU_APP_ID || '') ||
+            (updates.FEISHU_APP_SECRET || '') !== (process.env.FEISHU_APP_SECRET || '')
+          )
           setSocialConfig(updates)
           // Restart the connector for each platform whose key was updated
           const PLATFORM_KEYS = {
@@ -1210,10 +1543,23 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
               )
             }
           }
+          // 飞书：仅在凭据变化且配齐时重启（去抖，见上方快照）。断开走下方 _feishu_disconnect。
+          if (feishuChanged && process.env.FEISHU_APP_ID && process.env.FEISHU_APP_SECRET) {
+            restartConnector('feishu', { pushMessage, emitEvent }).catch(err =>
+              console.warn('[social] restart feishu failed:', err.message)
+            )
+          }
           // Restart the ClawBot connector when the user clicks "Connect WeChat"
           if (updates._clawbot_connect) {
             restartConnector('wechat-clawbot', { pushMessage, emitEvent }).catch(err =>
               console.warn('[social] restart wechat-clawbot failed:', err.message)
+            )
+          }
+          // 断开飞书：清空凭据是 falsy，不会命中上面 PLATFORM_KEYS 的 truthy 重启，
+          // 需显式重启 —— 新连接器读不到凭据即返回 null，状态归 idle、旧长连接被 close。
+          if (updates._feishu_disconnect) {
+            restartConnector('feishu', { pushMessage, emitEvent }).catch(err =>
+              console.warn('[social] restart feishu failed:', err.message)
             )
           }
           jsonResponse(res, 200, { ok: true, social: getSocialConfig() })
@@ -1330,6 +1676,18 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       return
     }
 
+    if (req.method === 'GET' && (url.pathname === '/terminal-stream' || url.pathname === '/terminal-stream.html')) {
+      try {
+        const html = fs.readFileSync(TERMINAL_STREAM_PATH, 'utf-8')
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(html)
+      } catch {
+        res.writeHead(404)
+        res.end('terminal-stream.html not found')
+      }
+      return
+    }
+
     if (req.method === 'GET' && url.pathname === '/systemPrompt.html') {
       try {
         const html = fs.readFileSync(SYSTEM_PROMPT_PATH, 'utf-8')
@@ -1354,6 +1712,38 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       } catch {
         res.writeHead(404)
         res.end('d3.min.js not found')
+      }
+      return
+    }
+
+    // Scene 架构 shell 的静态资源(新 Agent-UI,与 brain-ui 并行)
+    if (req.method === 'GET' && url.pathname.startsWith('/src/ui/scene-shell/')) {
+      const relativePath = decodeURIComponent(url.pathname.slice('/src/ui/scene-shell/'.length))
+      const assetRoot = path.resolve(SCENE_SHELL_ASSET_ROOT)
+      const assetPath = path.resolve(SCENE_SHELL_ASSET_ROOT, relativePath)
+
+      if (!isPathInside(assetRoot, assetPath)) {
+        res.writeHead(403)
+        res.end('forbidden')
+        return
+      }
+
+      try {
+        const stat = fs.statSync(assetPath)
+        if (!stat.isFile()) {
+          res.writeHead(404)
+          res.end('asset not found')
+          return
+        }
+        res.writeHead(200, {
+          'Content-Type': contentTypeFor(assetPath),
+          'Content-Length': stat.size,
+          'Cache-Control': 'no-cache',
+        })
+        fs.createReadStream(assetPath).pipe(res)
+      } catch {
+        res.writeHead(404)
+        res.end('asset not found')
       }
       return
     }
@@ -1542,6 +1932,15 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
           const { clearEmbeddingCache } = await import('./embedding.js')
           clearEmbeddingCache()
         } catch {}
+        // 切到 local：后台 fire-and-forget 预热（含首次模型下载），不阻塞响应
+        try {
+          const { getEmbeddingCredentials } = await import('./config.js')
+          const cred = getEmbeddingCredentials()
+          if (cred?.provider === 'local' && cred.model) {
+            const { warmupLocalEmbedding } = await import('./embedding-local.js')
+            warmupLocalEmbedding(cred.model).catch(() => {})
+          }
+        } catch {}
         jsonResponse(res, 200, { ok: true, embedding: getEmbeddingConfig() })
       } catch (err) {
         jsonResponse(res, 400, { ok: false, error: err.message })
@@ -1597,9 +1996,17 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
           jsonResponse(res, 200, { ok: true, started: false, reason: 'already running', status: beforeStatus })
           return
         }
+        // force=true：全量重算（切换嵌入模型后刷新维度）；否则只补 embedding IS NULL
+        let force = false
+        try {
+          const chunks = []
+          for await (const chunk of req) chunks.push(chunk)
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
+          force = !!body.force
+        } catch {}
         // fire-and-forget：不 await，立即响应
-        runBackfill({ batchSize: 20, throttleMs: 200 }).catch(() => {})
-        jsonResponse(res, 200, { ok: true, started: true, status: getBackfillStatus() })
+        runBackfill({ batchSize: 20, throttleMs: 200, force }).catch(() => {})
+        jsonResponse(res, 200, { ok: true, started: true, force, status: getBackfillStatus() })
       } catch (err) {
         jsonResponse(res, 500, { ok: false, error: err.message })
       }
@@ -1625,9 +2032,13 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
       req.on('end', async () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}')
-          const { text } = body
-          if (!text?.trim()) { jsonResponse(res, 400, { ok: false, error: 'Missing text parameter' }); return }
+          // 统一在合成入口剥 markdown：模型回复带 **加粗** 等记号时，TTS 会把星号念成"星星"
+          const text = stripMarkdownForSpeech(body.text)
+          if (!text) { jsonResponse(res, 400, { ok: false, error: 'Missing text parameter' }); return }
           const creds = getTTSCredentials()
+          // 合成前预检：服务商未选/凭证未配齐时给出可执行引导，而非冲到 streamTTS 才裸抛
+          const check = validateTTSConfig(creds)
+          if (!check.ok) { jsonResponse(res, 400, { ok: false, error: check.guide, needsConfig: true, provider: check.provider }); return }
           const audioStream = await streamTTS({
             text: text.slice(0, 800),
             provider: creds.provider,
@@ -1762,81 +2173,54 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     ws.on('error', () => { session?.close(); session = null })
   })
 
-  // ACUI WebSocket channel: bidirectional control + perception
-  const acuiWss = new WebSocketServer({ noServer: true })
-  acuiWss.on('connection', (ws) => {
-    addACUIClient(ws)
-    try { ws.send(JSON.stringify({ v: 1, kind: 'acui:hello' })) } catch {}
+  // ---- Scene 协议(声明式 Agent-UI 架构,WS /scene)----
+  const sceneWss = new WebSocketServer({ noServer: true })
+  sceneWss.on('connection', (ws) => handleSceneConnection(ws))
 
-    ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString())
-        if (msg?.kind === 'ui.signal') {
-          const id = insertUISignal({
-            type: msg.type,
-            target: msg.target || null,
-            payload: msg.payload || {},
-            ts: msg.ts || Date.now(),
-          })
-          emitEvent('ui_signal', { id, type: msg.type, target: msg.target, payload: msg.payload })
-          // card.dismissed: remove from server-side active card table
-          if (msg.type === 'card.dismissed') {
-            removeActiveUICard(msg.target)
-          }
-          // Only push to the agent queue on explicit user interaction (card.action).
-          // Lifecycle signals like card.dismissed are already persisted by insertUISignal for passive injector use.
-          if (msg.type === 'card.action') {
-            const appId = msg.target || 'ui'
-            const action = msg.payload?.action || 'unknown'
-            const payload = msg.payload?.payload || msg.payload || {}
-            if (action === 'app:saveState') {
-              // Auto-reported state snapshot from the component: persist directly, do not trigger agent
-              persistAppState(appId, payload)
-            } else if (action === 'confirm_security_change') {
-              // User confirmed a security settings change: apply directly, do not push to agent queue
-              const updates = {}
-              if (payload.file_sandbox !== undefined) updates.fileSandbox = String(payload.file_sandbox) === 'true'
-              if (payload.exec_sandbox !== undefined) updates.execSandbox = String(payload.exec_sandbox) === 'true'
-              const result = Object.keys(updates).length > 0 ? setSecurity(updates) : getSecurity()
-              emitUICommand({ op: 'unmount', id: appId })
-              removeActiveUICard(appId)
-              const desc = Object.entries(updates).map(([k, v]) => `${k}=${v}`).join(', ')
-              pushMessage(
-                'SYSTEM',
-                `[security settings updated] User confirmed changes: ${desc}. changed_at=${result.updatedAt || 'not recorded'}\n(Internal context refresh only. Do NOT call send_message.)`,
-                'APP_SIGNAL',
-                { queue: 'background', persist: false, silent: true },
-              )
-            } else if (action === 'cancel_security_change') {
-              // User cancelled — close the card, do not apply changes
-              emitUICommand({ op: 'unmount', id: appId })
-              removeActiveUICard(appId)
-              pushMessage('SYSTEM', '[security settings change] User cancelled — settings unchanged\n(Internal context refresh only. Do NOT call send_message.)', 'APP_SIGNAL', { queue: 'background', persist: false, silent: true })
-            } else if (action.startsWith('app:') || SILENT_CARD_ACTIONS.has(action)) {
-              // app: prefix = system-internal signal; SILENT_CARD_ACTIONS = lifecycle signals.
-              // Both are already written to DB by insertUISignal; injector picks them up passively on the next tick.
-            } else {
-              const signalContent = `[App signal app=${appId} action=${action}]\n${JSON.stringify(payload, null, 2)}`
-              pushMessage(`APP:${appId}`, signalContent, 'APP_SIGNAL')
-            }
-          }
-        } else if (msg?.kind === 'pong') {
-          // ignore
-        }
-      } catch (e) {
-        // Reject non-JSON frames
+  // 上行 intent:落库(复用 ui_signals 表)+ 在有语义的用户意图时推进 agent 队列。
+  // 协议规定只有"有意义的用户意图"才上行;dismiss/ended 等生命周期意图只落库供被动注入,不打扰 agent。
+  const SCENE_PASSIVE_INTENTS = new Set(['dismiss', 'ended', 'mounted', 'dwell'])
+  setSceneIntentHandler((msg) => {
+    const surface = msg.surface || 'scene'
+    const name = msg.name || 'unknown'
+    const data = msg.data || {}
+    const id = insertUISignal({ type: `scene.intent.${name}`, target: msg.surface || null, payload: data, ts: msg.ts || Date.now() })
+    emitEvent('ui_signal', { id, type: name, target: msg.surface, payload: data })
+
+    // 安全确认回流：security-confirm-* 的 select intent 走 core 侧确定性处理（不卷入 Agent 回合）。
+    // 待应用的变更存在该 surface 的 data.pending（execSetSecurity 写入），这里回查后直接 apply，
+    // 与旧 ACUI confirm_security_change 行为一致；提前 return，不走下面的通用 APP_SIGNAL push。
+    if (name === 'select' && surface.startsWith('security-confirm-')) {
+      const pending = sceneStore.get(surface)?.data?.pending || {}
+      sceneStore.set(surface, null)   // 无论确认/取消都先收起确认 surface
+      if (data.value === 'confirm') {
+        const updates = {}
+        if (pending.file_sandbox !== undefined) updates.fileSandbox = pending.file_sandbox === true
+        if (pending.exec_sandbox !== undefined) updates.execSandbox = pending.exec_sandbox === true
+        const result = Object.keys(updates).length > 0 ? setSecurity(updates) : getSecurity()
+        const desc = Object.entries(updates).map(([k, v]) => `${k}=${v}`).join(', ')
+        pushMessage(
+          'SYSTEM',
+          `[security settings updated] User confirmed changes: ${desc}. changed_at=${result.updatedAt || 'not recorded'}\n(Internal context refresh only. Do NOT call send_message.)`,
+          'APP_SIGNAL',
+          { queue: 'background', persist: false, silent: true },
+        )
+      } else {
+        pushMessage('SYSTEM', '[security settings change] User cancelled — settings unchanged\n(Internal context refresh only. Do NOT call send_message.)', 'APP_SIGNAL', { queue: 'background', persist: false, silent: true })
       }
-    })
+      return
+    }
 
-    ws.on('close', () => removeACUIClient(ws))
-    ws.on('error', () => removeACUIClient(ws))
+    if (!SCENE_PASSIVE_INTENTS.has(name)) {
+      pushMessage(`UI:${surface}`, `[UI intent surface=${surface} name=${name}]\n${JSON.stringify(data, null, 2)}`, 'APP_SIGNAL')
+    }
   })
 
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, `http://localhost:${port}`)
-    if (url.pathname === '/acui') {
+    if (url.pathname === '/scene') {
       const origin = req.headers.origin
-      if (origin && !isAllowedOrigin(origin, req)) {
+      if (origin && !isAllowedOrigin(origin)) {
         socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
         socket.destroy()
         return
@@ -1846,10 +2230,10 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
         socket.destroy()
         return
       }
-      acuiWss.handleUpgrade(req, socket, head, (ws) => acuiWss.emit('connection', ws, req))
+      sceneWss.handleUpgrade(req, socket, head, (ws) => sceneWss.emit('connection', ws, req))
     } else if (url.pathname === '/voice/cloud') {
       const origin = req.headers.origin
-      if (origin && !isAllowedOrigin(origin, req)) {
+      if (origin && !isAllowedOrigin(origin)) {
         socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
         socket.destroy()
         return
@@ -1865,14 +2249,6 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     }
   })
 
-  // Heartbeat: send ping to all ACUI clients every 30s
-  const acuiHeartbeat = setInterval(() => {
-    for (const client of acuiWss.clients) {
-      try { client.send(JSON.stringify({ v: 1, kind: 'ping' })) } catch {}
-    }
-  }, 30000)
-  acuiHeartbeat.unref?.()
-
   server.listen(port, host, () => {
     console.log(`[API] Listening at http://${host}:${port}`)
     console.log(`[API]   POST /message  — send message to agent`)
@@ -1880,7 +2256,7 @@ export function startAPI(port = 3721, { getStateSnapshot = null, onActivated = n
     console.log(`[API]   GET  /memories — query memories`)
     console.log(`[API]   GET  /audit/recall, /audit/extract, /audit/stats — memory observability (Phase 0)`)
     console.log(`[API]   GET  /status   — status`)
-    console.log(`[API]   WS   /acui     — ACUI bidirectional channel (control + perception)`)
+    console.log(`[API]   WS   /scene    — Scene declarative UI channel`)
   })
 
   return server

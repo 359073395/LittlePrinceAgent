@@ -24,12 +24,20 @@ export function cloudCapabilityEnabled(name, desktopFallback = true) {
 
 const CLOUD_DISABLED_TOOLS = new Set([
   'exec_command',
+  'exec_quick_command',
+  'exec_task_command',
+  'exec_background_command',
+  'download_file',
   'kill_process',
   'list_processes',
   'delegate_to_agent',
   'grant_agent_delegation',
   'install_tool',
   'uninstall_tool',
+  'install_software',
+  'manage_tool_factory',
+  'manage_api_capability',
+  'run_api_capability',
   'manage_app',
   'connect_wechat',
   'set_security',
@@ -38,7 +46,7 @@ const CLOUD_DISABLED_TOOLS = new Set([
 export function isRuntimeToolEnabled(name) {
   if (!isCloudMode()) return true
   if (!CLOUD_DISABLED_TOOLS.has(name)) return true
-  const capability = name === 'exec_command' || name === 'kill_process' || name === 'list_processes'
+  const capability = name === 'exec_command' || name === 'exec_quick_command' || name === 'exec_task_command' || name === 'exec_background_command' || name === 'download_file' || name === 'kill_process' || name === 'list_processes'
     ? 'SHELL_TOOLS'
     : 'LOCAL_PRIVILEGED_TOOLS'
   return envFlag(`LITTLE_PRINCE_AGENT_ENABLE_${capability}`, false)
@@ -52,6 +60,7 @@ export function runtimeModeSummary() {
     desktopScan: cloudCapabilityEnabled('DESKTOP_SCAN'),
     installedSoftwareScan: cloudCapabilityEnabled('INSTALLED_SOFTWARE_SCAN'),
     localResourcesScan: cloudCapabilityEnabled('LOCAL_RESOURCES_SCAN'),
+    geoWeather: cloudCapabilityEnabled('GEO_WEATHER'),
     localAgentScan: cloudCapabilityEnabled('LOCAL_AGENT_SCAN'),
   }
 }

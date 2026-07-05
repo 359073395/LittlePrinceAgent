@@ -1,4 +1,5 @@
 import { createHotspotPanel } from './hotspot-panel.js';
+import { createWorldcupPanel } from './worldcup-panel.js';
 import { createPersonCardPanel } from './person-card-panel.js';
 import { createDocPanel } from './doc-panel.js';
 
@@ -134,10 +135,11 @@ const createConsole = () => `
   <div id="chat-history">
     <div id="chat-messages"></div>
   </div>
+  <div id="paste-attachments" class="paste-attachments" hidden></div>
   <div id="input-row">
     <div id="slash-menu" class="slash-menu" role="listbox" aria-label="命令" hidden></div>
     <span class="prompt-mark">▸</span>
-    <input id="msg-input" type="text" placeholder="向 Longma 发送消息…（输入 / 调出命令）" autocomplete="off">
+    <textarea id="msg-input" rows="1" placeholder="向 Longma 发送消息…（输入 / 调出命令，Shift+Enter 换行）" autocomplete="off"></textarea>
     <button id="send-btn" type="button">发送</button>
   </div>
 </section>
@@ -173,7 +175,7 @@ const createSettingsModal = () => `
         <button class="settings-nav-item" data-tab="llm" type="button">LLM 模型</button>
         <button class="settings-nav-item" data-tab="media" type="button">媒体能力</button>
         <button class="settings-nav-item" data-tab="social" type="button">社交媒体</button>
-        <button class="settings-nav-item" data-tab="voice" type="button">语音识别</button>
+        <button class="settings-nav-item" data-tab="voice" type="button">语音对话</button>
         <button class="settings-nav-item" data-tab="web-search" type="button">上网搜索</button>
         <button class="settings-nav-item" data-tab="security" type="button">安全沙箱</button>
         <button class="settings-nav-item" data-tab="update" type="button">更新</button>
@@ -187,6 +189,17 @@ const createSettingsModal = () => `
           <div class="settings-section">
             <div class="settings-section-label">主题</div>
             ${createThemeSwitcher()}
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-label">AI 名字</div>
+            <div class="settings-row">
+              <label class="settings-label" for="settings-agent-name">显示名</label>
+              <input class="settings-input" id="settings-agent-name" type="text" maxlength="32" autocomplete="off" spellcheck="false" placeholder="小王子">
+            </div>
+            <div class="settings-row-action">
+              <button class="settings-save-btn" id="settings-save-agent-name" type="button">保存</button>
+              <span class="settings-feedback" id="settings-agent-name-feedback"></span>
+            </div>
           </div>
           <div class="settings-section">
             <div class="settings-section-label">记忆节点图</div>
@@ -225,6 +238,10 @@ const createSettingsModal = () => `
               <label class="settings-label" for="settings-model-select">模型</label>
               <select class="settings-select" id="settings-model-select"></select>
             </div>
+            <div class="settings-row" id="settings-official-custom-model-row" style="display:none;">
+              <label class="settings-label" for="settings-official-custom-model">自定义模型名</label>
+              <input class="settings-input" id="settings-official-custom-model" type="text" placeholder="如 kimi-k2.8, gpt-5.2, glm-6" autocomplete="off" spellcheck="false">
+            </div>
             <!-- 自定义端点字段（选择"自定义端点"时显示） -->
             <div id="settings-custom-llm-section" style="display:none;">
               <div class="settings-row">
@@ -238,7 +255,10 @@ const createSettingsModal = () => `
             </div>
             <div class="settings-row">
               <label class="settings-label" for="settings-llm-key">API Key</label>
-              <input class="settings-input" id="settings-llm-key" type="password" placeholder="自定义端点可留空；其他留空则仅切换模型" autocomplete="new-password">
+              <div class="settings-secret-wrap">
+                <input class="settings-input" id="settings-llm-key" type="password" placeholder="已保存的 Key 会在这里显示" autocomplete="new-password">
+                <button class="settings-secret-toggle" id="settings-llm-key-toggle" type="button" aria-label="显示 API Key" title="显示/隐藏 API Key">👁</button>
+              </div>
             </div>
             <div class="settings-row-action">
               <button class="settings-save-btn" id="settings-save-llm" type="button">保存</button>
@@ -256,6 +276,18 @@ const createSettingsModal = () => `
             <div class="settings-row-action">
               <button class="settings-save-btn" id="settings-save-temperature" type="button">保存</button>
               <span class="settings-feedback" id="settings-temperature-feedback"></span>
+            </div>
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-label">思考模式</div>
+            <p class="settings-hint">默认关闭：直接作答，响应更快、更省 token。开启后模型会先推理再回答，复杂任务更可靠（具体想多深由模型自己决定），但响应更慢。遇到难题想要更高质量时再开启。</p>
+            <div class="settings-row">
+              <label class="settings-label" for="settings-thinking">启用思考模式</label>
+              <label class="settings-toggle">
+                <input type="checkbox" id="settings-thinking">
+                <span class="settings-toggle-track"></span>
+              </label>
+              <span class="settings-feedback" id="settings-thinking-feedback"></span>
             </div>
           </div>
         </div>
@@ -361,7 +393,7 @@ const createSettingsModal = () => `
         <!-- ── 语音 tab ── -->
         <div class="settings-tab" data-tab="voice">
           <div class="settings-section">
-            <div class="settings-section-label">云端模式配置</div>
+            <div class="settings-section-label">识别模式配置</div>
             <div class="settings-row">
               <label class="settings-label" for="voice-auto-key">粘贴 Key 自动识别厂商</label>
               <input class="settings-input" type="password" id="voice-auto-key" placeholder="阿里云 / 腾讯云 / 讯飞 / 火山豆包 ASR Key">
@@ -370,6 +402,7 @@ const createSettingsModal = () => `
             <div class="settings-row">
               <label class="settings-label" for="voice-provider-select">服务商</label>
               <select class="settings-select" id="voice-provider-select">
+                <option value="local">本机识别（macOS）</option>
                 <option value="aliyun">阿里云百炼（推荐）</option>
                 <option value="volcengine">火山引擎豆包 ASR</option>
                 <option value="tencent">腾讯云 ASR</option>
@@ -436,6 +469,14 @@ const createSettingsModal = () => `
               </select>
             </div>
             <div class="settings-row">
+              <label class="settings-label" for="voice-mic-select">麦克风</label>
+              <select class="settings-select" id="voice-mic-select">
+                <option value="">系统默认麦克风</option>
+              </select>
+              <button class="settings-save-btn" id="voice-refresh-mics" type="button" style="padding:0 10px;">刷新</button>
+            </div>
+            <p class="settings-hint" id="voice-mic-status" style="margin-top:-2px;">更换麦克风后，重新开启语音对话生效。</p>
+            <div class="settings-row">
               <label class="settings-label" for="voice-auto-send">识别后自动发送</label>
               <input id="voice-auto-send" type="checkbox" checked style="width:auto;flex:none;">
             </div>
@@ -458,6 +499,14 @@ const createSettingsModal = () => `
           <div class="settings-section" id="settings-tts-section">
             <div class="settings-section-label">语音合成（TTS）</div>
             <p class="settings-hint">用语音发消息时，Agent 回复会自动转为语音播放。首选推荐豆包语音合成 2.0（https://console.volcengine.com/speech/new/），也支持 MiniMax、OpenAI、ElevenLabs、火山引擎。</p>
+            <div class="settings-row">
+              <label class="settings-label" for="voice-output-select">输出设备</label>
+              <select class="settings-select" id="voice-output-select">
+                <option value="">自动（跟随系统，避开虚拟设备）</option>
+              </select>
+              <button class="settings-save-btn" id="voice-refresh-outputs" type="button" style="padding:0 10px;">刷新</button>
+            </div>
+            <p class="settings-hint" id="voice-output-status" style="margin-top:-2px;">语音从这里发声。默认自动选择；拔耳机会自动切回扬声器，不会被串流/虚拟声卡占用。</p>
             <div class="settings-row">
               <label class="settings-label" for="tts-provider-select">服务商</label>
               <select class="settings-select" id="tts-provider-select">
@@ -683,17 +732,28 @@ const createSettingsModal = () => `
             </div>
           </div>
           <div class="settings-section">
+            <div class="settings-section-label">局域网访问</div>
+            <p class="settings-hint">允许同一局域网内的设备访问本机白龙马 API，用于多台白龙马互相通信。开启或关闭后需要重启应用生效。</p>
+            <div class="settings-row">
+              <label class="settings-label" for="security-lan-access">允许局域网访问</label>
+              <label class="settings-toggle">
+                <input type="checkbox" id="security-lan-access">
+                <span class="settings-toggle-track"></span>
+              </label>
+            </div>
+          </div>
+          <div class="settings-section">
             <div class="settings-section-label">工具黑名单</div>
             <p class="settings-hint">勾选后该工具将被拒绝执行，对话中 Agent 调用时会收到"已被安全策略禁用"错误。</p>
             <div class="settings-row"><label class="settings-label"><input type="checkbox" class="security-blocked-tool" value="exec_command"> exec_command &nbsp;<span style="color:var(--ink2);font-size:12px;">（执行 shell 命令）</span></label></div>
             <div class="settings-row"><label class="settings-label"><input type="checkbox" class="security-blocked-tool" value="browser_read"> browser_read &nbsp;<span style="color:var(--ink2);font-size:12px;">（浏览器渲染访问）</span></label></div>
             <div class="settings-row"><label class="settings-label"><input type="checkbox" class="security-blocked-tool" value="fetch_url"> fetch_url &nbsp;<span style="color:var(--ink2);font-size:12px;">（HTTP 请求）</span></label></div>
             <div class="settings-row"><label class="settings-label"><input type="checkbox" class="security-blocked-tool" value="web_search"> web_search &nbsp;<span style="color:var(--ink2);font-size:12px;">（网页搜索）</span></label></div>
-            <div class="settings-row"><label class="settings-label"><input type="checkbox" class="security-blocked-tool" value="ui_show"> ui_show &nbsp;<span style="color:var(--ink2);font-size:12px;">（推送 UI 卡片 / 动态代码注入）</span></label></div>
-            <div class="settings-row"><label class="settings-label"><input type="checkbox" class="security-blocked-tool" value="ui_register"> ui_register &nbsp;<span style="color:var(--ink2);font-size:12px;">（注册新 UI 组件）</span></label></div>
+            <div class="settings-row"><label class="settings-label"><input type="checkbox" class="security-blocked-tool" value="ui_set"> ui_set &nbsp;<span style="color:var(--ink2);font-size:12px;">（投影声明式界面 surface）</span></label></div>
           </div>
           <div class="settings-section settings-section-action">
             <button class="settings-save-btn" id="settings-save-security" type="button">保存</button>
+            <button class="settings-save-btn hidden" id="settings-restart-security" type="button" style="width:auto;padding:0 14px;">立即重启</button>
             <span class="settings-feedback" id="settings-security-feedback"></span>
           </div>
         </div>
@@ -922,6 +982,7 @@ export function createBrainUiMarkup() {
     createMusicPanel(),
     createImagePanel(),
     createHotspotPanel(),
+    createWorldcupPanel(),
     createPersonCardPanel(),
     createDocPanel(),
   ].join("\n\n");

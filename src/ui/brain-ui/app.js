@@ -1,15 +1,18 @@
 ﻿import { renderBrainUiApp } from "./app-shell.js";
 import { API } from "./api-client.js";
-import { bootstrapACUI } from "./acui/bootstrap.js";
+import { bootstrapScene } from "../scene-shell/bootstrap.js";
 import { initChat, friendlyChannelLabel } from "./chat.js";
 import { initPanelCollapse } from "./panel-collapse.js";
 import { ThoughtStream } from "./thought-stream.js";
 import { initVoicePanel } from "./voice-panel.js";
 import { initHotspot, toggleHotspot, setHotspotMode, moveVoicePanelToBody, restoreVoicePanel } from "./hotspot.js";
+import { initWorldcup, toggleWorldcup, setWorldcupMode } from "./worldcup.js";
 import { enrichVisiblePersonCardFromText, initPersonCard, setPersonCardMode, showPersonCardByName } from "./person-card.js";
 import { initDocPanel, setDocPanelMode } from "./doc.js";
 import { initWechatPopup, showWechatPopup } from "./wechat-popup.js";
-import { attachJarvisFx, isFxEnabledForVoice, setFxEnabledForVoice, getJarvisFxParams, setJarvisFxParams, resetJarvisFxParams, isFxUnlocked, tryUnlockFx } from "./tts-fx.js";
+import { initFeishuPopup, showFeishuPopup } from "./feishu-popup.js";
+import { attachJarvisAudioGraph, attachJarvisFx, isFxEnabledForVoice, setFxEnabledForVoice, getJarvisFxParams, setJarvisFxParams, resetJarvisFxParams, isFxUnlocked, tryUnlockFx } from "./tts-fx.js";
+import { initAudioOutputRouting, applyOutputSink, listOutputDevices, getOutputPreference, setOutputPreference } from "./audio-output.js";
 renderBrainUiApp(document.body);
 const THEME_KEY = "jarvis-brain-ui-theme";
 const PHYSICS_STORAGE_KEY = "jarvis-brain-ui-physics";
@@ -427,8 +430,10 @@ const sim = MEMORY_GRAPH_ENABLED
     .force("radial", d3.forceRadial(180, W / 2, H / 2 - 10))
     .force("collision", d3.forceCollide())
     .alphaDecay(0.028)
+    .alphaMin(0.02) // 肉眼已静止后别再空烧 GPU（默认 0.001 要多跑约 2 秒）
     .velocityDecay(0.3)
     .on("tick", tick)
+    .on("end", writeGraphDom)
   : null;
 
 function linkDistance(link) {
@@ -545,7 +550,7 @@ function dampTangentialMotion() {
   });
 }
 
-function naturalTwitch() {
+function naturalTwitch(big = Math.random() < 0.3) {
   if (!MEMORY_GRAPH_ENABLED || !sim) return;
   if (nodeData.length < 2) {
     sim.alpha(1).restart();
@@ -563,7 +568,9 @@ function naturalTwitch() {
     }
   });
 
-  const twitchCount = Math.max(6, Math.floor(nodeData.length * 0.3));
+  // 小抽动（常态）只动少数节点低热度；大波（偶发）才整片涌动
+  const ratio = big ? 0.3 : 0.1;
+  const twitchCount = Math.max(big ? 6 : 3, Math.floor(nodeData.length * ratio));
   const candidates = shuffleArray(nodeData.filter(node => !node._core)).slice(0, twitchCount);
 
   candidates.forEach(node => {
@@ -585,12 +592,21 @@ function naturalTwitch() {
     node.vy = (node.vy || 0) + (nextY - currentY) * 0.14;
   });
 
-  sim.alpha(0.85).restart();
+  sim.alpha(big ? 0.6 : 0.35).restart();
 }
 
+let tickParity = 0;
 function tick() {
   if (!MEMORY_GRAPH_ENABLED) return;
   dampTangentialMotion();
+  // 非拖拽时 DOM 写入降到 30fps：力计算照跑，重绘减半；拖拽（alphaTarget>0）保持满帧
+  tickParity ^= 1;
+  if (tickParity && sim.alphaTarget() === 0) return;
+  writeGraphDom();
+}
+
+function writeGraphDom() {
+  if (!MEMORY_GRAPH_ENABLED || !linkSel || !nodeSel) return;
 
   linkSel
     .attr("x1", d => d.source.x)
@@ -958,7 +974,17 @@ function addNewNodes(memories) {
 }
 
 if (MEMORY_GRAPH_ENABLED) {
-  setInterval(() => naturalTwitch(), 6000);
+  // 随机 5–9 秒一次抽动，比固定节拍更像活物；窗口不可见时休眠省 GPU
+  const scheduleTwitch = () => {
+    setTimeout(() => {
+      if (!document.hidden) naturalTwitch();
+      scheduleTwitch();
+    }, 5000 + Math.random() * 4000);
+  };
+  scheduleTwitch();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) naturalTwitch(true); // 回到前台来一发大波当欢迎
+  });
   setInterval(() => { nodeData.forEach(n => { if (n._strength) n._strength *= 0.97; }); }, 2500);
 }
 
@@ -1025,10 +1051,10 @@ const AI_ACTIVITY_IDLE_AFTER_MS = 15_000;
 const AI_TOOL_GROUPS = {
   "扫描文件": new Set(["read_file", "list_dir"]),
   "改动文件": new Set(["write_file", "make_dir", "delete_file"]),
-  "执行命令": new Set(["exec_command", "kill_process", "list_processes"]),
+  "执行命令": new Set(["exec_command", "exec_quick_command", "exec_task_command", "exec_background_command", "download_file", "kill_process", "list_processes"]),
   "上网": new Set(["fetch_url", "web_search", "browser_read"]),
   "调取记忆": new Set(["search_memory", "recall_memory", "probe_memory", "upsert_memory", "merge_memories", "downgrade_memory"]),
-  "推送界面": new Set(["ui_show", "ui_update", "ui_hide", "ui_patch", "ui_register", "focus_banner"]),
+  "推送界面": new Set(["ui_set", "focus_banner"]),
   "处理多媒体": new Set(["speak", "generate_lyrics", "generate_music", "generate_image", "music", "media_mode"]),
   "回复用户": new Set(["send_message", "express"]),
 };
@@ -1413,18 +1439,22 @@ function handle({ type, data = {} }) {
     case "message":
       if (data.from === "consciousness") {
         lastJarvisContent = data.content;
+        const shouldSpeakMessage = data.speak === true;
         const viaLabel = friendlyChannelLabel(data.channel);
         const content = viaLabel ? `_→ ${viaLabel}_  \n${data.content}` : data.content;
+        const messageId = data.conversation_id || data.conversationId || "";
         // 若本轮正文已流式进了实时气泡：用权威全文定稿同一个气泡，避免新建重复气泡
         if (chat.hasLiveJarvisMsg()) {
-          chat.finalizeLiveJarvisMsg(content);
+          chat.finalizeLiveJarvisMsg(content, { messageId });
         } else {
-          addMsg("jarvis", content);
+          addMsg("jarvis", content, { messageId });
         }
         // 语音轮的 TTS 收尾：逐句会话进行中 → flush 尾句并收尾；若未走逐句（流式合成关闭）→ 整段播一次
         if (liveTurnSpeak) {
           if (sttsActive) finalizeStreamingTTS();
           else playTTSReply(toPlainSpeech(data.content));
+        } else if (shouldSpeakMessage) {
+          playTTSReplyIfReadable(data.content);
         }
         liveReplyActive = false;
         liveRawText = "";
@@ -1441,7 +1471,7 @@ function handle({ type, data = {} }) {
         || (data.from_id && /^(wechat|discord|feishu|wecom):/i.test(data.from_id));
       if (isExternal) {
         const label = friendlyChannelLabel(data.channel) || data.from_id || "External";
-        addMsg("external", data.content, { label, alert: false });
+        addMsg("external", data.content, { label, alert: false, messageId: data.conversation_id || data.conversationId || "" });
         openChat(true);
       }
       break;
@@ -1458,6 +1488,9 @@ function handle({ type, data = {} }) {
     case "hotspot_mode":
       setHotspotMode(!!data.active || data.action === "show" || data.action === "open", { source: "agent_event" });
       break;
+    case "worldcup_mode":
+      setWorldcupMode(!!data.active || data.action === "show" || data.action === "open", { source: "agent_event" });
+      break;
     case "doc_panel_mode":
       setDocPanelMode(!!data.active || data.action === "open", { topicId: data.topic || null, source: "agent_event" });
       break;
@@ -1470,10 +1503,14 @@ function handle({ type, data = {} }) {
     case "show_wechat_popup":
       showWechatPopup();
       break;
+    case "show_feishu_popup":
+      showFeishuPopup();
+      break;
     case "audio_created":
       if (data.autoPlay && data.path) {
         const audioUrl = `${API}/${data.path}`;
         const audioEl = new Audio(audioUrl);
+        applyOutputSink(audioEl).catch(() => {}); // 与 TTS 同路由，避开虚拟/已拔出设备
         audioEl.play().catch(() => {});
       }
       break;
@@ -1569,6 +1606,7 @@ let ttsInterruptedOriginalContent = '';
 let ttsInterruptionApplied = false;
 let ttsInterruptionDbTimer = null;
 let ttsStreamReader = null; // 当前流式合成的网络读取器；打断/重播时取消，避免旧流继续占用
+let ttsAudioGraph = null;   // 当前 TTS <audio> 的 Web Audio 图，用于音效和语音球可视化
 
 // ── 边出文字边逐句流式合成（streaming sentence TTS）─────────────────────────────
 // 正文 token 边到边按句末标点切句入队，一个顺序播放队列逐句 /tts/stream 播放——第一句在
@@ -1679,6 +1717,7 @@ window.stopTTS = () => {
   // When duration is not yet loaded (NaN): spokenUpTo=0, remaining='', falls back to full text
   ttsInterruptedRemaining = remaining || ttsCurrentText;
   applyTTSInterruption(spokenUpTo);
+  clearTTSAudioGraph();
   ttsAudioEl.pause();
   try { URL.revokeObjectURL(ttsAudioEl.src); } catch {}
   if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
@@ -1710,6 +1749,29 @@ window.resumeTTSIfNoSpeech = () => {
   playTTSReply(text);
 };
 
+function activateTTSAudioGraph(graph) {
+  if (ttsAudioGraph && ttsAudioGraph !== graph) {
+    try { ttsAudioGraph.teardown?.(); } catch {}
+  }
+  ttsAudioGraph = graph || null;
+  window.bailongmaVoice?.setTTSAnalyser?.(ttsAudioGraph?.analyser || null);
+}
+
+function clearTTSAudioGraph(graph) {
+  if (arguments.length > 0) {
+    if (!graph) return;
+    if (graph !== ttsAudioGraph) {
+      try { graph.teardown?.(); } catch {}
+      return;
+    }
+  }
+  if (ttsAudioGraph) {
+    try { ttsAudioGraph.teardown?.(); } catch {}
+    ttsAudioGraph = null;
+  }
+  window.bailongmaVoice?.setTTSAnalyser?.(null);
+}
+
 // 接管一个 <audio> 元素开始播放：叠加音色音效、挂起 ASR、注册结束/出错清理。
 // revokeUrl 为该元素 src 的 objectURL（播放结束/出错时回收）。多条播放路径共用。
 // opts.manageMic：是否由本函数挂起/恢复麦克风（单段播放=true；逐句队列由队列在首尾统一管，传 false）。
@@ -1718,12 +1780,14 @@ function startTTSAudio(audioEl, revokeUrl, opts = {}) {
   const { manageMic = true, onComplete = null } = opts;
   ttsAudioEl = audioEl;
   audioEl.volume = 1.0; // ensure full volume (avoid residual duck state from previous play)
-  attachJarvisFx(audioEl, activeTTSVoiceId); // 仅当该音色开启了机器人音效才叠加；否则原生播放
+  const audioGraph = attachJarvisAudioGraph(audioEl, activeTTSVoiceId);
+  activateTTSAudioGraph(audioGraph);
   // Suspend cloud ASR but keep the mic hardware open for interruption detection
   if (manageMic) window.bailongmaVoice?.suspendForTTS?.();
   // 结束/出错收尾。注意：被新一轮播放替换掉的旧元素，其 onerror 可能在 pause/revoke 后迟到触发；
   // 此时全局已指向新元素，必须用 ttsAudioEl===audioEl 守卫，否则会误杀新播放的流读取器和状态。
   const finish = () => {
+    clearTTSAudioGraph(audioGraph);
     if (revokeUrl) { try { URL.revokeObjectURL(revokeUrl); } catch {} } // 释放本元素 URL（无论是否当前）
     if (ttsAudioEl !== audioEl) return; // 已不是当前播放对象：仅回收 URL，不动全局
     if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
@@ -1734,7 +1798,12 @@ function startTTSAudio(audioEl, revokeUrl, opts = {}) {
   };
   audioEl.onended = finish;
   audioEl.onerror = finish;
+  // 把这段语音显式路由到真实输出设备（规避被系统默认占用的虚拟/已拔出声卡）。
+  // setSinkId 是异步的，但对流式 TTS，首个音频样本要等网络首包到达才流出，
+  // 这点路由耗时（毫秒级）远在出声之前完成 → 不必 await，也不会让首音漏到默认设备。
+  applyOutputSink(audioEl).catch(() => {});
   audioEl.play().catch(() => {
+    clearTTSAudioGraph(audioGraph);
     if (ttsAudioEl !== audioEl) return;
     if (onComplete) { ttsAudioEl = null; onComplete(); return; }
     if (manageMic) window.bailongmaVoice?.resumeAfterMedia();
@@ -1745,12 +1814,16 @@ function startTTSAudio(audioEl, revokeUrl, opts = {}) {
 function playTTSViaMediaSource(resp, opts = {}) {
   const mediaSource = new MediaSource();
   const url = URL.createObjectURL(mediaSource);
-  startTTSAudio(new Audio(url), url, opts); // play() 会在缓冲到首包后自动开始
+  const audioEl = new Audio(url);
+  const isCurrentAudio = () => ttsAudioEl === audioEl;
+  startTTSAudio(audioEl, url, opts); // play() 会在缓冲到首包后自动开始
   mediaSource.addEventListener('sourceopen', () => {
+    if (!isCurrentAudio()) { try { mediaSource.endOfStream(); } catch {} return; }
     let sb;
     try { sb = mediaSource.addSourceBuffer('audio/mpeg'); }
     catch { try { mediaSource.endOfStream(); } catch {} return; }
     const reader = resp.body.getReader();
+    if (!isCurrentAudio()) { try { reader.cancel(); } catch {} return; }
     ttsStreamReader = reader;
     const queue = [];
     let finished = false;
@@ -1765,10 +1838,21 @@ function playTTSViaMediaSource(resp, opts = {}) {
       try {
         for (;;) {
           const { done, value } = await reader.read();
-          if (done) { finished = true; flush(); break; }
+          if (!isCurrentAudio()) {
+            if (ttsStreamReader === reader) ttsStreamReader = null;
+            try { reader.cancel(); } catch {}
+            break;
+          }
+          if (done) {
+            if (ttsStreamReader === reader) ttsStreamReader = null;
+            finished = true; flush(); break;
+          }
           if (value && value.byteLength) { queue.push(value); flush(); }
         }
-      } catch { finished = true; flush(); } // 被取消/网络中断：收尾，已播部分照常结束
+      } catch {
+        if (ttsStreamReader === reader) ttsStreamReader = null;
+        finished = true; flush();
+      } // 被取消/网络中断：收尾，已播部分照常结束
     })();
   }, { once: true });
 }
@@ -1792,7 +1876,7 @@ async function playTTSReply(text) {
       try { const j = await resp.json(); errMsg = j.error || errMsg; } catch {}
       throw new Error(errMsg);
     }
-    if (ttsAudioEl) { ttsAudioEl.pause(); try { URL.revokeObjectURL(ttsAudioEl.src); } catch {} }
+    if (ttsAudioEl) { clearTTSAudioGraph(); ttsAudioEl.pause(); try { URL.revokeObjectURL(ttsAudioEl.src); } catch {} }
     // 默认流式：边下边播；不支持 MSE / 已关闭流式 → 退回整段 blob 播放
     if (ttsCanStream() && resp.body) {
       playTTSViaMediaSource(resp);
@@ -1802,6 +1886,7 @@ async function playTTSReply(text) {
       startTTSAudio(new Audio(url), url);
     }
   } catch {
+    clearTTSAudioGraph();
     ttsCurrentText = '';
     window.bailongmaVoice?.resumeAfterMedia();
   }
@@ -1834,11 +1919,16 @@ function toPlainSpeech(md) {
     .trim();
 }
 
+function playTTSReplyIfReadable(text) {
+  const plain = toPlainSpeech(text);
+  if (plain && sttsHasReadable(plain)) playTTSReply(plain);
+}
+
 // ── 逐句流式 TTS 队列 ──────────────────────────────────────────────────────────
 function beginStreamingTTS() {
   // 停掉上一段仍在进行的单段播放 / 流读取
   if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
-  if (ttsAudioEl) { try { ttsAudioEl.pause(); URL.revokeObjectURL(ttsAudioEl.src); } catch {} ttsAudioEl = null; }
+  if (ttsAudioEl) { clearTTSAudioGraph(); try { ttsAudioEl.pause(); URL.revokeObjectURL(ttsAudioEl.src); } catch {} ttsAudioEl = null; }
   ttsStreamingMode = true;
   sttsActive = true;
   sttsConsumed = 0; sttsBuf = ''; sttsQueue = []; sttsPlaying = false;
@@ -1925,6 +2015,7 @@ function finalizeStreamingTTS() {
 function endStreamingTTS() {
   sttsActive = false;
   ttsStreamingMode = false;
+  clearTTSAudioGraph();
   if (sttsMicSuspended) { sttsMicSuspended = false; window.bailongmaVoice?.resumeAfterMedia(); }
   sttsQueue = []; sttsBuf = ''; sttsCurSeg = ''; sttsSpoken = ''; sttsPlaying = false;
 }
@@ -1945,7 +2036,7 @@ function stopStreamingTTS() {
   ttsCurrentText = fullPlain;                       // 让 ✋/续播的文本计算有一致的全文基准
   ttsInterruptedRemaining = remainingPlain || fullPlain;
   applyTTSInterruption(spokenPlain.length);
-  if (ttsAudioEl) { try { ttsAudioEl.pause(); URL.revokeObjectURL(ttsAudioEl.src); } catch {} }
+  if (ttsAudioEl) { clearTTSAudioGraph(); try { ttsAudioEl.pause(); URL.revokeObjectURL(ttsAudioEl.src); } catch {} }
   if (ttsStreamReader) { try { ttsStreamReader.cancel(); } catch {} ttsStreamReader = null; }
   ttsAudioEl = null;
   sttsActive = false; ttsStreamingMode = false;
@@ -1984,20 +2075,52 @@ d3.timer(() => {
   refreshNodeVisuals();
 });
 
+const PERSON_CARD_NON_PERSON_SUBJECT_RE = /(?:项目|功能|系统|工具|代码|文件|文档|文章|报告|方案|计划|任务|流程|架构|设计|页面|网站|应用|app|接口|api|正则|问题|bug|卡片|面板|按钮|图片|视频|音乐|游戏|天气|热点|热搜)/i;
+const PERSON_CARD_GENERIC_SUBJECT_RE = /^(?:这个人|那个人|这人|那人|这位|那位|某个人|某位|有人|谁|哪位|什么人|人物|人物卡|人物卡片)$/;
+
+function cleanPersonCardCandidate(value = "") {
+  return String(value || "")
+    .trim()
+    .replace(/^["'“”‘’「」『』《》]+|["'“”‘’「」『』《》]+$/g, "")
+    .replace(/[，,。.!！：:；;、]+$/g, "")
+    .replace(/\s*(?:是谁|是誰|是什么人|是什麼人|是个什么人|是個什麼人|是干嘛的|是幹嘛的)$/g, "")
+    .replace(/(?:的)?(?:生平|资料|資料|背景|简介|簡介|履历|履歷|故事|百科|个人资料|個人資料)$/g, "")
+    .trim();
+}
+
+function looksLikePersonCardName(value = "") {
+  const name = cleanPersonCardCandidate(value);
+  if (!name || name.length > 32) return false;
+  if (PERSON_CARD_NON_PERSON_SUBJECT_RE.test(name)) return false;
+  if (PERSON_CARD_GENERIC_SUBJECT_RE.test(name)) return false;
+  if (/[?？]/.test(name)) return false;
+  if (/(?:帮我|给我|请|麻烦|写|做|生成|打开|关闭|修|改|看下|看看|一下)/.test(name)) return false;
+
+  const compact = name.replace(/\s+/g, "");
+  if (/^[\u4e00-\u9fa5·]{2,8}$/.test(compact)) return true;
+
+  const latinName = name.replace(/[·]/g, " ").replace(/\s+/g, " ").trim();
+  const latinTokens = latinName.split(" ").filter(Boolean);
+  if (latinTokens.length >= 2 && latinTokens.length <= 4) {
+    return latinTokens.every(token => /^[A-Za-z][A-Za-z.'-]{1,24}$/.test(token));
+  }
+  return false;
+}
+
 function extractPersonCardQuery(text = "") {
   const value = String(text || "").trim();
   if (!value || /热点|热搜/.test(value)) return "";
 
   const patterns = [
-    /^谁是\s*([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9·.\-\s]{1,40})[？?]?$/,
-    /^([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9·.\-\s]{1,40})\s*(?:是谁|是誰|是什么人|是什麼人|是干嘛的|简介|介绍|资料|履历)[？?]?$/,
-    /^(?:介绍一下|介绍下|查一下|了解一下|认识一下)\s*([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9·.\-\s]{1,40})[？?]?$/,
+    /^谁是\s*(.+?)[？?]?$/,
+    /^(.+?)\s*(?:是谁|是誰|是什么人|是什麼人|是干嘛的|简介|介绍|资料|履历)[？?]?$/,
+    /^(?:介绍一下|介绍下|查一下|了解一下|认识一下)\s*(.+?)[？?]?$/,
   ];
 
   for (const pattern of patterns) {
     const match = value.match(pattern);
-    const name = match?.[1]?.trim();
-    if (name) return name.replace(/[，,。.!！：:；;]+$/g, "").trim();
+    const name = cleanPersonCardCandidate(match?.[1]);
+    if (looksLikePersonCardName(name)) return name;
   }
   return "";
 }
@@ -2019,12 +2142,19 @@ chat = initChat({
       toggleHotspot();
       return;
     }
+    if (document.body.classList.contains('worldcup-mode') && /关闭|退出|关掉|隐藏/.test(text)) {
+      toggleWorldcup();
+      return;
+    }
     if (document.body.classList.contains('person-card-mode') && /关闭|退出|关掉|隐藏/.test(text)) {
       setPersonCardMode(false, { source: 'chat_input' });
       return;
     }
     if (/热点|热搜/.test(text) && !document.body.classList.contains('hotspot-mode')) {
       toggleHotspot();
+    }
+    if (/世界杯/.test(text) && !document.body.classList.contains('worldcup-mode')) {
+      toggleWorldcup();
     }
     const personQuery = extractPersonCardQuery(text);
     if (personQuery) {
@@ -2047,9 +2177,10 @@ initDocPanel().catch((err) => console.warn('[DocPanel] init failed:', err));
 chat.restoreChatHistory();
 chat.unlockAudioOnFirstGesture();
 
-bootstrapACUI();
+bootstrapScene();  // Scene 架构 shell(/scene):声明式 Agent-UI 投影层。
 initPanelCollapse();
 initWechatPopup();
+initFeishuPopup();
 
 // ── TTS settings panel init ───────────────────────────────────────────────────
 function initTTSSettings() {
@@ -2319,6 +2450,7 @@ function initTTSSettings() {
         attachJarvisFx(ttsAudio, voiceSel?.value || activeTTSVoiceId); // 试听按当前选中音色的开关决定是否叠加
         ttsAudio.onended = () => { URL.revokeObjectURL(ttsUrl); if (testStatus) testStatus.textContent = ""; };
         ttsAudio.onerror = () => { URL.revokeObjectURL(ttsUrl); if (testStatus) testStatus.textContent = "播放失败"; };
+        await applyOutputSink(ttsAudio).catch(() => {}); // 试听也走同一输出路由
         await ttsAudio.play();
         if (testStatus) testStatus.textContent = "播放中";
         setTimeout(() => { if (testStatus && testStatus.textContent === "播放中") testStatus.textContent = ""; }, 8000);
@@ -2338,13 +2470,20 @@ function initTTSSettings() {
   const closeBtn        = document.getElementById("settings-close");
   const providerSelect  = document.getElementById("settings-provider-select");
   const modelSelect     = document.getElementById("settings-model-select");
+  const officialCustomModelInput = document.getElementById("settings-official-custom-model");
   const llmKeyInput     = document.getElementById("settings-llm-key");
+  const llmKeyToggle    = document.getElementById("settings-llm-key-toggle");
   const saveLlmBtn      = document.getElementById("settings-save-llm");
   const llmFeedback     = document.getElementById("settings-llm-feedback");
+  const agentNameInput  = document.getElementById("settings-agent-name");
+  const saveAgentNameBtn = document.getElementById("settings-save-agent-name");
+  const agentNameFeedback = document.getElementById("settings-agent-name-feedback");
   const tempSlider      = document.getElementById("settings-temperature");
   const tempVal         = document.getElementById("settings-temperature-val");
   const saveTempBtn     = document.getElementById("settings-save-temperature");
   const tempFeedback    = document.getElementById("settings-temperature-feedback");
+  const thinkingToggle  = document.getElementById("settings-thinking");
+  const thinkingFeedback = document.getElementById("settings-thinking-feedback");
   const minimaxKeyInput = document.getElementById("settings-minimax-key");
   const saveMinimaxBtn  = document.getElementById("settings-save-minimax");
   const minimaxFeedback = document.getElementById("settings-minimax-feedback");
@@ -2354,10 +2493,20 @@ function initTTSSettings() {
   const voiceFeedback   = document.getElementById("settings-voice-feedback");
   const voiceThreshSlider = document.getElementById("settings-voice-threshold");
   const voiceThreshVal    = document.getElementById("settings-voice-threshold-val");
+  const voiceMicSelect    = document.getElementById("voice-mic-select");
+  const voiceRefreshMicsBtn = document.getElementById("voice-refresh-mics");
+  const voiceMicStatus    = document.getElementById("voice-mic-status");
+  const voiceOutputSelect    = document.getElementById("voice-output-select");
+  const voiceRefreshOutputsBtn = document.getElementById("voice-refresh-outputs");
+  const voiceOutputStatus    = document.getElementById("voice-output-status");
 
   if (!settingsBtn || !overlay) return;
 
   let cachedProviders = null;
+  let cachedLlm = null;
+  let llmKeyVisible = false;
+  const agentNameRe = /^[一-龥A-Za-z0-9 _-]+$/;
+  const CUSTOM_MODEL_VALUE = "__custom_model__";
 
   overlay.querySelectorAll(".settings-nav-item").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -2398,12 +2547,38 @@ function initTTSSettings() {
     }
   }
 
+  function escapeHtml(text) {
+    return String(text ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function syncOfficialCustomModelRow() {
+    const customRow = document.getElementById("settings-official-custom-model-row");
+    if (!customRow || !modelSelect) return;
+    customRow.style.display = modelSelect.value === CUSTOM_MODEL_VALUE ? "" : "none";
+  }
+
   function populateModelSelect(models, current) {
     if (!modelSelect || !models) return;
-    modelSelect.innerHTML = models
-      .map(m => `<option value="${m.id}"${m.deprecated ? " data-deprecated" : ""}>${m.label}</option>`)
+    const list = Array.isArray(models) ? models.filter(m => m?.id) : [];
+    const currentModel = String(current || "").trim();
+    const hasCurrent = currentModel && list.some(m => m.id === currentModel);
+    modelSelect.innerHTML = list
+      .map(m => `<option value="${escapeHtml(m.id)}"${m.deprecated ? " data-deprecated" : ""}>${escapeHtml(m.label || m.id)}</option>`)
+      .concat(`<option value="${CUSTOM_MODEL_VALUE}">手动输入模型名…</option>`)
       .join("");
-    if (current) modelSelect.value = current;
+    if (hasCurrent) {
+      modelSelect.value = currentModel;
+      if (officialCustomModelInput) officialCustomModelInput.value = "";
+    } else if (currentModel) {
+      modelSelect.value = CUSTOM_MODEL_VALUE;
+      if (officialCustomModelInput) officialCustomModelInput.value = currentModel;
+    }
+    syncOfficialCustomModelRow();
   }
 
   function populateProviderSelect(providers, current) {
@@ -2412,26 +2587,69 @@ function initTTSSettings() {
     const options = [`<option value="auto">Auto-detect</option>`]
       .concat(Object.entries(providers).map(([id, provider]) => {
         const label = provider.label || id;
-        return `<option value="${id}">${label}</option>`;
+        return `<option value="${escapeHtml(id)}">${escapeHtml(label)}</option>`;
       }));
     providerSelect.innerHTML = options.join("");
     providerSelect.value = providers[selected] || selected === "auto" ? selected : "auto";
   }
 
-  function applyCustomProviderUI(llm) {
+  function setLlmKeyVisible(visible) {
+    llmKeyVisible = Boolean(visible);
+    if (llmKeyInput) llmKeyInput.type = llmKeyVisible ? "text" : "password";
+    if (llmKeyToggle) {
+      llmKeyToggle.setAttribute("aria-label", llmKeyVisible ? "隐藏 API Key" : "显示 API Key");
+      llmKeyToggle.title = llmKeyVisible ? "隐藏 API Key" : "显示 API Key";
+    }
+  }
+
+  function getProviderConfigForUI(provider, llm = cachedLlm) {
+    const summary = cachedProviders?.[provider] || {};
+    if (llm && provider === llm.provider) {
+      return {
+        ...summary,
+        ...llm,
+        apiKey: llm.apiKey ?? summary.apiKey ?? "",
+      };
+    }
+    return summary;
+  }
+
+  function applyCustomProviderUI(providerOrLlm) {
+    const provider = typeof providerOrLlm === "string"
+      ? providerOrLlm
+      : (providerOrLlm?.provider || "auto");
+    const providerCfg = getProviderConfigForUI(provider, typeof providerOrLlm === "object" ? providerOrLlm : cachedLlm);
     const customSection = document.getElementById("settings-custom-llm-section");
     const modelRow = document.getElementById("settings-model-row");
-    if (llm?.provider === "custom") {
+    const officialCustomModelRow = document.getElementById("settings-official-custom-model-row");
+    if (provider === "auto") {
+      if (customSection) customSection.style.display = "none";
+      if (modelRow) modelRow.style.display = "none";
+      if (officialCustomModelRow) officialCustomModelRow.style.display = "none";
+      if (llmKeyInput) llmKeyInput.value = "";
+      setLlmKeyVisible(false);
+      return;
+    }
+    if (provider === "custom") {
       if (customSection) customSection.style.display = "";
       if (modelRow) modelRow.style.display = "none";
+      if (officialCustomModelRow) officialCustomModelRow.style.display = "none";
       const baseUrlEl = document.getElementById("settings-custom-baseurl");
       const modelEl = document.getElementById("settings-custom-model");
-      if (baseUrlEl && llm.baseURL) baseUrlEl.value = llm.baseURL;
-      if (modelEl && llm.model) modelEl.value = llm.model;
+      if (baseUrlEl) baseUrlEl.value = providerCfg.baseURL || "";
+      if (modelEl) modelEl.value = providerCfg.model || "";
     } else {
       if (customSection) customSection.style.display = "none";
       if (modelRow) modelRow.style.display = "";
+      if (cachedProviders?.[provider]) {
+        populateModelSelect(
+          cachedProviders[provider].models,
+          providerCfg.model || cachedProviders[provider].defaultModel,
+        );
+      }
     }
+    if (llmKeyInput) llmKeyInput.value = providerCfg.apiKey || "";
+    setLlmKeyVisible(false);
   }
 
   async function loadSettings() {
@@ -2439,15 +2657,17 @@ function initTTSSettings() {
       const data = await fetch(`${API}/settings`).then(r => r.json());
       const { llm, minimax, providers } = data;
       if (providers) cachedProviders = providers;
+      cachedLlm = llm;
+      if (agentNameInput) agentNameInput.value = data.agent_name || agentName || DEFAULT_AGENT_NAME;
       refreshConfigSummary({ llm, minimax });
       populateProviderSelect(providers, llm.provider || "auto");
       if (providerSelect && llm.provider) providerSelect.value = llm.provider;
       applyCustomProviderUI(llm);
-      if (llm.provider !== "custom") populateModelSelect(llm.models, llm.model);
       if (typeof llm.temperature === "number" && tempSlider) {
         tempSlider.value = String(llm.temperature);
         if (tempVal) tempVal.textContent = llm.temperature.toFixed(2);
       }
+      if (thinkingToggle) thinkingToggle.checked = llm.thinking === true;
     } catch {}
   }
 
@@ -2493,7 +2713,9 @@ function initTTSSettings() {
 
   const fileSandboxToggle = document.getElementById("security-file-sandbox");
   const execSandboxToggle = document.getElementById("security-exec-sandbox");
+  const lanAccessToggle   = document.getElementById("security-lan-access");
   const saveSecurityBtn   = document.getElementById("settings-save-security");
+  const restartSecurityBtn = document.getElementById("settings-restart-security");
   const securityFeedback  = document.getElementById("settings-security-feedback");
 
   async function loadWebSearchSettings() {
@@ -2571,9 +2793,11 @@ function initTTSSettings() {
 
   async function loadSecuritySettings() {
     try {
-      const { security } = await fetch(`${API}/settings/security`).then(r => r.json());
+      const { security, network } = await fetch(`${API}/settings/security`).then(r => r.json());
       if (fileSandboxToggle) fileSandboxToggle.checked = security.fileSandbox !== false;
       if (execSandboxToggle) execSandboxToggle.checked = security.execSandbox !== false;
+      if (lanAccessToggle) lanAccessToggle.checked = network?.allowLanAccess === true;
+      restartSecurityBtn?.classList.add("hidden");
       document.querySelectorAll(".security-blocked-tool").forEach(cb => {
         cb.checked = (security.blockedTools || []).includes(cb.value);
       });
@@ -2588,6 +2812,7 @@ function initTTSSettings() {
       const body = {
         fileSandbox: fileSandboxToggle ? fileSandboxToggle.checked : true,
         execSandbox: execSandboxToggle ? execSandboxToggle.checked : true,
+        allowLanAccess: lanAccessToggle ? lanAccessToggle.checked : false,
         blockedTools,
       };
       saveSecurityBtn.disabled = true;
@@ -2599,7 +2824,12 @@ function initTTSSettings() {
         });
         const data = await res.json();
         if (data.ok) {
-          showFeedback(securityFeedback, "已保存 — 立即生效");
+          if (data.network?.restartRequired) {
+            showFeedback(securityFeedback, "已保存 — 重启后生效");
+            restartSecurityBtn?.classList.remove("hidden");
+          } else {
+            showFeedback(securityFeedback, "已保存 — 立即生效");
+          }
         } else {
           showFeedback(securityFeedback, data.error || "保存失败", true);
         }
@@ -2607,6 +2837,19 @@ function initTTSSettings() {
         showFeedback(securityFeedback, "请求失败", true);
       } finally {
         saveSecurityBtn.disabled = false;
+      }
+    });
+  }
+
+  if (restartSecurityBtn) {
+    restartSecurityBtn.addEventListener("click", async () => {
+      restartSecurityBtn.disabled = true;
+      try {
+        await fetch(`${API}/admin/restart`, { method: "POST" });
+        showFeedback(securityFeedback, "正在重启…");
+      } catch {
+        showFeedback(securityFeedback, "重启请求失败，请手动重启应用", true);
+        restartSecurityBtn.disabled = false;
       }
     });
   }
@@ -2670,11 +2913,36 @@ function initTTSSettings() {
     });
   }
 
+  if (thinkingToggle) {
+    thinkingToggle.addEventListener("change", async () => {
+      const thinking = thinkingToggle.checked;
+      thinkingToggle.disabled = true;
+      try {
+        const res = await fetch(`${API}/settings/thinking`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ thinking }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          showFeedback(thinkingFeedback, data.thinking ? "已开启 — 下一轮生效" : "已关闭 — 下一轮生效");
+        } else {
+          thinkingToggle.checked = !thinking;
+          showFeedback(thinkingFeedback, data.error || "保存失败", true);
+        }
+      } catch {
+        thinkingToggle.checked = !thinking;
+        showFeedback(thinkingFeedback, "请求失败", true);
+      } finally { thinkingToggle.disabled = false; }
+    });
+  }
+
   const VOICE_LANG_KEY       = "bailongma-voice-lang";
   const VOICE_AUTO_SEND_KEY  = "bailongma-voice-auto-send";
   const VOICE_AUTO_MIC_KEY   = "bailongma-voice-auto-mic";
   const VOICE_THRESHOLD_KEY  = "bailongma-voice-threshold";
   const VOICE_PROVIDER_KEY   = "bailongma-voice-provider";
+  const VOICE_MIC_DEVICE_KEY = "bailongma-voice-mic-device-id";
 
   function applyVoiceProviderUI(provider) {
     const panels = {
@@ -2682,8 +2950,10 @@ function initTTSSettings() {
       volcengine: "voice-cred-volcengine",
       tencent: "voice-cred-tencent",
       xunfei: "voice-cred-xunfei",
+      local: null,
     };
     for (const [key, id] of Object.entries(panels)) {
+      if (!id) continue;
       const el = document.getElementById(id);
       if (el) el.style.display = key === provider ? "" : "none";
     }
@@ -2712,6 +2982,143 @@ function initTTSSettings() {
     return null;
   }
 
+  function setVoiceMicStatus(message, isError = false) {
+    if (!voiceMicStatus) return;
+    voiceMicStatus.textContent = message;
+    voiceMicStatus.style.color = isError ? "var(--warm)" : "var(--dim)";
+  }
+
+  async function loadMicrophoneDevices({ requestPermission = false } = {}) {
+    if (!voiceMicSelect) return;
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      voiceMicSelect.disabled = true;
+      setVoiceMicStatus("当前环境不支持麦克风设备枚举，将使用系统默认麦克风。", true);
+      return;
+    }
+
+    const savedDeviceId = localStorage.getItem(VOICE_MIC_DEVICE_KEY) || "";
+    const preferredDeviceId = voiceMicSelect.value || savedDeviceId;
+    let permissionError = null;
+
+    voiceMicSelect.disabled = true;
+    if (voiceRefreshMicsBtn) voiceRefreshMicsBtn.disabled = true;
+
+    try {
+      if (requestPermission && navigator.mediaDevices.getUserMedia) {
+        try {
+          const permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          permissionStream.getTracks().forEach(track => track.stop());
+        } catch (err) {
+          permissionError = err;
+        }
+      }
+
+      const devices = (await navigator.mediaDevices.enumerateDevices())
+        .filter(device => device.kind === "audioinput");
+
+      voiceMicSelect.innerHTML = "";
+      const defaultOption = document.createElement("option");
+      defaultOption.value = "";
+      defaultOption.textContent = "系统默认麦克风";
+      voiceMicSelect.appendChild(defaultOption);
+
+      devices.forEach((device, index) => {
+        const option = document.createElement("option");
+        option.value = device.deviceId;
+        option.textContent = device.label || `麦克风 ${index + 1}`;
+        voiceMicSelect.appendChild(option);
+      });
+
+      const selectedStillExists = !preferredDeviceId || devices.some(device => device.deviceId === preferredDeviceId);
+      voiceMicSelect.value = selectedStillExists ? preferredDeviceId : "";
+      if (!selectedStillExists && savedDeviceId) localStorage.removeItem(VOICE_MIC_DEVICE_KEY);
+
+      const hasLabels = devices.some(device => device.label);
+      if (permissionError) {
+        setVoiceMicStatus("未获得麦克风权限，仍可使用系统默认麦克风；点刷新可重新授权。", true);
+      } else if (!devices.length) {
+        setVoiceMicStatus("未检测到独立麦克风，将使用系统默认麦克风。");
+      } else if (!hasLabels) {
+        setVoiceMicStatus(`已检测到 ${devices.length} 个麦克风；点刷新并授权后可显示完整名称。`);
+      } else {
+        setVoiceMicStatus(`已检测到 ${devices.length} 个麦克风。更换后重新开启语音对话生效。`);
+      }
+    } catch {
+      setVoiceMicStatus("麦克风列表读取失败，将使用系统默认麦克风。", true);
+    } finally {
+      voiceMicSelect.disabled = false;
+      if (voiceRefreshMicsBtn) voiceRefreshMicsBtn.disabled = false;
+    }
+  }
+
+  function setVoiceOutputStatus(message, isError = false) {
+    if (!voiceOutputStatus) return;
+    voiceOutputStatus.textContent = message;
+    voiceOutputStatus.style.color = isError ? "var(--warm)" : "var(--dim)";
+  }
+
+  // 填充"语音输出设备"下拉。结构对齐麦克风选择器：第一项=自动，其余=具体设备；
+  // 虚拟/串流设备打标提示用户它们不会真正出声。
+  async function loadOutputDevices({ requestPermission = false } = {}) {
+    if (!voiceOutputSelect) return;
+    if (!('setSinkId' in HTMLMediaElement.prototype)) {
+      voiceOutputSelect.disabled = true;
+      setVoiceOutputStatus("当前环境不支持指定输出设备，将使用系统默认。", true);
+      return;
+    }
+    const savedDeviceId = getOutputPreference();
+    const preferred = voiceOutputSelect.value || savedDeviceId;
+    voiceOutputSelect.disabled = true;
+    if (voiceRefreshOutputsBtn) voiceRefreshOutputsBtn.disabled = true;
+    try {
+      // label/deviceId 需要媒体权限；点"刷新"时主动请求一次，平时静默枚举
+      if (requestPermission && navigator.mediaDevices?.getUserMedia) {
+        try {
+          const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+          s.getTracks().forEach(t => t.stop());
+        } catch {}
+      }
+      const outs = await listOutputDevices();
+      // 只列真实可选设备（隐藏 default/communications 别名，避免和"自动"重复）
+      const selectable = outs.filter(d => !d.isDefault && d.label);
+      voiceOutputSelect.innerHTML = "";
+      const autoOpt = document.createElement("option");
+      autoOpt.value = "";
+      autoOpt.textContent = "自动（跟随系统，避开虚拟设备）";
+      voiceOutputSelect.appendChild(autoOpt);
+      selectable.forEach((d, i) => {
+        const opt = document.createElement("option");
+        opt.value = d.deviceId;
+        opt.textContent = (d.label || `输出设备 ${i + 1}`) + (d.isVirtual ? "（虚拟，可能没声音）" : "");
+        voiceOutputSelect.appendChild(opt);
+      });
+      const stillExists = !preferred || selectable.some(d => d.deviceId === preferred);
+      voiceOutputSelect.value = stillExists ? preferred : "";
+      if (!stillExists && savedDeviceId) setOutputPreference(""); // 钉的设备没了 → 回到自动
+
+      const hasLabels = selectable.some(d => d.label);
+      if (!selectable.length) {
+        setVoiceOutputStatus("未检测到独立扬声器/耳机，点刷新并授权后可显示。");
+      } else if (!hasLabels) {
+        setVoiceOutputStatus("点刷新并授权后可显示设备完整名称。");
+      } else {
+        setVoiceOutputStatus("语音从这里发声。默认自动；拔耳机会自动切回扬声器，不被虚拟声卡占用。");
+      }
+    } catch {
+      setVoiceOutputStatus("输出设备列表读取失败，将使用系统默认。", true);
+    } finally {
+      voiceOutputSelect.disabled = false;
+      if (voiceRefreshOutputsBtn) voiceRefreshOutputsBtn.disabled = false;
+    }
+  }
+
+  voiceRefreshOutputsBtn?.addEventListener("click", () => loadOutputDevices({ requestPermission: true }));
+  // 选择即时生效（无需点保存）：写偏好 → 模块自动把在播语音切过去并复评横幅
+  voiceOutputSelect?.addEventListener("change", () => {
+    setOutputPreference(voiceOutputSelect.value || "");
+    setVoiceOutputStatus(voiceOutputSelect.value ? "已切换，立即生效。" : "已设为自动，立即生效。");
+  });
+
   const voiceProviderSelect = document.getElementById("voice-provider-select");
   if (voiceProviderSelect) {
     voiceProviderSelect.addEventListener("change", () => applyVoiceProviderUI(voiceProviderSelect.value));
@@ -2738,6 +3145,18 @@ function initTTSSettings() {
     });
   }
 
+  voiceRefreshMicsBtn?.addEventListener("click", () => {
+    loadMicrophoneDevices({ requestPermission: true });
+  });
+
+  voiceMicSelect?.addEventListener("change", () => {
+    setVoiceMicStatus("保存后，重新开启语音对话生效。");
+  });
+
+  navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+    if (!overlay.hidden) { loadMicrophoneDevices(); loadOutputDevices(); }
+  });
+
   async function loadVoiceSettings() {
     const langSelect = document.getElementById("voice-lang-select");
     const autoSend   = document.getElementById("voice-auto-send");
@@ -2748,6 +3167,8 @@ function initTTSSettings() {
     const savedThresh = parseFloat(localStorage.getItem(VOICE_THRESHOLD_KEY) || "0.008");
     if (voiceThreshSlider) voiceThreshSlider.value = String(savedThresh);
     if (voiceThreshVal)    voiceThreshVal.textContent = savedThresh.toFixed(3);
+    await loadMicrophoneDevices();
+    await loadOutputDevices();
 
     let savedProvider = localStorage.getItem(VOICE_PROVIDER_KEY) || "aliyun";
     try {
@@ -2776,14 +3197,19 @@ function initTTSSettings() {
       const autoMic   = document.getElementById("voice-auto-mic")?.checked ?? false;
       const threshold = parseFloat(voiceThreshSlider?.value ?? "0.008");
       const provider  = voiceProviderSelect?.value || "aliyun";
+      const micDeviceId = voiceMicSelect?.value || "";
 
       localStorage.setItem(VOICE_LANG_KEY,      lang);
       localStorage.setItem(VOICE_AUTO_SEND_KEY,  String(autoSend));
       localStorage.setItem(VOICE_AUTO_MIC_KEY,   String(autoMic));
       localStorage.setItem(VOICE_THRESHOLD_KEY,  String(threshold));
       localStorage.setItem(VOICE_PROVIDER_KEY,   provider);
+      if (micDeviceId) localStorage.setItem(VOICE_MIC_DEVICE_KEY, micDeviceId);
+      else localStorage.removeItem(VOICE_MIC_DEVICE_KEY);
 
       window.dispatchEvent(new CustomEvent("bailongma:voice-threshold", { detail: { threshold } }));
+      const micLabel = voiceMicSelect?.selectedOptions?.[0]?.textContent || "系统默认麦克风";
+      setVoiceMicStatus(`当前麦克风：${micLabel}。重新开启语音对话生效。`);
 
       const body = { voiceProvider: provider };
       const aliyunKey = document.getElementById("voice-aliyun-key")?.value?.trim();
@@ -2888,58 +3314,89 @@ function initTTSSettings() {
 
   if (providerSelect) {
     providerSelect.addEventListener("change", () => {
-      const provider = providerSelect.value;
-      const customSection = document.getElementById("settings-custom-llm-section");
-      const modelRow = document.getElementById("settings-model-row");
-      if (provider === "custom") {
-        if (customSection) customSection.style.display = "";
-        if (modelRow) modelRow.style.display = "none";
-      } else {
-        if (customSection) customSection.style.display = "none";
-        if (modelRow) modelRow.style.display = "";
-        if (cachedProviders?.[provider]) populateModelSelect(cachedProviders[provider].models, null);
-      }
+      applyCustomProviderUI(providerSelect.value);
     });
   }
+
+  if (modelSelect) {
+    modelSelect.addEventListener("change", syncOfficialCustomModelRow);
+  }
+
+  saveAgentNameBtn?.addEventListener("click", async () => {
+    const nextName = agentNameInput?.value?.trim() || "";
+    if (nextName.length > 32) {
+      showFeedback(agentNameFeedback, "AI 名字不能超过 32 个字符", true);
+      return;
+    }
+    if (nextName && !agentNameRe.test(nextName)) {
+      showFeedback(agentNameFeedback, "AI 名字只允许中文、英文字母、数字、空格、下划线、短横线", true);
+      return;
+    }
+    saveAgentNameBtn.disabled = true;
+    try {
+      const res = await fetch(`${API}/settings/agent-name`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentName: nextName }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        const savedName = data.agent_name || DEFAULT_AGENT_NAME;
+        if (agentNameInput) agentNameInput.value = savedName;
+        setAgentName(savedName);
+        showFeedback(agentNameFeedback, "已保存");
+      } else {
+        showFeedback(agentNameFeedback, data.error || "保存失败", true);
+      }
+    } catch {
+      showFeedback(agentNameFeedback, "请求失败", true);
+    } finally {
+      saveAgentNameBtn.disabled = false;
+    }
+  });
+
+  llmKeyToggle?.addEventListener("click", () => {
+    setLlmKeyVisible(!llmKeyVisible);
+  });
 
   saveLlmBtn?.addEventListener("click", async () => {
     const provider = providerSelect?.value || "auto";
     const apiKey = llmKeyInput.value.trim();
     saveLlmBtn.disabled = true;
-
-    if (provider === "custom") {
-      const baseURL = document.getElementById("settings-custom-baseurl")?.value?.trim();
-      const model   = document.getElementById("settings-custom-model")?.value?.trim();
-      if (!baseURL || !model) {
-        showFeedback(llmFeedback, "请填入 Base URL 和模型名称", true);
-        saveLlmBtn.disabled = false;
-        return;
-      }
-      try {
-        const res = await fetch(`${API}/activate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider: "custom", baseURL, model, apiKey: apiKey || "none" }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-          showFeedback(llmFeedback, `已连接：${data.model}`);
-          llmKeyInput.value = "";
-          loadSettings();
-        } else {
-          showFeedback(llmFeedback, data.error || "连接失败", true);
-        }
-      } catch { showFeedback(llmFeedback, "请求失败", true); }
-      finally { saveLlmBtn.disabled = false; }
-      return;
-    }
-
-    const model = modelSelect.value;
     try {
-      const body = apiKey
-        ? { provider, apiKey, ...(provider === "auto" ? {} : { model }) }
-        : { model };
-      const res = await fetch(apiKey ? `${API}/activate` : `${API}/settings/model`, {
+      const selectedCfg = cachedProviders?.[provider] || {};
+      const body = { provider };
+      if (provider === "custom") {
+        body.baseURL = document.getElementById("settings-custom-baseurl")?.value?.trim();
+        body.model = document.getElementById("settings-custom-model")?.value?.trim();
+        if (!body.baseURL || !body.model) {
+          showFeedback(llmFeedback, "请填入 Base URL 和模型名称", true);
+          saveLlmBtn.disabled = false;
+          return;
+        }
+        if (apiKey !== (selectedCfg.apiKey || "")) body.apiKey = apiKey || "none";
+      } else if (provider === "auto") {
+        if (!apiKey) {
+          showFeedback(llmFeedback, "自动识别需要填入 API Key", true);
+          saveLlmBtn.disabled = false;
+          return;
+        }
+        body.apiKey = apiKey;
+      } else {
+        if (modelSelect.value === CUSTOM_MODEL_VALUE) {
+          body.model = officialCustomModelInput?.value?.trim();
+          if (!body.model) {
+            showFeedback(llmFeedback, "请填入模型名称", true);
+            saveLlmBtn.disabled = false;
+            return;
+          }
+        } else {
+          body.model = modelSelect.value;
+        }
+        if (apiKey && apiKey !== (selectedCfg.apiKey || "")) body.apiKey = apiKey;
+      }
+
+      const res = await fetch(`${API}/settings/model`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -2947,7 +3404,6 @@ function initTTSSettings() {
       const data = await res.json();
       if (data.ok) {
         showFeedback(llmFeedback, "已保存");
-        llmKeyInput.value = "";
         loadSettings();
       } else {
         showFeedback(llmFeedback, data.error || "保存失败", true);
@@ -3272,8 +3728,16 @@ initVoicePanel({
   getAutoMic:    () => localStorage.getItem("bailongma-voice-auto-mic") === "true",
 });
 
+// ── 语音输出设备路由 ──
+// 监听设备插拔：拔耳机/虚拟设备占用系统默认时，把正在播的语音即时切到真实硬件；
+// 完全无设备时弹一键修复横幅。getCurrentAudioEl 回传当前在播 TTS 元素。
+initAudioOutputRouting({ getCurrentAudioEl: () => ttsAudioEl });
+
 // ── Hotspot mode ──
 initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
+
+// ── Worldcup mode ──
+initWorldcup().catch((err) => console.warn('[Worldcup] init failed:', err));
 
 // ── Media modes (video / image) ──
 (function initMediaModes() {

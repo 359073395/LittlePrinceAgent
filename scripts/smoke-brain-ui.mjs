@@ -7,6 +7,7 @@ import { chromium } from 'playwright'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(__dirname, '..')
 const brainUiRoot = path.join(root, 'src', 'ui', 'brain-ui')
+const sceneShellRoot = path.join(root, 'src', 'ui', 'scene-shell')
 
 function contentTypeFor(filePath) {
   switch (path.extname(filePath).toLowerCase()) {
@@ -73,8 +74,34 @@ function createServer() {
       return
     }
 
+    if (url.pathname.startsWith('/src/ui/scene-shell/')) {
+      const relativePath = decodeURIComponent(url.pathname.slice('/src/ui/scene-shell/'.length))
+      const assetPath = path.resolve(sceneShellRoot, relativePath)
+      if (!isPathInside(sceneShellRoot, assetPath)) {
+        res.writeHead(403)
+        res.end('forbidden')
+        return
+      }
+      sendFile(res, assetPath)
+      return
+    }
+
+    if (url.pathname === '/downloads') {
+      sendJson(res, {
+        ok: true,
+        version: '2.1.479',
+        downloads: {
+          windows: { url: '/downloads/windows' },
+          linux: { url: '/downloads/linux-install.sh', command: 'curl -fsSL /downloads/linux-install.sh | bash' },
+          source: { url: 'https://github.com/359073395/LittlePrinceAgent' },
+        },
+        updatePolicy: 'Smoke server mock.',
+      })
+      return
+    }
+
     if (url.pathname === '/agent-profile') {
-      sendJson(res, { name: 'SmokePrince' })
+      sendJson(res, { name: 'SmokeLongma' })
       return
     }
 
@@ -95,9 +122,24 @@ function createServer() {
       sendJson(res, {
         windowHours: Number(url.searchParams.get('hours') || 1),
         sinceIso: new Date().toISOString(),
-        recall: { total: 0, avg_chosen: 0, zero_match_count: 0 },
-        extract: { total: 0, avg_extracted: 0, skipped_count: 0 },
+        recall: {},
+        extract: {},
       })
+      return
+    }
+
+    if (url.pathname === '/docs') {
+      sendJson(res, { ok: true, topics: [] })
+      return
+    }
+
+    if (url.pathname.startsWith('/docs/')) {
+      sendJson(res, { ok: true, doc: { id: url.pathname.slice(6), title: 'Smoke Doc', body: '' } })
+      return
+    }
+
+    if (url.pathname === '/aivideo/history') {
+      sendJson(res, { ok: true, jobs: [] })
       return
     }
 
@@ -144,7 +186,7 @@ function createServer() {
           card: {
             name: '马云',
             title: '人物卡片',
-            summary: '暂时没有内置资料。可以让 小王子 Agent 补充身份、代表作品和为什么被提到。',
+            summary: '暂时没有内置资料。可以让 Longma 补充身份、代表作品和为什么被提到。',
             knownFor: [],
             tags: ['待补充'],
             image: 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 640 360%22%3E%3Crect width=%22640%22 height=%22360%22 fill=%22%23112332%22/%3E%3Ccircle cx=%22320%22 cy=%22130%22 r=%2260%22 fill=%22%2382d2ff%22/%3E%3Crect x=%22205%22 y=%22210%22 width=%22230%22 height=%2280%22 rx=%2240%22 fill=%22%2382d2ff%22/%3E%3C/svg%3E',
@@ -172,32 +214,6 @@ function createServer() {
 
     if (url.pathname === '/person-card-state') {
       sendJson(res, { ok: true, state: { active: true } })
-      return
-    }
-
-    if (url.pathname === '/doc-panel-state') {
-      sendJson(res, { ok: true, state: { active: false, topicId: null } })
-      return
-    }
-
-    if (url.pathname === '/docs') {
-      sendJson(res, {
-        ok: true,
-        topics: [
-          {
-            id: 'voice_config',
-            title: 'Voice Config',
-            subtitle: 'Smoke docs topic',
-            icon: 'mic',
-            summary: 'Smoke documentation topic',
-          },
-        ],
-      })
-      return
-    }
-
-    if (url.pathname === '/aivideo/history') {
-      sendJson(res, { ok: true, jobs: [] })
       return
     }
 
@@ -254,12 +270,13 @@ const baseUrl = `http://127.0.0.1:${port}`
 const browser = await chromium.launch()
 const page = await browser.newPage({ viewport: { width: 1280, height: 840 } })
 await page.addInitScript(() => {
-  localStorage.setItem('littleprinceagent-memory-graph-enabled', 'true')
+  localStorage.setItem('bailongma-memory-graph-enabled', 'true')
 })
 const errors = []
 page.on('pageerror', err => errors.push(err.message))
 page.on('console', msg => {
   if (msg.text().includes('/acui') && msg.text().includes('WebSocket connection')) return
+  if (msg.text().includes('/scene') && msg.text().includes('WebSocket connection')) return
   if (msg.text().includes('Failed to load resource: the server responded with a status of 404')) return
   if (msg.type() === 'error') errors.push(msg.text())
 })
@@ -273,7 +290,7 @@ try {
 
   await page.goto(`${baseUrl}/brain-ui`, { waitUntil: 'domcontentloaded' })
   await page.waitForSelector('#graph circle', { timeout: 5000 })
-  await page.waitForFunction(() => window.d3 && document.querySelector('#agent-brand-name')?.textContent.includes('SmokePrince'))
+  await page.waitForFunction(() => window.d3 && document.querySelector('#agent-brand-name')?.textContent.includes('SmokeLongma'))
   await page.fill('#msg-input', '马云是谁')
   await page.click('#send-btn')
   await page.waitForTimeout(300)
@@ -296,7 +313,7 @@ try {
     d3: Boolean(window.d3),
     nodes: document.querySelectorAll('#graph circle').length,
     links: document.querySelectorAll('#graph line').length,
-    acuiHost: Boolean(document.getElementById('acui-host')),
+    sceneStage: Boolean(document.getElementById('stage')),
     personCard: document.querySelector('#pc-name')?.textContent || '',
     personSummary: document.querySelector('#pc-summary')?.textContent || '',
     personKnownFor: [...document.querySelectorAll('#pc-known-list li')].map(li => li.textContent).join(' / '),
@@ -307,7 +324,7 @@ try {
 
   if (!snapshot.d3) throw new Error('d3 global missing')
   if (snapshot.nodes < 2) throw new Error(`expected at least 2 graph nodes, saw ${snapshot.nodes}`)
-  if (!snapshot.acuiHost) throw new Error('ACUI host was not bootstrapped')
+  if (!snapshot.sceneStage) throw new Error('scene shell stage was not bootstrapped')
   if (!snapshot.personCard.includes('马云')) throw new Error('person card did not render the requested person')
   if (!snapshot.personSummary.includes('阿里巴巴集团创始人')) throw new Error('person card did not absorb assistant summary')
   if (!snapshot.personKnownFor.includes('淘宝')) throw new Error('person card did not absorb assistant known-for items')
@@ -319,6 +336,13 @@ try {
   const leavingSeen = await page.waitForFunction(() => document.querySelector('#person-card-panel')?.classList.contains('pc-leaving'), null, { timeout: 1000 })
   if (!leavingSeen) throw new Error('person card did not use the leaving glitch state')
   await page.waitForFunction(() => !document.body.classList.contains('person-card-mode') && !document.querySelector('#person-card-panel')?.classList.contains('pc-visible'))
+  await page.fill('#msg-input', '帮我写一个项目介绍')
+  await page.click('#send-btn')
+  await page.waitForTimeout(1300)
+  const falsePersonCard = await page.evaluate(() =>
+    document.body.classList.contains('person-card-mode')
+    || document.querySelector('#person-card-panel')?.classList.contains('pc-visible'))
+  if (falsePersonCard) throw new Error('person card opened for a non-person introduction request')
   if (errors.length) throw new Error(`browser errors:\n${errors.join('\n')}`)
 
   console.log('[PASS] brain-ui smoke')

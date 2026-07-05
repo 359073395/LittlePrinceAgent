@@ -20,14 +20,13 @@ const TOOL_RISK = {
   schedule_reminder: 'medium',
   manage_prefetch_task: 'medium',
   manage_rule: 'medium',
-  ui_show: 'medium',
-  ui_update: 'medium',
-  ui_hide: 'medium',
-  ui_patch: 'medium',
-  manage_app: 'medium',
+  ui_set: 'medium',
+  capability_demo: 'medium',
+  terminal_stream: 'medium',
   set_tick_interval: 'medium',
   media_mode: 'low',
   hotspot_mode: 'low',
+  worldcup_mode: 'low',
   open_doc_panel: 'low',
   person_card_mode: 'low',
   music: 'low',
@@ -36,10 +35,16 @@ const TOOL_RISK = {
   install_tool: 'high',
   uninstall_tool: 'medium',
   list_tools: 'low',
+  manage_tool_factory: 'high',
   find_tool: 'low',
   complete_startup_self_check: 'low',
   delete_file: 'high',
+  install_software: 'high',
   exec_command: 'high',
+  exec_quick_command: 'medium',
+  exec_task_command: 'high',
+  exec_background_command: 'high',
+  download_file: 'high',
   kill_process: 'high',
   web_search: 'high',
   fetch_url: 'high',
@@ -48,8 +53,10 @@ const TOOL_RISK = {
   generate_lyrics: 'high',
   generate_music: 'high',
   generate_image: 'high',
-  generate_video: 'high',
-  ui_register: 'high',
+  run_capability: 'high',
+  run_api_capability: 'high',
+  analyze_image: 'high',
+  manage_api_capability: 'high',
   set_security: 'high',
 }
 export function classifyTool(name) {
@@ -81,7 +88,7 @@ export function evaluateToolPolicy(name, args = {}, context = {}) {
   if (blockedTools.includes(name)) {
     return { allowed: false, risk, reason: `工具 "${name}" 已被安全策略禁用` }
   }
-  if (name === 'exec_command') {
+  if (['exec_command', 'exec_quick_command', 'exec_task_command', 'exec_background_command'].includes(name)) {
     const reasons = isDangerousShellCommand(args.command || args.cmd || '')
     if (reasons.length) return { allowed: false, risk, reason: reasons.join('; ') }
   }

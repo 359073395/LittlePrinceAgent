@@ -14,6 +14,8 @@
 // 安全原则：任何一步不可用（Web Audio 缺失 / 上下文未被用户手势解锁 / 创建失败）
 // 都直接放弃接管，退回 <audio> 原生播放，绝不让声音变哑。
 
+import { applyContextSink } from './audio-output.js'
+
 const FX_STORAGE_KEY = 'bailongma.ttsfx.v2'      // 音效参数（手感）；v2＝金属感默认调高+新增金属/Flanger参数
 const FX_VOICES_KEY = 'bailongma.ttsfx.voices'   // 哪些音色开启了音效（音色 ID 列表）
 
@@ -384,4 +386,70 @@ export function attachJarvisFx(audioEl, voiceId) {
     audioEl.addEventListener('pause', teardown)
   }
   return ok
+}
+
+function shouldUseFx(voiceId) {
+  return isFxUnlocked() && isFxEnabledForVoice(voiceId)
+}
+
+export function attachJarvisAudioGraph(audioEl, voiceId) {
+  if (!audioEl) return null
+  const ctx = ensureCtx()
+  if (!ctx) return null
+  if (ctx.state !== 'running') {
+    ctx.resume?.().catch(() => {})
+    return null
+  }
+
+  let mediaSource
+  try {
+    mediaSource = ctx.createMediaElementSource(audioEl)
+  } catch {
+    return null
+  }
+
+  const analyser = ctx.createAnalyser()
+  analyser.fftSize = 512
+  analyser.smoothingTimeConstant = 0.5
+
+  let fxTeardown = null
+  let done = false
+  const teardown = () => {
+    if (done) return
+    done = true
+    try { fxTeardown?.() } catch { /* ignore */ }
+    try { analyser.disconnect() } catch { /* ignore */ }
+    try { mediaSource.disconnect() } catch { /* ignore */ }
+    audioEl.removeEventListener('ended', teardown)
+    audioEl.removeEventListener('error', teardown)
+    audioEl.removeEventListener('pause', teardown)
+  }
+
+  try {
+    mediaSource.connect(analyser)
+    if (shouldUseFx(voiceId)) {
+      const chain = buildChain(ctx, analyser, readParams())
+      fxTeardown = chain.teardown
+    } else {
+      analyser.connect(ctx.destination)
+    }
+    // 声音经此 ctx 输出 → 把输出设备 sink 设在 ctx 上（元素的 setSinkId 在此被绕过）。
+    applyContextSink(ctx).catch(() => {})
+  } catch {
+    teardown()
+    try {
+      mediaSource.connect(ctx.destination)
+      applyContextSink(ctx).catch(() => {})
+      return {
+        analyser: null,
+        teardown: () => { try { mediaSource.disconnect() } catch { /* ignore */ } },
+      }
+    } catch { /* ignore */ }
+    return null
+  }
+
+  audioEl.addEventListener('ended', teardown)
+  audioEl.addEventListener('error', teardown)
+  audioEl.addEventListener('pause', teardown)
+  return { analyser, teardown }
 }

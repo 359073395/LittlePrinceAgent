@@ -3,9 +3,16 @@
 
 import { buildToolCatalogText } from './auto-catalog.js'
 import { getAppVersion } from '../version.js'
+import { listCapabilities } from '../capabilities/capability-registry.js'
 
 // 在模块加载时生成一次工具清单文本（纯数据派生，无副作用）。
 const TOOL_CATALOG_TEXT = buildToolCatalogText()
+
+// 能力清单文本（派生自 capability-registry.js，杜绝漂移）。能力 = 工作流上下文 + 配套工具 +
+// 运行时数据预喂，由情境触发打包注入；新增能力自动出现在这里，无需手改本文档。
+const CAPABILITY_LIST_TEXT = listCapabilities()
+  .map(c => `  - ${c.label}（${c.id}）：${c.summary}\n      工具：${c.tools.length ? c.tools.join('、') : '随上下文加载'}`)
+  .join('\n')
 
 // 当前应用版本（从 package.json 派生，升级自动跟上，不手写）。
 const APP_VERSION = getAppVersion()
@@ -134,6 +141,14 @@ export const SELF_KNOWLEDGE_TOPICS = {
 ■ capabilities/sandbox.js —— 文件/命令沙箱隔离；set_security 经用户确认才放开
 ■ capabilities/marketplace/ —— install_tool 动态安装的扩展工具，下一轮即可调用
 ■ memory/tool-router.js + find_tool —— 每轮按消息加载相关工具子集，缺什么现场调取
+■ capabilities/capability-registry.js —— 「能力机制」唯一真相源：把一个领域的「工作流上下文 +
+   配套工具 + 运行时数据预喂」收敛成一个声明式单元，由情境触发整体注入。工具半（tool-router）、
+   工作流半（prompt 块）、数据半（runtime-injector 预喂）都从这里读，find_tool 也据此发现能力并
+   回带「怎么用」的工作流摘要——所以这些能力既能被关键词自动唤起，也能被我按需主动激活。
+
+我当前具备的能力（自动生成，随注册表增长）：
+
+${CAPABILITY_LIST_TEXT}
 
 当前内置工具清单（自动生成）：
 
@@ -187,10 +202,10 @@ Key 配置：serper / brave / tavily / jina / searxng，存在 config.json 顶�
       },
       {
         title: 'AI 视频生成',
-        content: `generate_video 工具接火山方舟 Ark 的 Seedance 模型，配独立的右侧"AI 视频生成"面板：
+        content: `右侧"AI 视频生成"面板接火山方舟 Ark 的 Seedance 模型：
   - 文生视频 / 图生视频（首帧或首尾帧）双模式
   - 异步：提交任务 → 面板进"生成中" → 后台轮询（约 1–5 分钟）→ 自动播放，无需再调
-  - 未配置时靠工具返回值引导用户发 Key（"火山视频 <APIKEY>"）自动配置
+  - 未配置时可引导用户发 Key（"火山视频 <APIKEY>"）自动配置
   - 配置存独立的 seedance.json（不与主 config 互相覆盖）`,
       },
       {
@@ -213,9 +228,9 @@ Key 配置：serper / brave / tavily / jina / searxng，存在 config.json 顶�
   ui_design: {
     id: 'ui_design',
     title: '白龙马界面设计',
-    subtitle: 'BaiLongma UI & ACUI Design',
+    subtitle: 'BaiLongma UI & Scene Design',
     icon: '🖥',
-    summary: '白龙马的界面叫 Brain UI，运行在 Electron 渲染进程。核心是 ACUI（Agent 控制 + 感知 双柱架构）：Agent 既能控制界面，也能感知界面状态。以下是界面各部分的设计说明。',
+    summary: '白龙马的界面叫 Brain UI，运行在 Electron 渲染进程。Agent 通过声明式 Scene 协议驱动界面（UI = f(scene)），并能感知界面状态。以下是界面各部分的设计说明。',
     sections: [
       {
         title: 'Brain UI 总览',
@@ -229,39 +244,39 @@ Key 配置：serper / brave / tavily / jina / searxng，存在 config.json 顶�
 整体是"一边聊天 + 一边可被 Agent 驱动的可视化舞台"的布局。`,
       },
       {
-        title: 'ACUI：控制 + 感知 双柱架构',
-        content: `ACUI（src/ui/brain-ui/acui/）让 Agent 既能"控制"界面也能"感知"界面，是白龙马区别于普通聊天框的关键。
+        title: 'Scene：声明式 Agent-UI',
+        content: `Scene 协议（src/scene/ + src/ui/scene-shell/）让 Agent 用一个幂等动词驱动界面：UI = f(scene)。core 持有唯一真相源 scene，Agent 通过 ui_set(id, surface|null) 增删改一个 surface；scene-shell 是 scene 的纯投影，握有前后两帧自行做 enter/exit/morph 动画；用户交互以 intent 回流。
 
-■ 模块：bootstrap.js（启动）、client.js（前端接收）、registry.js（组件注册表）、renderer.js（渲染）、components/（内置组件）
-■ 三种执行模式（优先级 A > B > C）：
-  - 模式 A：调用已注册组件（如 WeatherCard），ui_show(component, props)
-  - 模式 B：inline-template，HTML 模板 + 数据绑定，临时一次性卡片
-  - 模式 C：inline-script，完整 Web Component，用于游戏/工具等复杂交互
-■ ui_register 转正：inline 组件多次成功且用户留存好时，promote 成永久组件（写 .js + 注册 + 落 skill.ui 记忆），以后直接 ui_show
-■ 控制工具：ui_show / ui_update / ui_patch / ui_hide / manage_app（保存可重开的 app）
+■ 模块：core 侧 scene-store.js（SceneStore 唯一真相源/幂等/rev）、scene-server.js（/scene WS 传输）、tools/scene.js（ui_set 工具）；前端 scene-shell/（client.js 传输 + shell.js applyScene + kinds/ 渲染器）
+■ 唯一动词 ui_set：set(id, surface) 挂载/morph，set(id, null) 收起；同一 id 重复 set 即 morph（shell 自行算前后帧差做动画）
+■ kinds 词汇表：text / metric / image / choice / weather / selfcheck / awakening + 排版原语 stack / row / col 组合长尾内容
+■ intent：surface 带 ambient（背景陈列）/ confront（必须停下决策，居中聚焦）等，决定它在舞台上的存在感
+■ 明确不让 Agent 注入 HTML/JS 代码——长尾用排版原语拼，保证投影层可控
 
-设计与组件约定详见 acui/AGENT_GUIDE.md。`,
+规范契约详见仓库根 SCENE-PROTOCOL.md，理念见 Agent-驱动UI-设计方案.md。`,
       },
       {
-        title: '显示模式与卡片形态',
-        content: `ui_show 的 hint.placement 决定卡片怎么出现：
-  - notification —— 右上角堆叠滑入（默认）
-  - center —— 居中 + 半透明遮罩
-  - floating —— 自由可拖拽浮层
-  - stage —— 全屏舞台
+        title: '形态由 shell 决定，不由 Agent 摆放',
+        content: `和旧架构最大的不同：Agent 不再指定像素/placement/动画。core 只声明 surface 的语义（kind + intent + data），具体怎么出现、放哪、用什么过渡，全由 scene-shell 依 intent 和前后帧自行决定。
 
-尺寸 sm/md/lg/xl 或像素对象；enter/exit 动画按 placement 推断。
-原则：仅当"可视化比纯文字更清楚"时才推卡片，普通问答不主动弹。`,
+■ intent=ambient —— 背景陈列，温和入场，不抢焦点（如天气）
+■ intent=confront —— 必须停下决策，背景退后、居中聚焦（如安全确认 choice）
+■ 同 id 再 set —— shell 做 morph（就地变形，不重放入场），用于自检逐步推进等
+■ set(id,null) —— 退场动画后移除
+
+原则：仅当"可视化比纯文字更清楚"时才 ui_set，普通问答不主动投影。`,
       },
       {
         title: '功能面板',
         content: `Brain UI 的几个专用面板，都由对应工具驱动：
   - 媒体舞台（media_mode）—— 右侧视频/音乐唱片机、左侧图像；视频按平台选择（CN 优先 B 站）
   - 热点面板（hotspot_mode）—— hotspot.js / hotspot-earth.js / hotspot-panel.js，热搜可视化
+  - 世界杯面板（worldcup_mode）—— worldcup.js / worldcup-panel.js 是 iframe 壳，内容为转播大屏页 worldcup-broadcast-v2.html：焦点比赛/赛程比分/小组积分榜/世界杯新闻（数据源直播吧，北京时间），面板打开时赛况自动注入上下文
   - 人物卡（person_card_mode）—— person-card.js，用户不认识某人时弹公众人物介绍
   - 文档面板（open_doc_panel）—— doc.js / doc-panel.js，配置与自知识文档（本页就是它），内容注入上下文 30 分钟
   - 语音面板（voice-panel.js）—— 语音输入/输出与设置
-  - 微信连接弹窗（wechat-popup.js + connect_wechat）—— 扫码挂载个人微信`,
+  - 微信连接弹窗（wechat-popup.js + connect_wechat）—— 扫码挂载个人微信
+  - 飞书连接弹窗（feishu-popup.js + connect_feishu）—— 长连接模式：填 App ID/Secret 即收发，无需公网地址`,
       },
       {
         title: 'Focus Banner 专注横幅',
@@ -294,7 +309,7 @@ export function detectSelfKnowledgeTopic(text) {
 
   // 界面 / UI 设计相关（优先于通用架构，命中更具体）
   if (
-    /(你的界面|你.*长什么样|界面设计|ui.*设计|acui|brain.?ui|可视化卡片|ui_show|ui_register|显示模式|浮层|横幅|focus.?banner|专注横幅|思维流|thought.?stream|你的.*面板|面板.*设计|dashboard.*风格|turn.?trace|回合.*回放)/.test(
+    /(你的界面|你.*长什么样|界面设计|ui.*设计|scene|brain.?ui|可视化卡片|ui_set|surface|显示模式|浮层|横幅|focus.?banner|专注横幅|思维流|thought.?stream|你的.*面板|面板.*设计|dashboard.*风格|turn.?trace|回合.*回放)/.test(
       t
     )
   ) {

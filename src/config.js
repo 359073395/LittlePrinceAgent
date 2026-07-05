@@ -1,4 +1,6 @@
+import './network-proxy.js'
 import fs from 'fs'
+import path from 'path'
 import { paths } from './paths.js'
 import { nowTimestamp } from './time.js'
 
@@ -12,11 +14,11 @@ export const MIMO_PROVIDER = 'mimo'
 
 export const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-pro'
 export const DEFAULT_MINIMAX_MODEL = 'MiniMax-M2.7'
-export const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini'
+export const DEFAULT_OPENAI_MODEL = 'gpt-5.5'
 export const DEFAULT_QWEN_MODEL = 'qwen-turbo'
-export const DEFAULT_MOONSHOT_MODEL = 'moonshot-v1-8k'
-export const DEFAULT_ZHIPU_MODEL = 'glm-4-flash'
-export const DEFAULT_MIMO_MODEL = 'mimo-v2.5'
+export const DEFAULT_MOONSHOT_MODEL = 'kimi-k2.6'
+export const DEFAULT_ZHIPU_MODEL = 'glm-5.1'
+export const DEFAULT_MIMO_MODEL = 'mimo-v2.5-pro'
 
 export const DEEPSEEK_MODELS = [
   {
@@ -56,13 +58,113 @@ export const MINIMAX_MODELS = [
 
 export const OPENAI_MODELS = [
   {
-    id: 'gpt-4o-mini',
-    label: 'gpt-4o-mini',
+    id: 'gpt-5.5',
+    label: 'GPT-5.5',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.5-2026-04-23',
+    label: 'GPT-5.5 (2026-04-23)',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.4',
+    label: 'GPT-5.4',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.4-2026-03-05',
+    label: 'GPT-5.4 (2026-03-05)',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.4-mini',
+    label: 'GPT-5.4 mini',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.4-nano',
+    label: 'GPT-5.4 nano',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.3-chat-latest',
+    label: 'GPT-5.3 Chat latest',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.2',
+    label: 'GPT-5.2',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.2-chat-latest',
+    label: 'GPT-5.2 Chat latest',
+    deprecated: true,
+  },
+  {
+    id: 'gpt-5.1',
+    label: 'GPT-5.1',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5.1-chat-latest',
+    label: 'GPT-5.1 Chat latest',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5',
+    label: 'GPT-5',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5-chat-latest',
+    label: 'GPT-5 Chat latest',
+    deprecated: true,
+  },
+  {
+    id: 'gpt-5-mini',
+    label: 'GPT-5 mini',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-5-nano',
+    label: 'GPT-5 nano',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-4.1',
+    label: 'GPT-4.1',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-4.1-mini',
+    label: 'GPT-4.1 mini',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-4.1-nano',
+    label: 'GPT-4.1 nano',
     deprecated: false,
   },
   {
     id: 'gpt-4o',
-    label: 'gpt-4o',
+    label: 'GPT-4o',
+    deprecated: false,
+  },
+  {
+    id: 'gpt-4o-mini',
+    label: 'GPT-4o mini',
+    deprecated: false,
+  },
+  {
+    id: 'o3',
+    label: 'o3',
+    deprecated: false,
+  },
+  {
+    id: 'o4-mini',
+    label: 'o4-mini',
     deprecated: false,
   },
 ]
@@ -82,8 +184,23 @@ export const QWEN_MODELS = [
 
 export const MOONSHOT_MODELS = [
   {
-    id: 'moonshot-v1-8k',
-    label: 'moonshot-v1-8k',
+    id: 'kimi-k2.7-code',
+    label: 'kimi-k2.7-code',
+    deprecated: false,
+  },
+  {
+    id: 'kimi-k2.7-code-highspeed',
+    label: 'kimi-k2.7-code-highspeed',
+    deprecated: false,
+  },
+  {
+    id: 'kimi-k2.6',
+    label: 'kimi-k2.6',
+    deprecated: false,
+  },
+  {
+    id: 'kimi-k2.5',
+    label: 'kimi-k2.5',
     deprecated: false,
   },
   {
@@ -91,30 +208,115 @@ export const MOONSHOT_MODELS = [
     label: 'moonshot-v1-32k',
     deprecated: false,
   },
+  {
+    id: 'moonshot-v1-128k',
+    label: 'moonshot-v1-128k',
+    deprecated: false,
+  },
+  {
+    id: 'moonshot-v1-8k',
+    label: 'moonshot-v1-8k',
+    deprecated: false,
+  },
+  {
+    id: 'moonshot-v1-8k-vision-preview',
+    label: 'moonshot-v1-8k-vision-preview',
+    deprecated: false,
+  },
+  {
+    id: 'moonshot-v1-32k-vision-preview',
+    label: 'moonshot-v1-32k-vision-preview',
+    deprecated: false,
+  },
+  {
+    id: 'moonshot-v1-128k-vision-preview',
+    label: 'moonshot-v1-128k-vision-preview',
+    deprecated: false,
+  },
+  {
+    id: 'kimi-k2-thinking',
+    label: 'kimi-k2-thinking (deprecated)',
+    deprecated: true,
+  },
 ]
 
 export const ZHIPU_MODELS = [
   {
-    id: 'glm-4-flash',
-    label: 'glm-4-flash',
+    id: 'glm-5.1',
+    label: 'glm-5.1',
     deprecated: false,
   },
   {
-    id: 'glm-4-plus',
-    label: 'glm-4-plus',
+    id: 'glm-5-turbo',
+    label: 'glm-5-turbo',
+    deprecated: false,
+  },
+  {
+    id: 'glm-5',
+    label: 'glm-5',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4.7',
+    label: 'glm-4.7',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4.7-flash',
+    label: 'glm-4.7-flash',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4.7-flashx',
+    label: 'glm-4.7-flashx',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4.6',
+    label: 'glm-4.6',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4.5-air',
+    label: 'glm-4.5-air',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4.5-airx',
+    label: 'glm-4.5-airx',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4.5-flash',
+    label: 'glm-4.5-flash',
+    deprecated: false,
+  },
+  {
+    id: 'glm-5.1-highspeed',
+    label: 'glm-5.1-highspeed (limited access)',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4-flash-250414',
+    label: 'glm-4-flash-250414',
+    deprecated: false,
+  },
+  {
+    id: 'glm-4-flashx-250414',
+    label: 'glm-4-flashx-250414',
     deprecated: false,
   },
 ]
 
 export const MIMO_MODELS = [
   {
-    id: 'mimo-v2.5',
-    label: 'MiMo-V2.5',
+    id: 'mimo-v2.5-pro',
+    label: 'MiMo-V2.5-Pro',
     deprecated: false,
   },
   {
-    id: 'mimo-v2.5-pro',
-    label: 'MiMo-V2.5-Pro',
+    id: 'mimo-v2.5',
+    label: 'MiMo-V2.5',
     deprecated: false,
   },
   {
@@ -125,6 +327,12 @@ export const MIMO_MODELS = [
   {
     id: 'mimo-v2-flash',
     label: 'MiMo-V2-Flash',
+    deprecated: false,
+  },
+  {
+    // 极速版：保留为可选项，非默认首选（小米平台暂无此官方 ID，调用失败会自动降级到上面的真实模型）
+    id: 'MiMo-V2.5-Pro-UltraSpeed',
+    label: 'MiMo-V2.5-Pro-UltraSpeed（极速版）',
     deprecated: false,
   },
 ]
@@ -166,7 +374,7 @@ const PROVIDER_CONFIG = {
     defaultModel: DEFAULT_MOONSHOT_MODEL,
   },
   [ZHIPU_PROVIDER]: {
-    label: 'Zhipu',
+    label: '智谱 GLM',
     baseURL: 'https://open.bigmodel.cn/api/paas/v4',
     envVar: 'ZHIPU_API_KEY',
     models: ZHIPU_MODELS,
@@ -187,9 +395,63 @@ const PROBE_TIMEOUT_MS = 12000
 function normalizeModel(model, provider = DEEPSEEK_PROVIDER) {
   const pConfig = PROVIDER_CONFIG[provider] || PROVIDER_CONFIG[DEEPSEEK_PROVIDER]
   const value = String(model || '').trim()
-  const validIds = new Set(pConfig.models.map(m => m.id))
-  if (validIds.has(value)) return value
+  if (value) return value
   return pConfig.defaultModel
+}
+
+function withCurrentModel(models, model) {
+  const value = String(model || '').trim()
+  if (!value || models.some(m => m?.id === value)) return models
+  return [{ id: value, label: `${value} (custom)`, deprecated: false, custom: true }, ...models]
+}
+
+function isMoonshotKimiModel(model) {
+  return String(model || '').trim().toLowerCase().startsWith('kimi-')
+}
+
+function isMoonshotThinkingAlwaysOnModel(model) {
+  const value = String(model || '').trim().toLowerCase()
+  return value === 'kimi-k2.7-code' || value === 'kimi-k2.7-code-highspeed'
+}
+
+function isMoonshotThinkingToggleSupportedModel(model) {
+  const value = String(model || '').trim().toLowerCase()
+  return value === 'kimi-k2.6' || value === 'kimi-k2.5'
+}
+
+export function shouldOmitSamplingForProviderModel(provider, model) {
+  if (provider === OPENAI_PROVIDER && isOpenAIDefaultSamplingModel(model)) return true
+  return provider === MOONSHOT_PROVIDER && isMoonshotKimiModel(model)
+}
+
+function isOpenAIDefaultSamplingModel(model) {
+  const value = String(model || '').trim().toLowerCase()
+  return value.startsWith('gpt-5') || /^o\d/.test(value)
+}
+
+export function shouldUseMaxCompletionTokensForProviderModel(provider, model) {
+  if (provider !== OPENAI_PROVIDER) return false
+  return isOpenAIDefaultSamplingModel(model)
+}
+
+export function shouldSendThinkingDisabledForProviderModel(provider, model) {
+  if (provider === ZHIPU_PROVIDER) return true
+  if (provider !== MOONSHOT_PROVIDER) return false
+  return isMoonshotThinkingToggleSupportedModel(model) && !isMoonshotThinkingAlwaysOnModel(model)
+}
+
+export function getProviderModelFallbacks(provider, model) {
+  const pConfig = PROVIDER_CONFIG[provider]
+  if (!pConfig) return String(model || '').trim() ? [String(model).trim()] : []
+  const primary = normalizeModel(model, provider)
+  if (provider !== MIMO_PROVIDER) return [primary]
+
+  const chain = [primary]
+  for (const item of pConfig.models) {
+    if (!item?.id || item.deprecated || chain.includes(item.id)) continue
+    chain.push(item.id)
+  }
+  return chain
 }
 
 function isThinkingEnabledForModel(model) {
@@ -206,6 +468,12 @@ function getProviderErrorMessage(err) {
   return status ? `${status} ${message}` : message
 }
 
+function isProviderAuthError(err) {
+  const status = err?.status ?? err?.response?.status
+  const message = err?.message || String(err)
+  return status === 401 || /unauthoriz|invalid.*api.*key|authentication/i.test(message)
+}
+
 function withTimeout(promise, ms, label) {
   let timer
   const timeout = new Promise((_, reject) => {
@@ -218,31 +486,48 @@ function buildPingParams(provider, model) {
   const pingParams = {
     model,
     messages: [{ role: 'user', content: 'Reply with exactly: hello' }],
-    max_tokens: 8,
-    temperature: 0,
     stream: false,
+  }
+  if (shouldUseMaxCompletionTokensForProviderModel(provider, model)) {
+    pingParams.max_completion_tokens = 32
+  } else {
+    pingParams.max_tokens = 8
+  }
+  if (!shouldOmitSamplingForProviderModel(provider, model)) {
+    pingParams.temperature = 0
   }
   if (provider === DEEPSEEK_PROVIDER) {
     pingParams.reasoning_effort = 'high'
     pingParams.thinking = { type: isThinkingEnabledForModel(model) ? 'enabled' : 'disabled' }
+  } else if (provider === ZHIPU_PROVIDER) {
+    pingParams.thinking = { type: 'disabled' }
   }
   return pingParams
 }
 
 async function probeProvider(OpenAI, provider, apiKey, requestedModel) {
   const pConfig = PROVIDER_CONFIG[provider]
-  const model = normalizeModel(requestedModel, provider)
+  const models = getProviderModelFallbacks(provider, requestedModel)
   const client = new OpenAI({
     apiKey,
     baseURL: pConfig.baseURL,
     timeout: PROBE_TIMEOUT_MS,
   })
-  await withTimeout(
-    client.chat.completions.create(buildPingParams(provider, model)),
-    PROBE_TIMEOUT_MS,
-    provider,
-  )
-  return { provider, model, pConfig }
+  const errors = []
+  for (const model of models) {
+    try {
+      await withTimeout(
+        client.chat.completions.create(buildPingParams(provider, model)),
+        PROBE_TIMEOUT_MS,
+        provider,
+      )
+      return { provider, model, pConfig }
+    } catch (err) {
+      if (isProviderAuthError(err)) throw err
+      errors.push(`${model}: ${getProviderErrorMessage(err)}`)
+    }
+  }
+  throw new Error(`${provider} validation failed for models ${models.join(', ')}: ${errors.join(' | ')}`)
 }
 
 async function detectProvider(OpenAI, apiKey, requestedModel) {
@@ -278,6 +563,50 @@ function resolveProviderId(provider) {
   return LEGACY_PROVIDER_ALIASES[p] || p
 }
 
+function getLlmConfigFile(provider) {
+  const p = resolveProviderId(provider)
+  if (p !== 'custom' && !PROVIDER_CONFIG[p]) return null
+  return path.join(paths.llmConfigDir, `${p}.json`)
+}
+
+function readLlmProviderConfig(provider) {
+  const file = getLlmConfigFile(provider)
+  if (!file) return null
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'))
+    return (parsed && typeof parsed === 'object') ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function writeLlmProviderConfig(provider, record) {
+  const file = getLlmConfigFile(provider)
+  if (!file) throw new Error(`Unsupported provider: "${provider}"`)
+  const tmp = `${file}.tmp`
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf-8')
+  fs.renameSync(tmp, file)
+}
+
+function resolveLlmRecord(raw, fallbackProvider) {
+  if (!raw || typeof raw !== 'object') return null
+  const provider = resolveProviderId(raw.provider || fallbackProvider)
+  if (provider === 'custom') {
+    if (typeof raw.baseURL !== 'string' || !raw.baseURL) return null
+    if (typeof raw.model !== 'string' || !raw.model) return null
+    return {
+      provider,
+      apiKey: typeof raw.apiKey === 'string' && raw.apiKey ? raw.apiKey : 'none',
+      model: raw.model,
+      baseURL: raw.baseURL,
+    }
+  }
+  if (!PROVIDER_CONFIG[provider]) return null
+  if (typeof raw.apiKey !== 'string' || !raw.apiKey) return null
+  return { provider, apiKey: raw.apiKey, model: raw.model, baseURL: raw.baseURL }
+}
+
 // 只负责把 config.json 解析成对象；文件缺失或损坏才返回 null。
 // 不在这里判断 LLM 块是否可用——那是加载逻辑的事，避免"一个字段不合法就丢掉整份文件、
 // 连带把 voice/tts/security 等兄弟字段一起重置"（升级后最常见的"配置全没了"根因）。
@@ -291,19 +620,22 @@ function readParsedConfig() {
   }
 }
 
-// 判断 config.json 里的 LLM 块能否直接激活（provider/apiKey/custom 三件套齐全）。
+// 判断旧版 config.json 里的 LLM 块能否直接激活（provider/apiKey/custom 三件套齐全）。
 // 返回规整后的 { provider, apiKey, model, baseURL }（provider 已过别名映射）；不可用则返回 null。
+function resolveLegacyStoredLlm(parsed) {
+  if (!parsed || !parsed.provider) return null
+  return resolveLlmRecord(parsed, parsed.provider)
+}
+
+function resolveStoredLlmForProvider(provider) {
+  const p = resolveProviderId(provider)
+  return resolveLlmRecord(readLlmProviderConfig(p), p)
+}
+
 function resolveStoredLlm(parsed) {
   if (!parsed || !parsed.provider) return null
   const provider = resolveProviderId(parsed.provider)
-  if (provider === 'custom') {
-    if (typeof parsed.baseURL !== 'string' || !parsed.baseURL) return null
-    if (typeof parsed.model !== 'string' || !parsed.model) return null
-    return { provider, apiKey: parsed.apiKey, model: parsed.model, baseURL: parsed.baseURL }
-  }
-  if (!PROVIDER_CONFIG[provider]) return null
-  if (typeof parsed.apiKey !== 'string' || !parsed.apiKey) return null
-  return { provider, apiKey: parsed.apiKey, model: parsed.model, baseURL: parsed.baseURL }
+  return resolveStoredLlmForProvider(provider) || resolveLegacyStoredLlm(parsed)
 }
 
 function writeStoredConfig(obj) {
@@ -326,6 +658,50 @@ function patchConfig(partial) {
   const merged = { ...readExistingStoredConfig(), ...partial }
   writeStoredConfig(merged)
   return merged
+}
+
+function withoutLegacyLlmFields(obj) {
+  const {
+    apiKey: _apiKey,
+    model: _model,
+    baseURL: _baseURL,
+    activatedAt: _activatedAt,
+    ...rest
+  } = obj || {}
+  return rest
+}
+
+function writeActiveLlmProvider(provider) {
+  const base = withoutLegacyLlmFields(readExistingStoredConfig())
+  writeStoredConfig({
+    ...base,
+    schemaVersion: CONFIG_SCHEMA_VERSION,
+    provider,
+  })
+}
+
+function persistLlmProviderConfig(record) {
+  const provider = resolveProviderId(record?.provider)
+  if (provider === 'custom') {
+    writeLlmProviderConfig('custom', {
+      provider: 'custom',
+      apiKey: String(record.apiKey || '').trim() || 'none',
+      model: String(record.model || '').trim(),
+      baseURL: String(record.baseURL || '').trim(),
+      activatedAt: record.activatedAt || new Date().toISOString(),
+    })
+    return
+  }
+
+  const pConfig = PROVIDER_CONFIG[provider]
+  if (!pConfig) throw new Error(`Unsupported provider: "${provider}"`)
+  writeLlmProviderConfig(provider, {
+    provider,
+    apiKey: String(record.apiKey || '').trim(),
+    model: normalizeModel(record.model, provider),
+    baseURL: undefined,
+    activatedAt: record.activatedAt || new Date().toISOString(),
+  })
 }
 
 function shouldAllowEnvFallback() {
@@ -385,7 +761,7 @@ function applyConfig(provider, apiKey, model, customBaseURL) {
 // 跑完写回新版本号。把历史上零散、惰性触发的"一次性迁移"（如 seedance 拆分）收编到这里，
 // 让升级路径确定、可测、可追溯，而不是散落在各 getter 里。
 // 加新迁移：CONFIG_SCHEMA_VERSION 加 1，并在 CONFIG_MIGRATIONS 里补上对应版本号的函数。
-const CONFIG_SCHEMA_VERSION = 1
+const CONFIG_SCHEMA_VERSION = 2
 
 // 每个迁移把传入的 config 对象升一级，返回新对象。允许带幂等副作用（如写独立文件）。
 const CONFIG_MIGRATIONS = {
@@ -400,6 +776,21 @@ const CONFIG_MIGRATIONS = {
     }
     const { seedance: _drop, ...rest } = cfg
     return rest
+  },
+  // v1 → v2：LLM 凭据按 provider 拆到 userData/llm/<provider>.json。
+  // config.json 只保留当前 provider 指针和 temperature/security/voice 等通用块。
+  2(cfg) {
+    const legacyLlm = resolveLegacyStoredLlm(cfg)
+    if (legacyLlm) {
+      const targetFile = getLlmConfigFile(legacyLlm.provider)
+      if (targetFile && !fs.existsSync(targetFile)) {
+        persistLlmProviderConfig({
+          ...legacyLlm,
+          activatedAt: cfg.activatedAt,
+        })
+      }
+    }
+    return withoutLegacyLlmFields(cfg)
   },
 }
 
@@ -434,10 +825,18 @@ export const config = {
   baseURL: null,
   needsActivation: true,
   temperature: 0.5,
+  // 思考模式开关：true=向 provider 传 thinking enabled（深度由模型自控），false=thinking disabled。
+  // 默认关闭——只有用户在设置里显式开启才思考。这是「用户显式选择」的开关，
+  // 不是 runtime 按难度替模型决定开关 reasoning（那条路 index.js 已注释外掉）。
+  thinking: false,
   security: {
     fileSandbox: true,
     execSandbox: true,
     blockedTools: [],
+    updatedAt: null,
+  },
+  network: {
+    allowLanAccess: false,
     updatedAt: null,
   },
 }
@@ -453,12 +852,21 @@ if (parsedConfig) {
   if (typeof parsedConfig.temperature === 'number' && parsedConfig.temperature >= 0 && parsedConfig.temperature <= 2) {
     config.temperature = parsedConfig.temperature
   }
+  // 缺字段（旧版升级 / 未开启过）按默认 false 处理 —— 无需 schema 迁移。
+  if (typeof parsedConfig.thinking === 'boolean') {
+    config.thinking = parsedConfig.thinking
+  }
   if (parsedConfig.security && typeof parsedConfig.security === 'object') {
     const s = parsedConfig.security
     if (typeof s.fileSandbox === 'boolean') config.security.fileSandbox = s.fileSandbox
     if (typeof s.execSandbox === 'boolean') config.security.execSandbox = s.execSandbox
     if (Array.isArray(s.blockedTools)) config.security.blockedTools = s.blockedTools
     if (typeof s.updatedAt === 'string') config.security.updatedAt = s.updatedAt
+  }
+  if (parsedConfig.network && typeof parsedConfig.network === 'object') {
+    const n = parsedConfig.network
+    if (typeof n.allowLanAccess === 'boolean') config.network.allowLanAccess = n.allowLanAccess
+    if (typeof n.updatedAt === 'string') config.network.updatedAt = n.updatedAt
   }
 }
 
@@ -489,7 +897,7 @@ if (storedLlm) {
   } catch {}
 })()
 
-export async function activate({ provider = AUTO_PROVIDER, apiKey, model, baseURL }) {
+export async function prepareActivation({ provider = AUTO_PROVIDER, apiKey, model, baseURL }) {
   const p = String(provider || AUTO_PROVIDER).toLowerCase()
 
   if (p === 'custom') {
@@ -518,18 +926,11 @@ export async function activate({ provider = AUTO_PROVIDER, apiKey, model, baseUR
       throw new Error(`Custom endpoint connection failed: ${message}`)
     }
 
-    applyConfig('custom', normalizedKey, normalizedModel, normalizedBaseURL)
-    writeStoredConfig({
-      ...readExistingStoredConfig(),   // 保留 voice/tts/security 等其它字段
+    return {
       provider: 'custom',
       apiKey: normalizedKey,
       model: normalizedModel,
       baseURL: normalizedBaseURL,
-      activatedAt: new Date().toISOString(),
-    })
-    return {
-      provider: 'custom',
-      model: normalizedModel,
       models: [{ id: normalizedModel, label: normalizedModel, deprecated: false }],
     }
   }
@@ -548,30 +949,18 @@ export async function activate({ provider = AUTO_PROVIDER, apiKey, model, baseUR
   const { default: OpenAI } = await import('openai')
   if (p === AUTO_PROVIDER) {
     const detected = await detectProvider(OpenAI, normalizedKey, model)
-    applyConfig(detected.provider, normalizedKey, detected.model)
-    writeStoredConfig({
-      ...readExistingStoredConfig(),   // 保留其它字段
+    return {
       provider: detected.provider,
       apiKey: normalizedKey,
       model: detected.model,
-      baseURL: undefined,              // 非 custom：清掉可能残留的旧 baseURL
-      activatedAt: new Date().toISOString(),
-    })
-    return {
-      provider: detected.provider,
-      model: detected.model,
-      models: detected.pConfig.models,
+      baseURL: undefined,
+      models: withCurrentModel(detected.pConfig.models, detected.model),
     }
   }
 
-  const client = new OpenAI({ apiKey: normalizedKey, baseURL: pConfig.baseURL, timeout: PROBE_TIMEOUT_MS })
-
+  let detected
   try {
-    await withTimeout(
-      client.chat.completions.create(buildPingParams(p, normalizedModel)),
-      PROBE_TIMEOUT_MS,
-      p,
-    )
+    detected = await probeProvider(OpenAI, p, normalizedKey, normalizedModel)
   } catch (err) {
     const message = err?.message || String(err)
     if (/401|unauthoriz|invalid.*api.*key|authentication/i.test(message)) {
@@ -580,21 +969,71 @@ export async function activate({ provider = AUTO_PROVIDER, apiKey, model, baseUR
     throw new Error(`${p} validation failed: ${message}`)
   }
 
+  return {
+    provider: p,
+    apiKey: normalizedKey,
+    model: detected.model,
+    baseURL: undefined,
+    models: withCurrentModel(pConfig.models, detected.model),
+  }
+}
+
+export function commitPreparedActivation(prepared) {
+  const p = String(prepared?.provider || '').toLowerCase()
+
+  if (p === 'custom') {
+    const normalizedBaseURL = String(prepared.baseURL || '').trim()
+    const normalizedModel = String(prepared.model || '').trim()
+    const normalizedKey = String(prepared.apiKey || '').trim() || 'none'
+    if (!normalizedBaseURL) throw new Error('Custom endpoint requires a Base URL')
+    if (!normalizedModel) throw new Error('Custom endpoint requires a model name')
+
+    applyConfig('custom', normalizedKey, normalizedModel, normalizedBaseURL)
+    persistLlmProviderConfig({
+      provider: 'custom',
+      apiKey: normalizedKey,
+      model: normalizedModel,
+      baseURL: normalizedBaseURL,
+      activatedAt: new Date().toISOString(),
+    })
+    writeActiveLlmProvider('custom')
+    return {
+      provider: 'custom',
+      model: normalizedModel,
+      models: [{ id: normalizedModel, label: normalizedModel, deprecated: false }],
+    }
+  }
+
+  const pConfig = PROVIDER_CONFIG[p]
+  if (!pConfig) {
+    throw new Error(`Unsupported provider: "${p}". Available: ${Object.keys(PROVIDER_CONFIG).join(', ')}`)
+  }
+
+  const normalizedKey = String(prepared.apiKey || '').trim()
+  const normalizedModel = normalizeModel(prepared.model, p)
+  if (normalizedKey.length < 8) {
+    throw new Error(`${p} key is invalid`)
+  }
+
   applyConfig(p, normalizedKey, normalizedModel)
-  writeStoredConfig({
-    ...readExistingStoredConfig(),   // 保留 voice/tts/security 等其它字段
+  persistLlmProviderConfig({
     provider: p,
     apiKey: normalizedKey,
     model: normalizedModel,
-    baseURL: undefined,              // 非 custom：清掉可能残留的旧 baseURL
     activatedAt: new Date().toISOString(),
   })
+  writeActiveLlmProvider(p)
 
   return {
     provider: p,
     model: normalizedModel,
-    models: pConfig.models,
+    models: withCurrentModel(pConfig.models, normalizedModel),
   }
+}
+
+export async function activate({ provider = AUTO_PROVIDER, apiKey, model, baseURL }) {
+  const prepared = await prepareActivation({ provider, apiKey, model, baseURL })
+  return commitPreparedActivation(prepared)
 }
 
 export function getActivationStatus() {
@@ -605,7 +1044,7 @@ export function getActivationStatus() {
     provider: config.provider,
     model: config.model,
     baseURL: config.provider === 'custom' ? config.baseURL : undefined,
-    models: pConfig ? pConfig.models : customModels,
+    models: pConfig ? withCurrentModel(pConfig.models, config.model) : customModels,
     defaultModel: pConfig ? pConfig.defaultModel : (config.model || DEFAULT_DEEPSEEK_MODEL),
   }
 }
@@ -613,13 +1052,28 @@ export function getActivationStatus() {
 export function getProviderSummaries() {
   const result = Object.fromEntries(Object.entries(PROVIDER_CONFIG).map(([name, pConfig]) => [
     name,
-    {
+    (() => {
+      const stored = resolveStoredLlmForProvider(name)
+      return {
       label: pConfig.label || name,
-      models: pConfig.models,
+      models: withCurrentModel(pConfig.models, stored?.model),
       defaultModel: pConfig.defaultModel,
-    },
+      configured: !!stored,
+      apiKey: stored?.apiKey || '',
+      model: stored?.model ? normalizeModel(stored.model, name) : pConfig.defaultModel,
+    }
+    })(),
   ]))
-  result.custom = { label: 'Custom Endpoint', models: [], defaultModel: '' }
+  const custom = resolveStoredLlmForProvider('custom')
+  result.custom = {
+    label: 'Custom Endpoint',
+    models: [],
+    defaultModel: '',
+    configured: !!custom,
+    apiKey: custom?.apiKey || '',
+    model: custom?.model || '',
+    baseURL: custom?.baseURL || '',
+  }
   return result
 }
 
@@ -640,13 +1094,98 @@ export function switchModel(model) {
     const trimmed = String(model || '').trim()
     if (!trimmed) throw new Error('Model name cannot be empty')
     config.model = trimmed
-    patchConfig({ model: trimmed })
+    persistLlmProviderConfig({
+      provider: 'custom',
+      apiKey: config.apiKey,
+      model: trimmed,
+      baseURL: config.baseURL,
+      activatedAt: readLlmProviderConfig('custom')?.activatedAt,
+    })
     return { provider: 'custom', model: trimmed }
   }
   const normalized = normalizeModel(model, config.provider)
   config.model = normalized
-  patchConfig({ model: normalized })
+  persistLlmProviderConfig({
+    provider: config.provider,
+    apiKey: config.apiKey,
+    model: normalized,
+    activatedAt: readLlmProviderConfig(config.provider)?.activatedAt,
+  })
   return { provider: config.provider, model: normalized }
+}
+
+export function switchProviderConfig({ provider, model } = {}) {
+  const p = resolveProviderId(provider)
+  if (p === AUTO_PROVIDER) throw new Error('Auto-detect requires an API key')
+  const stored = resolveStoredLlmForProvider(p)
+  if (!stored) {
+    throw new Error(`No saved ${p} configuration. Enter the API key once to save it.`)
+  }
+
+  if (p === 'custom') {
+    const nextModel = String(model || stored.model || '').trim()
+    if (!nextModel) throw new Error('Model name cannot be empty')
+    applyConfig('custom', stored.apiKey || 'none', nextModel, stored.baseURL)
+    persistLlmProviderConfig({
+      provider: 'custom',
+      apiKey: stored.apiKey || 'none',
+      model: nextModel,
+      baseURL: stored.baseURL,
+      activatedAt: readLlmProviderConfig('custom')?.activatedAt,
+    })
+    writeActiveLlmProvider('custom')
+    return {
+      provider: 'custom',
+      model: nextModel,
+      models: [{ id: nextModel, label: nextModel, deprecated: false }],
+    }
+  }
+
+  const nextModel = normalizeModel(model || stored.model, p)
+  applyConfig(p, stored.apiKey, nextModel)
+  persistLlmProviderConfig({
+    provider: p,
+    apiKey: stored.apiKey,
+    model: nextModel,
+    activatedAt: readLlmProviderConfig(p)?.activatedAt,
+  })
+  writeActiveLlmProvider(p)
+  return {
+    provider: p,
+    model: nextModel,
+    models: withCurrentModel(PROVIDER_CONFIG[p].models, nextModel),
+  }
+}
+
+export async function saveLLMSettings({ provider = AUTO_PROVIDER, apiKey, model, baseURL } = {}) {
+  const p = String(provider || AUTO_PROVIDER).toLowerCase()
+  const trimmedKey = String(apiKey || '').trim()
+
+  if (p === 'custom') {
+    const stored = resolveStoredLlmForProvider('custom')
+    const nextKey = trimmedKey || stored?.apiKey || 'none'
+    const nextModel = String(model || stored?.model || '').trim()
+    const nextBaseURL = String(baseURL || stored?.baseURL || '').trim()
+    const prepared = await prepareActivation({
+      provider: 'custom',
+      apiKey: nextKey,
+      model: nextModel,
+      baseURL: nextBaseURL,
+    })
+    return commitPreparedActivation(prepared)
+  }
+
+  if (trimmedKey || p === AUTO_PROVIDER) {
+    if (!trimmedKey) throw new Error('API key is required to auto-detect a provider')
+    const prepared = await prepareActivation({
+      provider: p,
+      apiKey: trimmedKey,
+      model,
+    })
+    return commitPreparedActivation(prepared)
+  }
+
+  return switchProviderConfig({ provider: p, model })
 }
 
 export function setTemperature(t) {
@@ -654,6 +1193,13 @@ export function setTemperature(t) {
   config.temperature = v
   patchConfig({ temperature: v })
   return { temperature: v }
+}
+
+export function setThinking(enabled) {
+  const v = !!enabled
+  config.thinking = v
+  patchConfig({ thinking: v })
+  return { thinking: v }
 }
 
 export function getSecurity() {
@@ -678,6 +1224,27 @@ export function setSecurity(updates) {
   if (changed) config.security.updatedAt = nowTimestamp()
   patchConfig({ security: { ...config.security } })
   return getSecurity()
+}
+
+export function getNetworkConfig() {
+  return {
+    allowLanAccess: !!config.network.allowLanAccess,
+    updatedAt: config.network.updatedAt || null,
+  }
+}
+
+export function setNetworkConfig(updates) {
+  const before = getNetworkConfig()
+  if (typeof updates.allowLanAccess === 'boolean') {
+    config.network.allowLanAccess = updates.allowLanAccess
+  }
+  const changed = before.allowLanAccess !== config.network.allowLanAccess
+  if (changed) config.network.updatedAt = nowTimestamp()
+  patchConfig({ network: { ...config.network } })
+  return {
+    ...getNetworkConfig(),
+    restartRequired: changed,
+  }
 }
 
 export function getMinimaxKey() {
@@ -956,24 +1523,28 @@ export function setTTSConfig(updates) {
 }
 
 // ── Embedding config ──────────────────────────────────────────────────────────
-// Embedding 与 chat provider 完全独立。DeepSeek/Moonshot 没 embedding API，
-// 所以必须分开存。结构：config.json 的 "embedding" 块。
-//
-// 字段：
-//   provider:   'openai' | 'qwen' | 'zhipu' | 'minimax' | 'custom'
-//   model:      模型名（参考 EMBEDDING_PROVIDER_PRESETS）
-//   apiKey:     凭证（明文存储，与现有 chat apiKey 一样）
-//   baseURL:    custom 时必填；其他 provider 留空走预设
-//   dimensions: 可选，仅 OpenAI text-embedding-3-* 系列支持显式指定
+// 记忆向量召回只用本地离线模型（transformers.js + onnxruntime-node 跑 ONNX），不依赖任何云端 API。
+// 零配置开箱即用：config.json 的 "embedding" 块可不存在；存在时仅 model / timeoutMs 有意义。
+//   model:     本地 ONNX 模型 HF 仓库 id（缺省走 LOCAL_DEFAULT_MODEL）
+//   timeoutMs: 可选，覆盖向量召回硬超时（默认 1500ms）
+// 首次运行会下载 ~330MB 中文嵌入模型到 userData/data/models，之后离线可用。
 
-const EMBEDDING_CONFIG_KEYS = ['provider', 'model', 'apiKey', 'baseURL', 'dimensions']
+const EMBEDDING_CONFIG_KEYS = ['model', 'timeoutMs']
 
+// 本地默认模型：中文为主、量化后体积/速度均衡的小型 ONNX 模型。
+const LOCAL_DEFAULT_MODEL = 'Xenova/bge-large-zh-v1.5'
+const LOCAL_DEFAULT_DIMS = 1024
+
+// 解析有效本地模型名：只认 HF 仓库 id 形态（owner/name），过滤掉残留的云端模型名
+// （如 'text-embedding-3-small'），避免拿云端名当本地模型加载导致召回静默失效。
+function resolveLocalModel(stored) {
+  const m = typeof stored?.model === 'string' ? stored.model.trim() : ''
+  return /^[^/\s]+\/[^/\s]+$/.test(m) ? m : LOCAL_DEFAULT_MODEL
+}
+
+// 仅保留 local 预设（云端 provider 已移除）。供 api 的 /settings/embedding 视图使用。
 export const EMBEDDING_PROVIDER_PRESETS = {
-  openai:  { baseURL: 'https://api.openai.com/v1',                          defaultModel: 'text-embedding-3-small', defaultDims: 1536 },
-  qwen:    { baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',  defaultModel: 'text-embedding-v2',      defaultDims: 1536 },
-  zhipu:   { baseURL: 'https://open.bigmodel.cn/api/paas/v4',               defaultModel: 'embedding-3',            defaultDims: 2048 },
-  minimax: { baseURL: 'https://api.minimax.chat/v1',                        defaultModel: 'embo-01',                defaultDims: 1536 },
-  custom:  { baseURL: '',                                                   defaultModel: '',                       defaultDims: 1536 },
+  local: { baseURL: '', defaultModel: LOCAL_DEFAULT_MODEL, defaultDims: LOCAL_DEFAULT_DIMS, local: true },
 }
 
 let _embeddingBlockCache = null
@@ -1007,31 +1578,25 @@ function readEmbeddingBlock() {
   return block
 }
 
-// 前端可见视图：不暴露 apiKey 明文，只暴露 configured 布尔
+// 前端可见视图。provider 恒为 'local'，model 缺省走默认，永远 configured=true（零配置）。
 export function getEmbeddingConfig() {
   const stored = readEmbeddingBlock()
-  const provider = typeof stored.provider === 'string' ? stored.provider : ''
-  const model    = typeof stored.model === 'string'    ? stored.model    : ''
-  const baseURL  = typeof stored.baseURL === 'string'  ? stored.baseURL  : ''
-  const dimensions = Number.isFinite(stored.dimensions) ? stored.dimensions : null
-  const configured = !!(stored.apiKey && model)
-  return { provider, model, baseURL, dimensions, configured }
+  const model = resolveLocalModel(stored)
+  const timeoutMs = Number.isFinite(stored.timeoutMs) ? stored.timeoutMs : null
+  return { provider: 'local', model, dimensions: LOCAL_DEFAULT_DIMS, timeoutMs, configured: true }
 }
 
-// Backend-only：读明文 apiKey。供 src/embedding.js 内部用，不要给前端。
+// Backend-only：供 src/embedding.js 内部用。强制本地，忽略任何残留的云端字段。
 export function getEmbeddingCredentials() {
   const stored = readEmbeddingBlock()
-  const provider = typeof stored.provider === 'string' ? stored.provider : ''
-  let baseURL = typeof stored.baseURL === 'string' && stored.baseURL ? stored.baseURL : ''
-  if (!baseURL && provider && EMBEDDING_PROVIDER_PRESETS[provider]) {
-    baseURL = EMBEDDING_PROVIDER_PRESETS[provider].baseURL || ''
-  }
+  const model = resolveLocalModel(stored)
   return {
-    provider,
-    model:      typeof stored.model === 'string'  ? stored.model  : '',
-    apiKey:     typeof stored.apiKey === 'string' ? stored.apiKey : '',
-    baseURL,
-    dimensions: Number.isFinite(stored.dimensions) ? stored.dimensions : null,
+    provider: 'local',
+    model,
+    apiKey: '',
+    baseURL: '',
+    dimensions: LOCAL_DEFAULT_DIMS,
+    timeoutMs: Number.isFinite(stored.timeoutMs) ? stored.timeoutMs : null,
   }
 }
 
@@ -1041,10 +1606,10 @@ export function setEmbeddingConfig(updates) {
   const next = { ...current }
   for (const [key, val] of Object.entries(updates || {})) {
     if (!EMBEDDING_CONFIG_KEYS.includes(key)) continue
-    if (key === 'dimensions') {
+    if (key === 'dimensions' || key === 'timeoutMs') {
       const n = Number(val)
-      if (Number.isFinite(n) && n > 0) next.dimensions = n
-      else delete next.dimensions
+      if (Number.isFinite(n) && n > 0) next[key] = n
+      else delete next[key]
       continue
     }
     const trimmed = String(val || '').trim()
@@ -1143,7 +1708,11 @@ export const __internals = {
   MOONSHOT_MODELS,
   ZHIPU_MODELS,
   MIMO_MODELS,
+  getProviderModelFallbacks,
   normalizeModel,
   isThinkingEnabledForModel,
+  shouldOmitSamplingForProviderModel,
+  shouldSendThinkingDisabledForProviderModel,
+  shouldUseMaxCompletionTokensForProviderModel,
   buildPingParams,
 }

@@ -22,22 +22,29 @@
 //   - recentActionLog      最近 N 条 action_log（保活源）
 //   - installedToolNames   marketplace 已安装的扩展工具
 //   - startupSelfCheckActive  启动自检激活标志
+//   - localVisualTurn      是否能安全展示本机 UI / TTS（TUI/voice 是 true，微信等外部渠道是 false）
 //   - fastUserPath         可选——是否实时用户消息（用于"再激进省一点"，未传按 false）
 //
 // 输出：去重后的 tools: string[]
 
 import { getStatus as getTickerStatus } from '../ticker.js'
+// 已迁能力的工具名 + 工具注入选择器由能力注册表提供（单向依赖：registry 不 import 本文件）。
+import { WEB_TOOLS, HOTSPOT_TOOLS, capabilityToolsFor } from '../capabilities/capability-registry.js'
+import { shouldInjectCapabilityDemo } from '../capability-demo-intent.js'
 
 // ---- 工具分组 ----
 //
-// core：任何场景都注入。ACUI 工具默认带上（白龙马侧 Phase 1 决策，组件少 token 便宜）。
+// core：任何场景都注入。
 const CORE_TOOLS = [
   'send_message',
   'recall_memory',
   // find_tool：工具发现入口。每轮只注入约 35 个工具里命中意图的子集，模型若需要一个本轮没注入的
   // 工具（比如关键词没命中导致 generate_image / exec_command 没进来），可调 find_tool 搜出来并当场装载。
   'find_tool',
-  'ui_show', 'ui_update', 'ui_hide', 'ui_register', 'ui_patch',
+  'ui_set',
+  // voice_retire：收起悬浮语音球。常驻很轻（一个小 schema），但保证语音对话轮一定可用；
+  // 何时调由 prompt 的 Voice Orb 段（仅语音轮注入）指导，非语音轮虽在工具表但不会被提示使用。
+  'voice_retire',
 ]
 
 const TASK_CTRL_FULL    = ['set_task', 'complete_task', 'update_task_step', 'review_work']
@@ -47,14 +54,15 @@ const TASK_CTRL_OPENER  = ['set_task']  // 没任务时只暴露 set_task
 // 无任务的临时成果，靠下面这组触发词 / find_tool 主动拉进来。
 const REVIEW_TOOLS      = ['review_work']
 
-const WEB_TOOLS         = ['web_search', 'fetch_url', 'browser_read']
+// WEB_TOOLS / HOTSPOT_TOOLS 由能力注册表提供（见顶部 import）——它们既是 web/hotspot 能力的
+// 工具，也被下面的 startup self-check / media / fallback 复用。WORLDCUP_TOOLS /
+// SOFTWARE_INSTALL_TOOLS 已随能力迁出本文件。
 const FILESYSTEM_TOOLS  = ['read_file', 'write_file', 'delete_file', 'list_dir', 'make_dir']
-const EXEC_TOOLS        = ['exec_command', 'kill_process', 'list_processes']
+const EXEC_TOOLS        = ['exec_command', 'exec_quick_command', 'exec_task_command', 'exec_background_command', 'download_file', 'kill_process', 'list_processes']
 const MEDIA_TOOLS       = ['media_mode', 'music']
 const REMINDER_TOOLS    = ['manage_reminder']
 const PREFETCH_TOOLS    = ['manage_prefetch_task']
 const TICKER_TOOLS      = ['set_tick_interval']
-const HOTSPOT_TOOLS     = ['hotspot_mode']
 const STARTUP_SELF_CHECK_TOOLS = [
   'speak',
   'complete_startup_self_check',
@@ -65,10 +73,13 @@ const STARTUP_SELF_CHECK_TOOLS = [
 ]
 const PERSON_CARD_TOOLS = ['person_card_mode']
 const FOCUS_BANNER_TOOLS = ['focus_banner']
+const TERMINAL_STREAM_TOOLS = ['terminal_stream']
+const CAPABILITY_DEMO_TOOLS = ['capability_demo']
 const ADMIN_TOOLS       = [
-  'install_tool', 'uninstall_tool', 'list_tools',
-  'set_security', 'connect_wechat',
-  'set_location', 'set_agent_name', 'manage_app', 'manage_rule',
+  'manage_tool_factory', 'install_tool', 'uninstall_tool', 'list_tools',
+  'set_security', 'connect_wechat', 'connect_feishu',
+  'set_location', 'set_agent_name', 'manage_rule',
+  'manage_api_capability',
 ]
 
 // 多模态生成（按 mmCaps gate；关键词命中后才注入对应工具）
@@ -78,6 +89,10 @@ const MM_GEN_TOOLS = {
   music:  'generate_music',
   image:  'generate_image',
 }
+const INLINE_IMAGE_RE = /!\[[^\]]*]\(|\/media\/chat\/|data:image\//i
+const API_KEY_RE = /\b(?:sk|ak|rk|pk|ark)-[A-Za-z0-9_\-.]{12,180}\b/i
+const API_DOCS_RE = /https?:\/\/|api|docs?|platform|capability|endpoint|base[-_\s]?url|model|auth|\u6587\u6863|\u63a5\u53e3|\u914d\u7f6e|\u80fd\u529b/i
+const API_CONFIG_CONFIRM_RE = /^(?:yes|yep|ok|okay|sure|do it|go ahead|\u662f|\u662f\u7684|\u53ef\u4ee5|\u597d|\u597d\u7684|\u5bf9|\u884c|\u914d\u7f6e|\u914d\u4e0a|\u8bbe\u7f6e|\u8bbe\u6210)$/i
 
 // ---- 关键词触发集 ----
 //
@@ -102,13 +117,6 @@ const EXEC_TRIGGERS = [
   'bash', 'terminal', 'console',
 ]
 
-const WEB_TRIGGERS = [
-  '搜', '搜索', '查一下', '查查', '百度', '谷歌', '上网', '在线', '网页',
-  '网址', '链接', '浏览', '打开网页', '看看网上', '抓一下',
-  'search', 'google', 'bing', 'fetch', 'http://', 'https://', 'url',
-  'web', 'browser', 'browse', 'website', '.com', '.cn', '.org', '.io',
-]
-
 const MEDIA_TRIGGERS = [
   '音乐', '歌', '听', '播放', '放首', '放一首', '放点', '视频', '看视频',
   '抖音', 'b站', 'bilibili', '电影', '电视剧',
@@ -131,14 +139,10 @@ const TICKER_TRIGGERS = [
   'heartbeat', 'interval',
 ]
 
-const HOTSPOT_TRIGGERS = [
-  '热点', '热搜', '热门', '新闻', '今日', '趋势', '榜单', '头条', 'trending',
-  'news', 'hot ', 'top ', '微博热搜', '热议',
-]
-
 const PERSON_CARD_TRIGGERS = [
-  '介绍', '是谁', '是个什么人', '是什么人', '百科', '人物', '生平', '简介',
-  'who is', 'tell me about', 'wiki', 'biography', 'background',
+  '谁是', '是谁', '是誰', '是个什么人', '是個什麼人', '是什么人', '是什麼人',
+  '是干嘛的', '是幹嘛的', '人物卡片', '人物卡', 'person card',
+  'who is', 'tell me about', 'biography of', 'profile of',
 ]
 
 const FOCUS_BANNER_TRIGGERS = [
@@ -146,14 +150,31 @@ const FOCUS_BANNER_TRIGGERS = [
   'focus mode', 'banner', 'do not disturb', 'dnd', 'immersive',
 ]
 
+const TERMINAL_STREAM_TRIGGERS = [
+  '行动可视化', '文本流', '命令行窗口', '终端窗口', '黑底白字', '写文件过程', '写入过程',
+  'terminal stream', 'terminal window', 'command line window', 'progress stream',
+  'visible progress', 'show progress', 'work log window',
+]
+
+const CAPABILITY_DEMO_TRIGGERS = [
+  '你能做什么', '你会做什么', '你可以做什么', '你有什么能力', '你有哪些能力',
+  '能力展示', '功能展示', '能力演示', '功能演示',
+  'what can you do', 'capability demo', 'show capability',
+]
+
 const ADMIN_TRIGGERS = [
   '装一下', '安装', '装个', '卸载', '装好', '装上', '工具市场', '插件',
-  '安全', '沙箱', '权限', '微信', '绑定', '连接', '配对',
+  '自写工具', '自己写工具', '工具工厂', '工具审核', '生成工具', '注册工具',
+  '安全', '沙箱', '权限', '微信', '飞书', 'feishu', 'lark', '绑定', '连接', '配对',
   '位置', '在哪', '改名字', '改名', '叫你', '叫我', '管理应用', 'app 列表',
-  'install tool', 'uninstall', 'plugin', 'security', 'sandbox', 'wechat',
+  'install tool', 'tool factory', 'generated tool', 'review tool', 'register tool',
+  'uninstall', 'plugin', 'security', 'sandbox', 'wechat',
   'connect ', 'location', 'rename', 'apps',
   '规则', '关键词规则', '上下文规则', '记忆注入',
   'rule', 'rules', 'context rule', 'keyword rule', 'memory injection',
+  '能力槽', 'api能力', 'api 能力', 'api文档', 'api 文档', '配置文档', '执行说明',
+  '视觉模型', '识图模型', '图片模型', '图像模型', 'ocr 模型',
+  'capability slot', 'api capability', 'vision model',
 ]
 
 // 多模态生成专用触发（关键词必须足够具体——单字"说""画"在中文里太宽泛
@@ -176,16 +197,6 @@ const IMAGE_GEN_TRIGGERS = [
   // 注：曾包含 '画图'，但常被"没说画图"等反语命中——改用更强限定的词组
   'draw', 'paint', 'generate image', 'image of', 'picture of',
 ]
-// AI 视频生成（Seedance）专用触发。不按 mmCaps gate：即使未配置 key 也暴露工具，
-// 让模型能在"未配置"时拿到 generate_video 的引导返回值去提醒用户配置（不做硬拦截）。
-const VIDEO_GEN_TRIGGERS = [
-  '生成视频', '生成个视频', '生成一段视频', '做个视频', '做段视频', '做一段视频',
-  '文生视频', '图生视频', 'ai视频', 'ai 视频', '视频生成',
-  '帮我生成视频', '用图生成视频', '把图变成视频', '让图片动起来', '让照片动起来',
-  'seedance', '即梦', '火山视频',
-  'generate video', 'text to video', 'image to video', 'make a video', 'create a video',
-]
-
 const REVIEW_TRIGGERS = [
   '检查成果', '检查一下成果', '审视', '复查', '核对', '把关', '验收', '自检',
   '检查工作', '检查我做的', '再检查', '复核', '查验',
@@ -195,23 +206,24 @@ const REVIEW_TRIGGERS = [
 // 触发词 → 工具组的单一数据源。selectTools（按轮注入）和 find_tool（模型主动搜工具）
 // 共用它，避免两处各维护一份中文关键词。注：CORE / task / memory / 多模态 mmCaps gate 等
 // 特殊注入逻辑仍在 selectTools 里，这里只收录"纯关键词触发的专业组"，正好是 find_tool 要搜的范围。
+// 已迁能力（web/hotspot/worldcup/software-install）的触发词+工具已移入 capability-registry.js，
+// find_tool 改读注册表发现它们，故不再列于此。
 export const TOOL_GROUPS = [
   { triggers: FILESYSTEM_TRIGGERS,   tools: FILESYSTEM_TOOLS },
   { triggers: EXEC_TRIGGERS,         tools: EXEC_TOOLS },
-  { triggers: WEB_TRIGGERS,          tools: WEB_TOOLS },
   { triggers: MEDIA_TRIGGERS,        tools: MEDIA_TOOLS },
   { triggers: REMINDER_TRIGGERS,     tools: REMINDER_TOOLS },
   { triggers: PREFETCH_TRIGGERS,     tools: PREFETCH_TOOLS },
   { triggers: TICKER_TRIGGERS,       tools: TICKER_TOOLS },
-  { triggers: HOTSPOT_TRIGGERS,      tools: HOTSPOT_TOOLS },
   { triggers: PERSON_CARD_TRIGGERS,  tools: PERSON_CARD_TOOLS },
   { triggers: FOCUS_BANNER_TRIGGERS, tools: FOCUS_BANNER_TOOLS },
+  { triggers: TERMINAL_STREAM_TRIGGERS, tools: TERMINAL_STREAM_TOOLS },
+  { triggers: CAPABILITY_DEMO_TRIGGERS, tools: CAPABILITY_DEMO_TOOLS },
   { triggers: ADMIN_TRIGGERS,        tools: ADMIN_TOOLS },
   { triggers: TTS_TRIGGERS,          tools: [MM_GEN_TOOLS.tts] },
   { triggers: LYRICS_TRIGGERS,       tools: [MM_GEN_TOOLS.lyrics] },
   { triggers: MUSIC_GEN_TRIGGERS,    tools: [MM_GEN_TOOLS.music] },
   { triggers: IMAGE_GEN_TRIGGERS,    tools: [MM_GEN_TOOLS.image] },
-  { triggers: VIDEO_GEN_TRIGGERS,    tools: ['generate_video'] },
   { triggers: REVIEW_TRIGGERS,       tools: REVIEW_TOOLS },
 ]
 
@@ -221,6 +233,70 @@ function hits(body, triggers) {
   if (!body) return false
   for (const t of triggers) {
     if (body.includes(t)) return true
+  }
+  return false
+}
+
+function recentApiCapabilitySetupNeed(recentActionLog = []) {
+  if (!Array.isArray(recentActionLog)) return false
+  return recentActionLog.some(entry => {
+    const tool = String(entry?.tool || '')
+    if (tool !== 'analyze_image' && tool !== 'manage_api_capability') return false
+    const text = `${entry?.status || ''} ${entry?.error || ''} ${entry?.result_preview || ''} ${entry?.args_json || ''}`
+    return /not_configured|slot_not_found|credential_not_configured|api_key required|configure|capability/i.test(text)
+  })
+}
+
+const PERSON_CARD_NON_PERSON_SUBJECT_RE = /(?:项目|功能|系统|工具|代码|文件|文档|文章|报告|方案|计划|任务|流程|架构|设计|页面|网站|应用|app|接口|api|正则|问题|bug|卡片|面板|按钮|图片|视频|音乐|游戏|天气|热点|热搜)/i
+const PERSON_CARD_GENERIC_SUBJECT_RE = /^(?:这个人|那个人|这人|那人|这位|那位|某个人|某位|有人|谁|哪位|什么人|人物|人物卡|人物卡片)$/i
+
+function cleanPersonCardCandidate(value = '') {
+  return String(value || '')
+    .trim()
+    .replace(/^["'“”‘’「」『』《》]+|["'“”‘’「」『』《》]+$/g, '')
+    .replace(/[，,。.!！：:；;、]+$/g, '')
+    .replace(/\s*(?:是谁|是誰|是什么人|是什麼人|是个什么人|是個什麼人|是干嘛的|是幹嘛的)$/g, '')
+    .replace(/(?:的)?(?:生平|资料|資料|背景|简介|簡介|履历|履歷|故事|百科|个人资料|個人資料)$/g, '')
+    .trim()
+}
+
+function looksLikePersonCardName(value = '') {
+  const name = cleanPersonCardCandidate(value)
+  if (!name || name.length > 32) return false
+  if (PERSON_CARD_NON_PERSON_SUBJECT_RE.test(name)) return false
+  if (PERSON_CARD_GENERIC_SUBJECT_RE.test(name)) return false
+  if (/[?？]/.test(name)) return false
+  if (/(?:帮我|给我|请|麻烦|写|做|生成|打开|关闭|修|改|看下|看看|一下)/.test(name)) return false
+
+  const compact = name.replace(/\s+/g, '')
+  if (/^[\u4e00-\u9fa5·]{2,8}$/.test(compact)) return true
+
+  const latinName = name.replace(/[·]/g, ' ').replace(/\s+/g, ' ').trim()
+  const latinTokens = latinName.split(' ').filter(Boolean)
+  if (latinTokens.length >= 2 && latinTokens.length <= 4) {
+    return latinTokens.every(token => /^[A-Za-z][A-Za-z.'-]{1,24}$/.test(token))
+  }
+  return false
+}
+
+function hitsPersonCardIntent(messageBody = '') {
+  const raw = String(messageBody || '').trim()
+  if (!raw || /热点|热搜/.test(raw)) return false
+
+  if (/(?:打开|显示|弹出|关闭|隐藏|收起).{0,8}(?:人物卡片|人物卡|person card)|(?:人物卡片|人物卡|person card).{0,8}(?:打开|显示|弹出|关闭|隐藏|收起)/i.test(raw)) {
+    return true
+  }
+
+  const patterns = [
+    /^谁是\s*(.+?)[？?]?$/,
+    /^(.+?)\s*(?:是谁|是誰|是什么人|是什麼人|是个什么人|是個什麼人|是干嘛的|是幹嘛的|为什么火|為什麼火|为什么红|為什麼紅)[？?]?$/,
+    /^(?:介绍一下|介绍下|查一下|了解一下|认识一下)\s*(.+?)[？?]?$/,
+    /^(?:who is|tell me about|biography of|profile of)\s+(.+?)[?.!]?$/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = raw.match(pattern)
+    if (looksLikePersonCardName(match?.[1])) return true
   }
   return false
 }
@@ -236,14 +312,15 @@ export function selectTools(ctx = {}) {
     recentActionLog = [],
     installedToolNames = [],
     startupSelfCheckActive = false,
+    localVisualTurn = true,
     fastUserPath = false,
   } = ctx
 
   const body = (messageBody || '').toLowerCase()
   const out = new Set(CORE_TOOLS)
   // 被显式抑制的工具名:ActionLog 保活 / installed 列表 / fallback 兜底都要跳过,
-  // 最后一道 delete 兜底,确保不被任何路径加回来。当前唯一用法是跨 turn 抑制 set_tick_interval。
-  const suppressed = new Set()
+  // 最后一道 delete 兜底,确保不被任何路径加回来。用于跨 turn 抑制 set_tick_interval 等，以及挡住已移除的旧工具名。
+  const suppressed = new Set(['generate_video'])
 
   // 任务控制：有任务 → 全组；没任务 → 仅 set_task（用户能开任务）
   for (const t of (hasTask ? TASK_CTRL_FULL : TASK_CTRL_OPENER)) out.add(t)
@@ -267,9 +344,6 @@ export function selectTools(ctx = {}) {
   }
   if (hits(body, EXEC_TRIGGERS)) {
     for (const t of EXEC_TOOLS) out.add(t)
-  }
-  if (hits(body, WEB_TRIGGERS) || isTick) {
-    for (const t of WEB_TOOLS) out.add(t)
   }
   if (hits(body, MEDIA_TRIGGERS)) {
     for (const t of MEDIA_TOOLS) out.add(t)
@@ -300,17 +374,33 @@ export function selectTools(ctx = {}) {
       for (const t of TICKER_TOOLS) suppressed.add(t)
     }
   }
-  if (hits(body, HOTSPOT_TRIGGERS) || isTick) {
-    for (const t of HOTSPOT_TOOLS) out.add(t)
-  }
-  if (hits(body, PERSON_CARD_TRIGGERS)) {
+  // —— 能力注册表：已迁能力（web / hotspot / worldcup / software-install）的工具注入 ——
+  // 每个能力用自己的 toolWhen 门（web=关键词|TICK、hotspot=仅 TICK、worldcup=从不自动、
+  // software-install=isSoftwareInstallRequest），保留与旧分支等价的解耦语义。
+  const capCtx = { text: body, rawText: messageBody, isTick, mmCaps, hasTask }
+  for (const t of capabilityToolsFor(capCtx)) out.add(t)
+  if (INLINE_IMAGE_RE.test(messageBody)) out.add('analyze_image')
+
+  if (hitsPersonCardIntent(messageBody)) {
     for (const t of PERSON_CARD_TOOLS) out.add(t)
   }
   if (hits(body, FOCUS_BANNER_TRIGGERS) || hasTask) {
     for (const t of FOCUS_BANNER_TOOLS) out.add(t)
   }
+  if (hits(body, TERMINAL_STREAM_TRIGGERS)) {
+    for (const t of TERMINAL_STREAM_TOOLS) out.add(t)
+  }
+  if (!isTick && localVisualTurn !== false && shouldInjectCapabilityDemo(messageBody)) {
+    for (const t of CAPABILITY_DEMO_TOOLS) out.add(t)
+  }
   if (hits(body, ADMIN_TRIGGERS)) {
     for (const t of ADMIN_TOOLS) out.add(t)
+  }
+  if (
+    (API_KEY_RE.test(messageBody) && API_DOCS_RE.test(messageBody))
+    || (API_CONFIG_CONFIRM_RE.test(body.trim()) && recentApiCapabilitySetupNeed(recentActionLog))
+  ) {
+    out.add('manage_api_capability')
   }
   // 成果审视：有任务时已随 TASK_CTRL_FULL 注入；这里覆盖"无任务但用户明确要求检查/验收成果"的临时场景。
   if (hits(body, REVIEW_TRIGGERS)) {
@@ -327,9 +417,6 @@ export function selectTools(ctx = {}) {
   if (mmCaps.includes('lyrics') && hits(body, LYRICS_TRIGGERS))    out.add(MM_GEN_TOOLS.lyrics)
   if (mmCaps.includes('music')  && hits(body, MUSIC_GEN_TRIGGERS)) out.add(MM_GEN_TOOLS.music)
   if (mmCaps.includes('image')  && hits(body, IMAGE_GEN_TRIGGERS)) out.add(MM_GEN_TOOLS.image)
-  // AI 视频生成：不 gate mmCaps，关键词命中即暴露（未配置时由工具返回值引导用户配置）
-  if (hits(body, VIDEO_GEN_TRIGGERS)) out.add('generate_video')
-
   // —— ActionLog 保活 ——
   // 上轮（或最近 10 次）调用过的工具强制带上：跨轮工作流不能因为关键词没命中就断链。
   // 保活只覆盖白龙马的"已知工具"——installed 工具走单独的全注入路径。

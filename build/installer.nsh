@@ -12,7 +12,7 @@ Function BailongmaNormalizeInstallDir
 FunctionEnd
 
 Function BailongmaFindForeignInstallRootItem
-  ; Returns the first item in $INSTDIR that is not owned by Bailongma.
+  ; Returns the first item in $INSTDIR that is not owned by 小王子 Agent.
   ; Result is written to $R3. "0" means the folder is absent, empty, or safe.
   StrCpy $R3 "0"
   IfFileExists "$INSTDIR\*.*" 0 bailongmaScanInstallRootNoClose
@@ -54,6 +54,54 @@ Function BailongmaFindForeignInstallRootItem
   bailongmaScanInstallRootNoClose:
 FunctionEnd
 
+Function BailongmaRescueForeignInstallRootItems
+  ; During upgrades, the old uninstaller may delete the whole install folder.
+  ; Move foreign items out first so third-party/user files are preserved while
+  ; the upgrade can continue.
+  StrCpy $R6 ""
+
+  bailongmaRescueForeignLoop:
+    Call BailongmaFindForeignInstallRootItem
+    ${if} $R3 == "0"
+      Return
+    ${endIf}
+
+    ${if} $R6 == ""
+      CreateDirectory "$APPDATA\小王子 Agent"
+      CreateDirectory "$APPDATA\小王子 Agent\install-root-rescue"
+      StrCpy $R8 "1"
+
+      bailongmaPickForeignRescueDir:
+        StrCpy $R6 "$APPDATA\小王子 Agent\install-root-rescue\upgrade-$R8"
+        IfFileExists "$R6\*.*" 0 bailongmaForeignRescueDirReady
+        IntOp $R8 $R8 + 1
+        IntCmp $R8 1000 bailongmaForeignRescueDirExhausted bailongmaPickForeignRescueDir bailongmaForeignRescueDirExhausted
+
+      bailongmaForeignRescueDirReady:
+        ClearErrors
+        CreateDirectory "$R6"
+        IfErrors bailongmaForeignRescueDirFailed
+    ${endIf}
+
+    ClearErrors
+    Rename "$INSTDIR\$R3" "$R6\$R3"
+    IfErrors bailongmaForeignRescueMoveFailed
+    DetailPrint "Moved non-小王子 Agent install-root item out of upgrade path: $INSTDIR\$R3 -> $R6\$R3"
+    Goto bailongmaRescueForeignLoop
+
+  bailongmaForeignRescueDirExhausted:
+    MessageBox MB_ICONSTOP|MB_OK "小王子 Agent could not create a unique rescue folder under:$\r$\n$\r$\n$APPDATA\小王子 Agent\install-root-rescue$\r$\n$\r$\nPlease move non-小王子 Agent content out of the install folder, then run setup again."
+    Abort
+
+  bailongmaForeignRescueDirFailed:
+    MessageBox MB_ICONSTOP|MB_OK "小王子 Agent could not create a rescue folder:$\r$\n$\r$\n$R6$\r$\n$\r$\nPlease move non-小王子 Agent content out of the install folder, then run setup again."
+    Abort
+
+  bailongmaForeignRescueMoveFailed:
+    MessageBox MB_ICONSTOP|MB_OK "小王子 Agent could not move non-小王子 Agent content out of the install folder:$\r$\n$\r$\n$INSTDIR\$R3$\r$\n$\r$\nTarget rescue folder:$\r$\n$R6$\r$\n$\r$\nPlease close programs that may be using this folder, or move it manually, then run setup again."
+    Abort
+FunctionEnd
+
 Function BailongmaValidateInstallDir
   Call BailongmaNormalizeInstallDir
 
@@ -76,7 +124,7 @@ Function BailongmaValidateInstallDir
   ${GetRoot} "$INSTDIR" $R4
   ${DriveSpace} "$R4\" "/D=F /S=M" $R5
   ${if} $R5 < 600
-    MessageBox MB_ICONSTOP|MB_OK "目标磁盘可用空间不足，无法安全安装小王子 Agent。$\r$\n$\r$\n所在磁盘：$R4$\r$\n当前可用：$R5 MB$\r$\n至少需要：600 MB$\r$\n$\r$\n请清理磁盘空间，或将小王子 Agent 安装到其他磁盘后重试。"
+    MessageBox MB_ICONSTOP|MB_OK "目标磁盘可用空间不足，无法安全安装白龙马。$\r$\n$\r$\n所在磁盘：$R4$\r$\n当前可用：$R5 MB$\r$\n至少需要：600 MB$\r$\n$\r$\n请清理磁盘空间，或将白龙马安装到其他磁盘后重试。"
     Abort
   ${endIf}
 FunctionEnd
@@ -174,10 +222,7 @@ FunctionEnd
   SetOutPath "$INSTDIR"
   Delete "$SMPROGRAMS\小王子 Agent.lnk"
   Delete "$SMPROGRAMS\小王子 Agent\小王子 Agent.lnk"
-  Delete "$SMPROGRAMS\Bailongma.lnk"
-  Delete "$SMPROGRAMS\Bailongma\Bailongma.lnk"
   RMDir "$SMPROGRAMS\小王子 Agent"
-  RMDir "$SMPROGRAMS\Bailongma"
   Delete "$DESKTOP\小王子 Agent.lnk"
   CreateShortCut "$DESKTOP\小王子 Agent.lnk" "$INSTDIR\小王子 Agent.exe" "" "$INSTDIR\小王子 Agent.exe" 0
   WriteRegStr SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" "KeepShortcuts" "true"
@@ -213,13 +258,14 @@ FunctionEnd
   ; Even a folder named 小王子 Agent can contain user-created or third-party
   ; folders. During upgrades, electron-builder invokes the *old* uninstaller
   ; before this new safe uninstaller exists, and old uninstallers recursively
-  ; remove the whole install folder. Refuse to continue if the install root
-  ; contains anything we do not recognize as 小王子 Agent/Electron payload.
-  Call BailongmaFindForeignInstallRootItem
-  ${if} $R3 != "0"
-      MessageBox MB_ICONSTOP|MB_OK "小王子 Agent install folder contains non-小王子 Agent content:$\r$\n$\r$\n$INSTDIR\$R3$\r$\n$\r$\nTo protect your files and other software, this installer will not run the old uninstaller automatically. Please back up or move this content out of the 小王子 Agent folder, then install again."
-      Abort
-    ${endIf}
+  ; remove the whole install folder. If this is an existing 小王子 Agent install,
+  ; rescue foreign items to userData first. Fresh installs still validate and
+  ; refuse non-empty foreign folders on the install-directory page.
+  ${if} ${FileExists} "$INSTDIR\小王子 Agent.exe"
+  ${orIf} ${FileExists} "$INSTDIR\Uninstall 小王子 Agent.exe"
+  ${orIf} ${FileExists} "$INSTDIR\resources\app.asar"
+    Call BailongmaRescueForeignInstallRootItems
+  ${endIf}
 
   ; Native Node addons are ABI-bound to Electron. Clean old unpacked copies
   ; before installing so upgrades cannot keep a stale better_sqlite3.node.
@@ -276,11 +322,7 @@ FunctionEnd
   Delete "$DESKTOP\小王子 Agent.lnk"
   Delete "$SMPROGRAMS\小王子 Agent.lnk"
   Delete "$SMPROGRAMS\小王子 Agent\小王子 Agent.lnk"
-  Delete "$DESKTOP\Bailongma.lnk"
-  Delete "$SMPROGRAMS\Bailongma.lnk"
-  Delete "$SMPROGRAMS\Bailongma\Bailongma.lnk"
   RMDir "$SMPROGRAMS\小王子 Agent"
-  RMDir "$SMPROGRAMS\Bailongma"
 
   Delete "$INSTDIR\resources\app.asar"
   Delete "$INSTDIR\resources\app-update.yml"
@@ -360,7 +402,7 @@ FunctionEnd
   ; 那种情况绝不能删数据，否则更新一次记忆全没——所以只在“真卸载”时弹窗。
   ; /SD IDNO 让静默卸载默认走“保留”，不打扰、不误删。
   ${ifNot} ${isUpdated}
-    MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除小王子 Agent 的全部用户数据？$\r$\n$\r$\n包括：对话与记忆数据库、配置（含 API Key）、沙盒文件、下载的音乐等。$\r$\n$\r$\n选择「是」将彻底清除且无法恢复；选择「否」保留数据，方便以后重装时继续使用。" /SD IDNO IDNO keepUserData
+    MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除白龙马的全部用户数据？$\r$\n$\r$\n包括：对话与记忆数据库、配置（含 API Key）、沙盒文件、下载的音乐等。$\r$\n$\r$\n选择「是」将彻底清除且无法恢复；选择「否」保留数据，方便以后重装时继续使用。" /SD IDNO IDNO keepUserData
       ; userData 目录 = %APPDATA%\<productName>，即 $APPDATA\小王子 Agent
       RMDir /r "$APPDATA\小王子 Agent"
     keepUserData:

@@ -76,7 +76,7 @@ MiniMax 一个 Key 同时供 LLM 与 TTS 两用。`,
 ■ 智谱 AI（GLM）
 → 申请：https://open.bigmodel.cn/
 → 字段：apiKey
-→ 默认模型：glm-4-flash
+→ 默认模型：glm-5.1
 
 ■ OpenAI
 → 申请：https://platform.openai.com/api-keys
@@ -89,7 +89,8 @@ MiniMax 一个 Key 同时供 LLM 与 TTS 两用。`,
 
 ■ 官网：https://platform.xiaomimimo.com
 ■ 字段：apiKey（在 MiMo 控制台「API Keys」生成）
-■ 默认模型：mimo-v2.5
+■ 默认模型：mimo-v2.5-pro（极速版 MiMo-V2.5-Pro-UltraSpeed 可在模型列表中手动选用，非默认）
+■ 降级策略：默认模型不可用时自动尝试其它 MiMo 模型
 ■ Base URL：https://api.xiaomimimo.com/v1（系统已内置）
 
 申请步骤：
@@ -118,8 +119,8 @@ MiniMax 一个 Key 同时供 LLM 与 TTS 两用。`,
       { name: 'MiniMax', url: 'https://platform.minimaxi.com/', free: false, note: 'MiniMax-M2.7，兼顾 TTS' },
       { name: '通义千问', url: 'https://bailian.console.aliyun.com/', free: false, note: 'qwen-turbo/plus' },
       { name: 'Moonshot', url: 'https://platform.moonshot.cn/', free: false, note: 'moonshot-v1-8k/32k' },
-      { name: '智谱 AI', url: 'https://open.bigmodel.cn/', free: false, note: 'glm-4-flash/plus' },
-      { name: '小米 MiMo', url: 'https://platform.xiaomimimo.com/', free: false, note: 'mimo-v2.5（默认）、mimo-v2.5-pro' },
+      { name: '智谱 AI', url: 'https://open.bigmodel.cn/', free: false, note: 'glm-5.1（默认）、glm-5-turbo、glm-5' },
+      { name: '小米 MiMo', url: 'https://platform.xiaomimimo.com/', free: false, note: 'mimo-v2.5-pro（默认，失败自动降级）、mimo-v2.5、MiMo-V2.5-Pro-UltraSpeed（极速版，可选）' },
     ],
   },
 
@@ -192,10 +193,13 @@ MiniMax 一个 Key 同时供 LLM 与 TTS 两用。`,
       },
       {
         title: '飞书 / Discord 配置',
-        content: `■ 飞书机器人
-→ 配置字段：FEISHU_APP_ID + FEISHU_APP_SECRET + FEISHU_VERIFICATION_TOKEN
-→ 申请：https://open.feishu.cn/ → 创建应用 → 事件订阅
-→ 回调 URL：http://你的IP:端口/social/feishu
+        content: `■ 飞书机器人（推荐长连接模式）
+→ 配置字段：FEISHU_APP_ID + FEISHU_APP_SECRET
+→ 申请：https://open.feishu.cn/ → 创建应用 → 添加「机器人」能力 → 权限里加 im:message
+→ 长连接模式无需公网回调地址：填好 App ID/Secret 即自动建立 WebSocket 收发消息
+→ 事件订阅里选「使用长连接接收事件」，订阅 im.message.receive_v1，不要开启加密推送
+→ 国际版 Lark 改用 FEISHU_DOMAIN=lark
+（旧的 webhook 模式仍兼容：配 FEISHU_VERIFICATION_TOKEN + 回调 URL http://你的IP:端口/social/feishu/webhook，但桌面端无公网地址，建议用长连接）
 
 ■ Discord Bot
 → 配置字段：DISCORD_BOT_TOKEN
