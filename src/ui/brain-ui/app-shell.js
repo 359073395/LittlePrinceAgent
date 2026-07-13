@@ -1,5 +1,6 @@
 import { createHotspotPanel } from './hotspot-panel.js';
 import { createWorldcupPanel } from './worldcup-panel.js';
+import { createTyphoonPanel } from './typhoon-panel.js';
 import { createPersonCardPanel } from './person-card-panel.js';
 import { createDocPanel } from './doc-panel.js';
 
@@ -178,6 +179,7 @@ const createSettingsModal = () => `
         <button class="settings-nav-item" data-tab="voice" type="button">语音对话</button>
         <button class="settings-nav-item" data-tab="web-search" type="button">上网搜索</button>
         <button class="settings-nav-item" data-tab="security" type="button">安全沙箱</button>
+        <button class="settings-nav-item" data-tab="advanced" type="button">高级功能</button>
         <button class="settings-nav-item" data-tab="update" type="button">更新</button>
       </nav>
 
@@ -393,7 +395,7 @@ const createSettingsModal = () => `
         <!-- ── 语音 tab ── -->
         <div class="settings-tab" data-tab="voice">
           <div class="settings-section">
-            <div class="settings-section-label">识别模式配置</div>
+            <div class="settings-section-label">语音识别配置</div>
             <div class="settings-row">
               <label class="settings-label" for="voice-auto-key">粘贴 Key 自动识别厂商</label>
               <input class="settings-input" type="password" id="voice-auto-key" placeholder="阿里云 / 腾讯云 / 讯飞 / 火山豆包 ASR Key">
@@ -431,20 +433,11 @@ const createSettingsModal = () => `
             </div>
             <div id="voice-cred-volcengine" style="display:none;">
               <div class="settings-row">
-                <label class="settings-label" for="voice-volc-apikey">API Key（新版）</label>
-                <input class="settings-input" type="password" id="voice-volc-apikey" placeholder="留空则不修改">
-              </div>
-              <div class="settings-row">
-                <label class="settings-label" for="voice-volc-resourceid">Resource ID</label>
-                <input class="settings-input" type="text" id="voice-volc-resourceid" placeholder="volc.bigasr.sauc.duration">
-              </div>
-              <div class="settings-row">
-                <label class="settings-label" for="voice-volc-appkey">App Key（旧版）</label>
-                <input class="settings-input" type="password" id="voice-volc-appkey" placeholder="旧版控制台可填">
-              </div>
-              <div class="settings-row">
-                <label class="settings-label" for="voice-volc-accesskey">Access Key（旧版）</label>
-                <input class="settings-input" type="password" id="voice-volc-accesskey" placeholder="旧版控制台可填">
+                <label class="settings-label" for="voice-volc-apikey">API Key</label>
+                <div class="settings-secret-wrap">
+                  <input class="settings-input" type="password" id="voice-volc-apikey" placeholder="输入后自动保存" autocomplete="new-password">
+                  <button class="settings-secret-toggle" id="voice-volc-apikey-toggle" type="button" aria-label="显示 API Key" title="显示/隐藏 API Key">👁</button>
+                </div>
               </div>
             </div>
             <div id="voice-cred-xunfei" style="display:none;">
@@ -460,34 +453,7 @@ const createSettingsModal = () => `
           </div>
 
           <div class="settings-section">
-            <div class="settings-section-label">通用设置</div>
-            <div class="settings-row">
-              <label class="settings-label" for="voice-lang-select">识别语言</label>
-              <select class="settings-select" id="voice-lang-select">
-                <option value="zh-CN">中文（普通话）</option>
-                <option value="en-US">English (US)</option>
-              </select>
-            </div>
-            <div class="settings-row">
-              <label class="settings-label" for="voice-mic-select">麦克风</label>
-              <select class="settings-select" id="voice-mic-select">
-                <option value="">系统默认麦克风</option>
-              </select>
-              <button class="settings-save-btn" id="voice-refresh-mics" type="button" style="padding:0 10px;">刷新</button>
-            </div>
-            <p class="settings-hint" id="voice-mic-status" style="margin-top:-2px;">更换麦克风后，重新开启语音对话生效。</p>
-            <div class="settings-row">
-              <label class="settings-label" for="voice-auto-send">识别后自动发送</label>
-              <input id="voice-auto-send" type="checkbox" checked style="width:auto;flex:none;">
-            </div>
-            <div class="settings-row">
-              <label class="settings-label" for="voice-auto-mic">启动时自动开启麦克风</label>
-              <input id="voice-auto-mic" type="checkbox" style="width:auto;flex:none;">
-            </div>
-          </div>
-
-          <div class="settings-section">
-            <div class="settings-section-label">语音灵敏度</div>
+            <div class="settings-section-label">语音识别灵敏度</div>
             <p class="settings-hint">调节麦克风触发阈值。越低越灵敏，越高越需要大声说话。默认 0.008。</p>
             <div class="settings-row">
               <label class="settings-label" for="settings-voice-threshold">触发阈值</label>
@@ -499,14 +465,6 @@ const createSettingsModal = () => `
           <div class="settings-section" id="settings-tts-section">
             <div class="settings-section-label">语音合成（TTS）</div>
             <p class="settings-hint">用语音发消息时，Agent 回复会自动转为语音播放。首选推荐豆包语音合成 2.0（https://console.volcengine.com/speech/new/），也支持 MiniMax、OpenAI、ElevenLabs、火山引擎。</p>
-            <div class="settings-row">
-              <label class="settings-label" for="voice-output-select">输出设备</label>
-              <select class="settings-select" id="voice-output-select">
-                <option value="">自动（跟随系统，避开虚拟设备）</option>
-              </select>
-              <button class="settings-save-btn" id="voice-refresh-outputs" type="button" style="padding:0 10px;">刷新</button>
-            </div>
-            <p class="settings-hint" id="voice-output-status" style="margin-top:-2px;">语音从这里发声。默认自动选择；拔耳机会自动切回扬声器，不会被串流/虚拟声卡占用。</p>
             <div class="settings-row">
               <label class="settings-label" for="tts-provider-select">服务商</label>
               <select class="settings-select" id="tts-provider-select">
@@ -536,7 +494,7 @@ const createSettingsModal = () => `
               </label>
             </div>
             <div id="tts-fx-lock" style="display:none;flex-direction:column;align-items:stretch;gap:6px;padding:8px 0 4px;">
-              <p class="settings-hint" style="margin:0;color:#e0a64d;">未来感音效需要付费，这是维持这个项目动力，请联系作者索要密码</p>
+              <p class="settings-hint" style="margin:0;color:#e0a64d;">机器人音效需要付费，这是维持这个项目动力，请联系作者索要密码</p>
               <div style="display:flex;gap:8px;align-items:center;">
                 <input class="settings-input" type="text" id="tts-fx-pw" placeholder="输入密码解锁" style="flex:1;">
                 <button class="settings-save-btn" id="tts-fx-unlock" type="button" style="padding:4px 14px;font-size:12px;">解锁</button>
@@ -562,30 +520,21 @@ const createSettingsModal = () => `
             <div id="tts-creds-doubao" style="display:none;">
               <div class="settings-row">
                 <label class="settings-label" for="tts-doubao-key">API Key</label>
-                <input class="settings-input" type="password" id="tts-doubao-key" placeholder="留空则不修改">
+                <div class="settings-secret-wrap">
+                  <input class="settings-input" type="password" id="tts-doubao-key" placeholder="已保存的 Key 会在这里显示" autocomplete="new-password">
+                  <button class="settings-secret-toggle" id="tts-doubao-key-toggle" type="button" aria-label="显示 API Key" title="显示/隐藏 API Key">👁</button>
+                </div>
               </div>
               <div class="settings-row">
                 <label class="settings-label" for="tts-doubao-resource">Resource ID</label>
                 <input class="settings-input" type="text" id="tts-doubao-resource" placeholder="自动匹配，或填 seed-tts-2.0 / seed-tts-1.0">
-              </div>
-              <div class="settings-row">
-                <label class="settings-label" for="tts-doubao-appid">AppId</label>
-                <input class="settings-input" type="text" id="tts-doubao-appid" placeholder="旧版控制台鉴权选填">
-              </div>
-              <div class="settings-row">
-                <label class="settings-label" for="tts-doubao-access-key">Access Key</label>
-                <input class="settings-input" type="password" id="tts-doubao-access-key" placeholder="旧版控制台 Access Token，留空则不修改">
-              </div>
-              <div class="settings-row">
-                <label class="settings-label" for="tts-doubao-style">情感风格</label>
-                <input class="settings-input" type="text" id="tts-doubao-style" placeholder="可空。例：用低沉沉稳、情绪饱满带金属感的人工智能管家声音">
               </div>
               <div class="tts-fx-srow" style="margin-bottom:8px;">
                 <label for="tts-doubao-rate">语速</label>
                 <input type="range" id="tts-doubao-rate" min="-50" max="100" step="5">
                 <span id="tts-doubao-rate-val"></span>
               </div>
-              <p class="settings-hint">在<a href="https://console.volcengine.com/speech/new/" target="_blank" style="color:var(--cool)">豆包语音合成控制台</a>获取 API Key。2.0 音色使用 seed-tts-2.0；1.0/moon/BV 音色使用 seed-tts-1.0 或控制台对应资源。<br>「情感风格」用自然语言描述语气（越具体越好，短词无效），留空＝中性。要贾维斯感建议配男声（云舟 zh_male_m191_uranus_bigtts）。</p>
+              <p class="settings-hint">在<a href="https://console.volcengine.com/speech/new/" target="_blank" style="color:var(--cool)">豆包语音合成控制台</a>获取 API Key。2.0 音色使用 seed-tts-2.0；1.0/moon/BV 音色使用 seed-tts-1.0 或控制台对应资源。</p>
             </div>
 
             <div id="tts-creds-minimax" style="display:none;">
@@ -631,6 +580,41 @@ const createSettingsModal = () => `
             <div class="settings-row" style="margin-top:8px;">
               <button class="settings-save-btn" id="tts-test-btn" type="button" style="padding:4px 12px;font-size:12px;">试听</button>
               <span id="tts-test-status" style="color:var(--ink2);font-size:12px;margin-left:8px;"></span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-label">设备设置</div>
+            <div class="settings-row">
+              <label class="settings-label" for="voice-lang-select">识别语言</label>
+              <select class="settings-select" id="voice-lang-select">
+                <option value="zh-CN">中文（普通话）</option>
+                <option value="en-US">English (US)</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="voice-mic-select">麦克风</label>
+              <select class="settings-select" id="voice-mic-select">
+                <option value="">系统默认麦克风</option>
+              </select>
+              <button class="settings-save-btn" id="voice-refresh-mics" type="button" style="padding:0 10px;">刷新</button>
+            </div>
+            <p class="settings-hint" id="voice-mic-status" style="margin-top:-2px;">更换麦克风后，重新开启语音对话生效。</p>
+            <div class="settings-row">
+              <label class="settings-label" for="voice-output-select">输出设备</label>
+              <select class="settings-select" id="voice-output-select">
+                <option value="">自动（跟随系统，避开虚拟设备）</option>
+              </select>
+              <button class="settings-save-btn" id="voice-refresh-outputs" type="button" style="padding:0 10px;">刷新</button>
+            </div>
+            <p class="settings-hint" id="voice-output-status" style="margin-top:-2px;">语音从这里发声。默认自动选择；拔耳机会自动切回扬声器，不会被串流/虚拟声卡占用。</p>
+            <div class="settings-row">
+              <label class="settings-label" for="voice-auto-send">识别后自动发送</label>
+              <input id="voice-auto-send" type="checkbox" checked style="width:auto;flex:none;">
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="voice-auto-mic">启动时自动开启麦克风</label>
+              <input id="voice-auto-mic" type="checkbox" style="width:auto;flex:none;">
             </div>
           </div>
 
@@ -733,7 +717,7 @@ const createSettingsModal = () => `
           </div>
           <div class="settings-section">
             <div class="settings-section-label">局域网访问</div>
-            <p class="settings-hint">允许同一局域网内的设备访问本机白龙马 API，用于多台白龙马互相通信。开启或关闭后需要重启应用生效。</p>
+            <p class="settings-hint">允许同一局域网内的设备访问本机小王子 Agent API，用于多台小王子 Agent 互相通信。开启或关闭后需要重启应用生效。</p>
             <div class="settings-row">
               <label class="settings-label" for="security-lan-access">允许局域网访问</label>
               <label class="settings-toggle">
@@ -755,6 +739,44 @@ const createSettingsModal = () => `
             <button class="settings-save-btn" id="settings-save-security" type="button">保存</button>
             <button class="settings-save-btn hidden" id="settings-restart-security" type="button" style="width:auto;padding:0 14px;">立即重启</button>
             <span class="settings-feedback" id="settings-security-feedback"></span>
+          </div>
+        </div>
+
+        <!-- ── 高级功能 tab ── -->
+        <div class="settings-tab" data-tab="advanced">
+          <div class="settings-section">
+            <div class="settings-section-label">地图服务</div>
+            <p class="settings-hint">为台风监测、位置、行程等功能提供统一真实地图。凭证仅保存在本机加密存储中，不会写入项目源码或返回安全密钥明文。</p>
+            <div class="settings-config-row">
+              <span class="settings-config-type">状态</span>
+              <span class="settings-config-info" id="settings-map-status">正在检查…</span>
+              <span class="settings-config-dot" id="settings-map-status-dot"></span>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="settings-map-provider">地图服务商</label>
+              <select class="settings-select" id="settings-map-provider">
+                <option value="amap">高德地图 JS API 2.0</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="settings-amap-key">Web 端 Key</label>
+              <input class="settings-input" id="settings-amap-key" type="password" placeholder="留空保持现有 Key 不变" autocomplete="new-password" spellcheck="false">
+            </div>
+            <div class="settings-row">
+              <label class="settings-label" for="settings-amap-security">安全密钥</label>
+              <input class="settings-input" id="settings-amap-security" type="password" placeholder="securityJsCode，留空保持不变" autocomplete="new-password" spellcheck="false">
+            </div>
+            <p class="settings-hint">请在高德开放平台创建“Web端（JS API）”Key。安全密钥只在本地代理请求中使用，地图页面无法读取其明文。</p>
+            <div class="settings-row-action" style="gap:8px;flex-wrap:wrap;">
+              <button class="settings-save-btn" id="settings-save-map" type="button">保存地图配置</button>
+              <button class="settings-save-btn" id="settings-clear-map" type="button" style="width:auto;padding:0 14px;background:transparent;border:1px solid var(--line);color:var(--ink2);">清除</button>
+              <a href="https://console.amap.com/dev/key/app" target="_blank" rel="noreferrer" class="settings-map-link">申请高德 Key ↗</a>
+              <span class="settings-feedback" id="settings-map-feedback"></span>
+            </div>
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-label">共用范围</div>
+            <p class="settings-hint">配置一次后，台风监测、天气灾害、位置卡片和后续地图页面都会通过统一 MapService 使用同一地图服务。</p>
           </div>
         </div>
 
@@ -983,6 +1005,7 @@ export function createBrainUiMarkup() {
     createImagePanel(),
     createHotspotPanel(),
     createWorldcupPanel(),
+    createTyphoonPanel(),
     createPersonCardPanel(),
     createDocPanel(),
   ].join("\n\n");

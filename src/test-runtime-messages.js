@@ -68,8 +68,8 @@ const messages = buildLLMMessages({
   conversationWindow,
   input: '[ID:000001] 2026-05-25T10:02:13+08:00 [WECHAT_CLAWBOT] 那现在呢？',
   msg: currentMsg,
-  recentActions: [{ ts: '2026-05-25T10:01:30+08:00', summary: 'read_file(foo)' }],
-  actionLog: [{ timestamp: '2026-05-25T10:01:40+08:00', tool: 'read_file', summary: 'read_file(foo)', detail: 'ok' }],
+  recentActions: [{ ts: '2026-05-25T02:01:30.000Z', summary: 'read_file(foo)' }],
+  actionLog: [{ timestamp: '2026-05-25T02:01:40.000Z', tool: 'read_file', summary: 'read_file(foo)', detail: 'ok' }],
   lastToolResult: { name: 'read_file', args: { path: 'foo.txt' }, result: 'hello world' },
   taskSteps: [{ text: '检查文件', status: 'done', note: 'ok' }, { text: '回复用户', status: 'pending' }],
   batteryBlock: 'Battery: 80%',
@@ -85,18 +85,24 @@ assert(messages[1].content.includes('Recent assistant actions'), 'runtime contex
 assert(messages[1].content.includes('Recent tool/action log'), 'runtime context includes action log')
 assert(messages[1].content.includes('Previous tool result'), 'runtime context includes last tool result')
 assert(messages[1].content.includes('<conversation_metadata>'), 'runtime context includes conversation metadata')
+assert(messages[1].content.includes('<context>CTX</context>'), 'runtime context includes round-local context block')
+assert(messages[1].content.includes('Current-turn intent check'), 'runtime context includes current-turn intent check')
 assert(messages[1].content.includes('role="assistant"'), 'conversation metadata includes assistant role')
 assert(messages[1].content.includes('salience="last_assistant_reply"'), 'conversation metadata marks the last assistant reply')
 assert(messages[1].content.includes('channel_switched_from="TUI"'), 'conversation metadata marks channel switch')
+assert(messages[1].content.includes('- 10:01 read_file(foo)'), 'UTC recent action time is rendered in local time')
+assert(!messages[1].content.includes('- 02:01 read_file(foo)'), 'UTC recent action time is not rendered as raw UTC clock')
 
 const historicalUser = messages.find(m => m.content.includes('先在本地看一下'))
 assert(historicalUser && !historicalUser.content.includes('<context>CTX</context>'), 'historical user message is not prefixed with current context')
 
-const currentUser = messages.find(m => m.content.startsWith('<context>CTX</context>'))
+const currentUser = messages.find(m => m.role === 'user' && m.content === currentMsg.content)
 assert(currentUser, 'current user message is identified')
-assert(currentUser.content.startsWith('<context>CTX</context>'), 'context is prefixed to current user message')
+assertEqual(currentUser.content, currentMsg.content, 'current user message stays exactly the user text')
+assertEqual(messages[messages.length - 1].content, currentMsg.content, 'final message is the clean current user message')
 assert(!currentUser.content.includes('[current user message'), 'current user message keeps metadata out of visible content')
 assert(!currentUser.content.includes('channel switch:'), 'current user message does not inline channel switch metadata')
+assert(!currentUser.content.includes('intent check'), 'current user message does not inline intent check')
 
 const assistant = messages.find(m => m.role === 'assistant')
 // The assistant line immediately preceding the current user message is the "last reply";
@@ -112,10 +118,11 @@ const fallbackMessages = buildLLMMessages({
   conversationWindow: [],
   input: 'TICK 2026-05-25-10:03:00',
 })
-assertEqual(fallbackMessages.length, 2, 'fallback path has system + one user message')
-assert(fallbackMessages[1].content.startsWith('<context>TICK</context>'), 'fallback user message gets context prefix')
-assert(fallbackMessages[1].content.includes('TICK 2026-05-25-10:03:00'), 'fallback user message keeps input')
-assert(!fallbackMessages[1].content.includes('[heartbeat tick'), 'fallback without isTick stays unmarked (non-tick callers unaffected)')
+assertEqual(fallbackMessages.length, 3, 'fallback path has system + runtime context + one user message')
+assert(fallbackMessages[1].content.startsWith('[runtime context]'), 'fallback runtime context is injected before user message')
+assert(fallbackMessages[1].content.includes('<context>TICK</context>'), 'fallback runtime context gets context block')
+assertEqual(fallbackMessages[2].content, 'TICK 2026-05-25-10:03:00', 'fallback user message keeps input clean')
+assert(!fallbackMessages[2].content.includes('[heartbeat tick'), 'fallback without isTick stays unmarked (non-tick callers unaffected)')
 
 const tickMessages = buildLLMMessages({
   systemPrompt: 'SYS',
@@ -124,12 +131,57 @@ const tickMessages = buildLLMMessages({
   input: 'TICK 2026-05-25-10:03:00',
   isTick: true,
 })
-assertEqual(tickMessages.length, 2, 'tick path has system + one user message')
-assertEqual(tickMessages[1].role, 'user', 'tick fallback uses user role')
-assert(tickMessages[1].content.startsWith('<context>TICK</context>'), 'tick fallback gets context prefix')
-assert(tickMessages[1].content.includes('[heartbeat tick · no new user message]'), 'tick fallback carries heartbeat marker')
-assert(tickMessages[1].content.includes('NOT a user message'), 'tick fallback tells the model this is not a user message')
-assert(tickMessages[1].content.includes('TICK 2026-05-25-10:03:00'), 'tick fallback preserves the tick payload')
+assertEqual(tickMessages.length, 2, 'tick path has system + runtime context only')
+assert(tickMessages[0].content.startsWith('[heartbeat tick - no new user message]'), 'tick marker is prepended to system prompt')
+assert(tickMessages[0].content.includes('not a user turn'), 'tick system prompt says this is not a user turn')
+assert(tickMessages[0].content.includes('TICK 2026-05-25-10:03:00'), 'tick system prompt preserves the tick payload')
+assert(tickMessages[0].content.endsWith('SYS'), 'original system prompt follows the tick marker')
+assertEqual(tickMessages[1].role, 'system', 'tick runtime context uses system role')
+assert(tickMessages[1].content.startsWith('[runtime context]'), 'tick runtime context is injected before user message')
+assert(tickMessages[1].content.includes('<context>TICK</context>'), 'tick runtime context gets context block')
+assert(!tickMessages.some((m, i) => i > 0 && m.content.includes('TICK 2026-05-25-10:03:00')), 'tick payload is not injected as a synthetic user message')
+assert(!tickMessages.some(m => m.role === 'user'), 'tick without history has no user-role message')
+
+const tickHistoryMessages = buildLLMMessages({
+  systemPrompt: 'SYS',
+  conversationWindow: [
+    {
+      role: 'user',
+      from_id: 'ID:000001',
+      timestamp: '2026-05-25T10:00:00+08:00',
+      content: 'hello',
+    },
+    {
+      role: 'jarvis',
+      from_id: 'jarvis',
+      to_id: 'ID:000001',
+      timestamp: '2026-05-25T10:01:00+08:00',
+      content: 'hi back',
+    },
+  ],
+  input: 'TICK 2026-05-25-10:03:00',
+  isTick: true,
+})
+assertEqual(tickHistoryMessages[tickHistoryMessages.length - 1].role, 'assistant', 'tick with history can end on the assistant history row')
+assertEqual(tickHistoryMessages[tickHistoryMessages.length - 1].content, 'hi back', 'tick does not append a current user message after assistant history')
+
+const continuityMessages = buildLLMMessages({
+  systemPrompt: 'SYS',
+  conversationWindow: [{
+    role: 'jarvis',
+    to_id: 'ID:000001',
+    timestamp: '2026-05-25T10:01:00+08:00',
+    content: 'The report is already sent.',
+  }],
+  recentActions: [{ ts: '2026-05-25T10:01:00+08:00', summary: 'sent report to ID:000001' }],
+  actionLog: [{ timestamp: '2026-05-25T10:01:00+08:00', tool: 'send_message', summary: 'report delivered' }],
+  input: 'TICK 2026-05-25-10:03:00',
+  isTick: true,
+})
+const continuityContext = continuityMessages.find(message => String(message.content || '').includes('Heartbeat continuity check'))?.content || ''
+assert(continuityContext.includes('freshest evidence'), 'Tick prioritizes recent conversation and execution evidence')
+assert(continuityContext.includes('do not repeat it'), 'Tick continuity check blocks already-completed work')
+assert(continuityContext.includes('Time passing by itself is not new evidence'), 'Tick does not treat elapsed time as a retry trigger')
 
 const systemSignal = formatConversationMessage({
   role: 'user',

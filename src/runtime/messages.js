@@ -1,4 +1,5 @@
 import { normalizeChannel, isSystemSignalRow } from './channel.js'
+import { formatLocalClock, formatLocalDateMinute } from '../time.js'
 
 function xmlAttr(value) {
   return String(value ?? '')
@@ -77,8 +78,7 @@ export function formatConversationMessage(row, currentMsg = null, prevChannel = 
     }
   }
 
-  // Truncate timestamp to minute precision (drop seconds and timezone)
-  const ts = row.timestamp ? row.timestamp.slice(0, 16).replace('T', ' ') : ''
+  const ts = formatLocalDateMinute(row.timestamp)
   const rawChannel = row.channel || currentMsg?.channel || ''
 
   // 保留 currentMsg 回退语义：row.channel 为空时回退到 currentMsg?.channel（同 rawChannel）。
@@ -111,11 +111,82 @@ export function formatTaskSteps(taskSteps = []) {
   return `Task step progress (${done}/${total}):\n${lines.join('\n')}`
 }
 
-export function buildRuntimeContextMessages({ recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '', conversationMetadata = '' } = {}) {
+function buildTickSystemPrompt(systemPrompt, input) {
+  return `[heartbeat tick - no new user message]
+This is an internal L2 heartbeat tick, not a user turn. No user is speaking right now. Read the runtime context and conversation history normally, then independently choose the appropriate outcome; the heartbeat itself does not require action, communication, or silence.
+Delivery boundary for this TICK: it has no incoming local-user channel. Plain assistant text is private working output and is delivered to nobody. If you decide that someone should receive a message, call send_message explicitly (including for TUI delivery); otherwise end silently.
+Tick payload: ${input}
+
+${systemPrompt}`
+}
+
+function buildRecentOutboundSnapshot(conversationWindow = []) {
+  const rows = (Array.isArray(conversationWindow) ? conversationWindow : [])
+    .filter(row => String(row?.content || '').trim())
+  const sent = rows
+    .filter(row => row?.role === 'jarvis' && String(row.content || '').trim())
+    .slice(-3)
+  if (sent.length === 0) return ''
+
+  const lastOutboundIndex = rows.map(row => row?.role).lastIndexOf('jarvis')
+  const isHumanMessage = row => row?.role !== 'jarvis' && String(row?.from_id || row?.fromId || '').toUpperCase() !== 'SYSTEM'
+  const lastHumanIndex = rows.reduce((last, row, index) => isHumanMessage(row) ? index : last, -1)
+  const unansweredOutboundCount = lastOutboundIndex > lastHumanIndex
+    ? rows.slice(lastHumanIndex + 1).filter(row => row?.role === 'jarvis').length
+    : 0
+
+  const lines = sent.map(row => {
+    const time = formatLocalClock(row.timestamp)
+    const target = row.to_id || 'the recipient'
+    const content = String(row.content || '').replace(/\s+/g, ' ').trim().slice(0, 360)
+    return `- ${time} -> ${target}: “${content}”`
+  })
+  const boundary = unansweredOutboundCount > 0
+    ? [
+        `Conversation boundary: the last conversational move is yours; the user has not replied since ${unansweredOutboundCount === 1 ? 'that message' : `you sent ${unansweredOutboundCount} messages in a row`}.`,
+        'A successful send_message result is authoritative delivery evidence: treat the message as received and shown to the user. No reply means only that the user has not responded; it is never evidence that they missed the message, that delivery failed, or that you should send it again.',
+        'Treat this as a human pause. Do not send another heartbeat follow-up, greeting, reflection, or status repeat merely because time passed. Silence is the default unless there is genuinely new consequential evidence, such as a due reminder, a requested task result, a material change, or urgent risk.',
+      ]
+    : []
+  return [
+    'Recent verified outbound messages (these are things you have already said, not pending work):',
+    ...lines,
+    'Before sending during this heartbeat, compare current evidence with what the recipient already knows. A new message is useful only when new facts, progress, risk, or a new user message makes it useful; otherwise silence is the complete action.',
+    ...boundary,
+  ].join('\n')
+}
+
+function buildTickContinuityCheck({ conversationWindow = [], recentActions = [], actionLog = [], lastToolResult = null } = {}) {
+  const hasConversation = conversationWindow.some(row => String(row?.content || '').trim())
+  const hasActions = recentActions.length > 0 || actionLog.length > 0 || !!lastToolResult
+  if (!hasConversation && !hasActions) return ''
+
+  return [
+    'Heartbeat continuity check — do this privately before choosing any tool call or send_message:',
+    '1. Treat the recent conversation, Recent assistant actions, Recent tool/action log, previous tool result, and verified outbound snapshot as the freshest evidence. They outrank generic memories for deciding what has already happened in this ongoing situation.',
+    '2. Identify the exact next state you would create. If that state, result, message, or investigation is already present in the fresh evidence, do not repeat it.',
+    '3. Repeat an action only when there is a concrete reason in current evidence: a changed input, an explicit retry after a failure, a scheduled/due trigger, or a task step that genuinely still requires new work. Time passing by itself is not new evidence.',
+    '4. If no such delta exists, conclude silently. Silence after a completed or already-reported action is correct heartbeat behavior, not an unfinished response.',
+  ].join('\n')
+}
+
+function buildIntentCheckContext() {
+  return 'In <think>: (1) resolve every pronoun/ellipsis in the current user message ("继续/那个/这个呢/再来一个/换一个") against your last reply and the exchange just above, before reaching for older context; (2) list EVERY distinct request this one message carries — finish all of them this turn, not just the first; (3) name the WANT under the words — the outcome that ends their need — and answer that, not the literal grammar (a question is usually "do it"; a complaint is "fix it"; terse/urgent typing means lead with the result, no preamble).'
+}
+
+function hasPriorAssistantReply(rows, currentRowIndex) {
+  if (currentRowIndex < 0) return false
+  for (let i = currentRowIndex - 1; i >= 0; i--) {
+    if (rows[i]?.role === 'jarvis') return true
+  }
+  return false
+}
+
+export function buildRuntimeContextMessages({ contextBlock = '', recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '', outboundSnapshot = '', conversationMetadata = '', intentCheck = '', role = 'user' } = {}) {
   const parts = []
 
-  if (conversationMetadata) {
-    parts.push(conversationMetadata)
+  if (contextBlock) {
+    parts.push(contextBlock)
   }
 
   if (batteryBlock) {
@@ -127,13 +198,13 @@ export function buildRuntimeContextMessages({ recentActions = [], actionLog = []
   }
 
   if (recentActions?.length > 0) {
-    const lines = recentActions.map(item => `- ${item.ts?.slice(11, 16) || ''} ${item.summary || ''}`).join('\n')
+    const lines = recentActions.map(item => `- ${formatLocalClock(item.ts)} ${item.summary || ''}`).join('\n')
     parts.push(`Recent assistant actions:\n${lines}\nAvoid immediately repeating the same action unless the current user message asks for it.`)
   }
 
   if (actionLog?.length > 0) {
     const lines = actionLog.slice(-10).map(item => {
-      const time = item.timestamp?.slice(11, 16) || ''
+      const time = formatLocalClock(item.timestamp)
       const detail = item.detail ? `\n  ${item.detail}` : ''
       return `- ${time} ${item.tool || ''} · ${item.summary || ''}${detail}`
     }).join('\n')
@@ -148,9 +219,21 @@ export function buildRuntimeContextMessages({ recentActions = [], actionLog = []
     parts.push(`Previous tool result:\n${lastToolResult.name}(${argsSummary}) ->\n${resultPreview}\nAbsorb this result before deciding the next step.`)
   }
 
+  if (outboundSnapshot) {
+    parts.push(outboundSnapshot)
+  }
+
+  if (conversationMetadata) {
+    parts.push(conversationMetadata)
+  }
+
+  if (intentCheck) {
+    parts.push(`Current-turn intent check:\n${intentCheck}`)
+  }
+
   if (parts.length === 0) return []
   return [{
-    role: 'user',
+    role,
     content: `[runtime context]\n${parts.join('\n\n')}`,
   }]
 }
@@ -189,19 +272,40 @@ function computeExpiredFollowupSet(rows, currentTopic) {
 }
 
 export function buildLLMMessages({ systemPrompt, contextBlock = '', conversationWindow = [], input, msg = null, recentActions = [], actionLog = [], lastToolResult = null, taskSteps = [], batteryBlock = '', currentTopic = '', isTick = false }) {
-  const messages = [{ role: 'system', content: systemPrompt }]
+  const messages = [{
+    role: 'system',
+    content: isTick ? buildTickSystemPrompt(systemPrompt, input) : systemPrompt,
+  }]
 
   const rows = Array.isArray(conversationWindow) ? conversationWindow : []
+  const outboundSnapshot = isTick ? buildRecentOutboundSnapshot(rows) : ''
+  const continuityCheck = isTick
+    ? buildTickContinuityCheck({ conversationWindow: rows, recentActions, actionLog, lastToolResult })
+    : ''
 
   // P0-2：先扫一遍找出所有"过期未答悬念"
   const expiredSet = computeExpiredFollowupSet(rows, currentTopic)
   const conversationMetadata = formatConversationMetadata({ conversationWindow: rows, msg, expiredSet })
-  messages.push(...buildRuntimeContextMessages({ recentActions, actionLog, lastToolResult, taskSteps, batteryBlock, conversationMetadata }))
+  const currentRowIndex = rows.findIndex(row => isCurrentMessageRow(row, msg))
+  const intentCheck = (!isTick && hasPriorAssistantReply(rows, currentRowIndex))
+    ? buildIntentCheckContext()
+    : ''
+  messages.push(...buildRuntimeContextMessages({
+    contextBlock,
+    recentActions,
+    actionLog,
+    lastToolResult,
+    taskSteps,
+    batteryBlock,
+    outboundSnapshot,
+    conversationMetadata,
+    intentCheck: [continuityCheck, intentCheck].filter(Boolean).join('\n\n'),
+    role: isTick ? 'system' : 'user',
+  }))
 
-  // Track which message in the array should receive this round's <context> block:
-  // it's the last user-role message representing the "current" turn — either the
-  // matched row from conversationWindow (when msg is already persisted to db) or
-  // the appended fallback message below (TICK / unmatched cases).
+  // Track the last user-role message representing the current turn. The message
+  // content stays clean: round-local context lives in the [runtime context]
+  // message above, before conversation history.
   let currentMessageIndex = -1
 
   for (const row of rows) {
@@ -215,48 +319,15 @@ export function buildLLMMessages({ systemPrompt, contextBlock = '', conversation
 
   const hasCurrentMessage = currentMessageIndex >= 0
 
-  // 显著度锚点：找出"紧挨着当前用户消息之前的那条 jarvis 回复"。
-  //   接追问 / 指代消解的核心信号——历史窗口里这条本就在，但和更早的若干条混在一起没有
-  //   区分度。用户当前这句（"继续 / 那个 / 再来一个 / 这个呢"）绝大多数是在回应/承接「这一条」，
-  //   而不是窗口里更早的某句。具体提示放在 <conversation_metadata>，不再写进 assistant 正文。
-  //   只在确实存在上一条回复（= 进行中的对话）时才标，首条消息无可锚定。
-  let priorReplyIndex = -1
-  if (hasCurrentMessage) {
-    for (let i = currentMessageIndex - 1; i >= 0; i--) {
-      if (messages[i].role === 'assistant') { priorReplyIndex = i; break }
-    }
-  }
-
-  if (!hasCurrentMessage) {
-    // TICK 心跳路径：fallback 消息会以 role:'user' 注入，结构上跟真用户消息没区别。
-    // 不加 marker 时模型会把 "TICK 2026-..." 当成用户在重新发问，于是反复回答自己上一轮
-    // 提的 open_question，出现自问自答。这里显式标 [heartbeat tick]、注明非用户消息、
-    // 禁止回放历史问题，与下面 system signal 的 marker 待遇对齐。
-    const fallbackContent = isTick
-      ? `[heartbeat tick · no new user message]\n${input}\n(This is an internal heartbeat, NOT a user message. Do NOT treat it as the user re-asking a prior question or responding to your previous open question. Decide whether to act proactively per the directions above, or stay silent — both are valid.)`
-      : input
+  if (!hasCurrentMessage && !isTick) {
+    // Non-tick callers without a current conversation row still need a clean user turn.
+    // Tick turns carry their signal in the leading system prompt instead, so there is
+    // deliberately no synthetic current user message for L2 heartbeats.
     messages.push({
       role: 'user',
-      content: fallbackContent,
+      content: msg?.content || input,
     })
     currentMessageIndex = messages.length - 1
-  }
-
-  // 复合意图 + 指代的即时提醒：贴在当前用户消息「原话之后」，靠 recency 把模型的注意力
-  //   从前面那一大块 <context> 背景拉回到这一句真正的诉求上。只在进行中的对话里加（有上一条
-  //   回复时），首条消息交给系统提示里的常驻规则即可，避免每轮无谓加料。非 TICK。
-  if (priorReplyIndex >= 0 && !isTick && currentMessageIndex >= 0) {
-    messages[currentMessageIndex].content +=
-      `\n[intent check · in <think>: (1) resolve every pronoun/ellipsis here ("继续/那个/这个呢/再来一个/换一个") against your last reply and the exchange just above, before reaching for older context; (2) list EVERY distinct request this one message carries — finish all of them this turn, not just the first; (3) name the WANT under the words — the outcome that ends their need — and answer that, not the literal grammar (a question is usually "do it"; a complaint is "fix it"; terse/urgent typing means lead with the result, no preamble).]`
-  }
-
-  // Prepend this round's <context>...</context> to the current user message.
-  // The block is NOT persisted to db — conversations are written from the raw
-  // user content (see queue.pushMessage) and assistant outputs are stored
-  // verbatim, so the next round's conversationWindow stays clean.
-  if (contextBlock && currentMessageIndex >= 0) {
-    const target = messages[currentMessageIndex]
-    target.content = `${contextBlock}\n\n${target.content || ''}`
   }
 
   return messages

@@ -12,9 +12,9 @@
 //   声明式单元，让每个能力的关键词、工具、工作流、数据只剩一处。
 //
 // 关键设计：保留「分面解耦」。现有架构故意让 tools / context / prefeed 各有自己的
-//   激活条件（例：热点工具只在 TICK 注入、世界杯工具根本不自动注入、但两者的 prompt
-//   块都随关键词注入）。强行用单一 detect 会把「关键词自动加载工具」加回来——正是先前
-//   特意删掉的。所以每个能力分别声明：
+//   激活条件（例：热点、世界杯工具都不自动注入，但两者的 prompt 块随关键词注入）。
+//   强行用单一 detect 会把「关键词自动加载工具」加回来——正是先前特意删掉的。
+//   所以每个能力分别声明：
 //     - detect(ctx)   领域相关信号 → 控 context 注入 +（默认）tool 注入门
 //     - toolWhen(ctx) tool 自动注入条件（可覆盖 detect；不写则用 detect）
 //     - prefeed(ctx)  运行时数据预喂（自门控，复用现成 build 函数）
@@ -27,6 +27,7 @@
 import { isSoftwareInstallRequest, SOFTWARE_INSTALL_TRIGGERS } from '../software-install-intent.js'
 import { buildHotspotRuntimeContext } from '../hotspots.js'
 import { buildWorldcupRuntimeContext } from '../worldcup.js'
+import { buildTyphoonRuntimeContext } from '../typhoon.js'
 import { buildWeatherRuntimeContext } from '../weather.js'
 import { listApiSlotCapabilities } from './api-slots.js'
 
@@ -36,6 +37,7 @@ export const HOTSPOT_TOOLS = ['hotspot_mode']
 // 世界杯模式打开面板即可（赛况数据由 prefeed 注入上下文）；追问细节（首发名单/射手榜等）
 // 要联网，所以 WEB_TOOLS 一并带上。
 export const WORLDCUP_TOOLS = ['worldcup_mode', ...WEB_TOOLS]
+export const TYPHOON_TOOLS = ['typhoon_mode']
 export const SOFTWARE_INSTALL_TOOLS = ['install_software', 'list_processes']
 
 // ---- 触发词 / 触发正则 ----
@@ -56,10 +58,14 @@ const WORLDCUP_TRIGGERS = [
   '谁赢', '进球', '几比几', '揭幕战', '球赛', '足球赛',
   'world cup', 'worldcup', 'fifa',
 ]
+const TYPHOON_TRIGGERS = [
+  '台风', '热带气旋', '台风路径', '台风预警', '风圈', '登陆台风', 'typhoon', 'tropical cyclone',
+]
 
 const WEATHER_KEYWORD_RE = /天气|温度|气温|下雨|降雨|下雪|台风|雾霾|阴天|晴天|多云|wttr|weather/i
 const HOTSPOT_KEYWORD_RE = /热点|热搜|热门|新闻|今日|趋势|榜单|头条|热议|微博热搜|trending|headline/i
 const WORLDCUP_KEYWORD_RE = /世界杯|赛况|比分|赛程|对阵|积分榜|小组赛|淘汰赛|揭幕战|进球|几比几|world ?cup|worldcup|fifa/i
+const TYPHOON_KEYWORD_RE = /台风|热带气旋|台风路径|台风预警|风圈|登陆台风|typhoon|tropical cyclone/i
 
 // ---- 工作流块（prompt 注入用；从 prompt.js / index.js 搬来，文本逐字保留）----
 const WEATHER_CONTEXT_BLOCK = `### Weather Surface Rules
@@ -84,6 +90,11 @@ const WORLDCUP_CONTEXT_BLOCK = `### World Cup Panel
 - You have a worldcup_mode tool that opens a panel with live scores, schedule and group standings (FIFA World Cup, Beijing time). It is NOT pre-loaded each turn — if it is not in your current tool list, call find_tool("世界杯 比分 worldcup") first to load it, then call it.
 - Open it (action="show") when the user asks about World Cup matches, scores or schedule and a visual panel helps; close it (action="hide") when asked.
 - While the panel is open, current match data is injected into your context automatically; for deeper details (lineups, scorers) use web tools.`
+
+const TYPHOON_CONTEXT_BLOCK = `### Typhoon Monitoring Panel
+- You have a typhoon_mode tool that opens a visual typhoon monitoring panel. It shows current active-typhoon tracks, intensity, wind circles, and forecast tracks from the Central Meteorological Observatory. It is NOT pre-loaded each turn — if it is not in your current tool list, call find_tool("台风 路径 typhoon") first to load it.
+- Open it (action="show") when the user explicitly asks to view typhoon paths, tracking, or monitoring; close it (action="hide") when asked.
+- The panel's data is for situational awareness. Do not present it as a replacement for official local emergency instructions.`
 
 // 安装工作流：原先以 directions.unshift 注入在 index.js，现归位为能力 context，统一经
 // buildSystemPrompt 注入（同一份文本、同一道 isSoftwareInstallRequest 门）。
@@ -119,9 +130,10 @@ export const CAPABILITIES = [
     summary: '联网搜索、抓取网页正文、读取链接内容（web_search / fetch_url / browser_read）。',
     triggers: WEB_TRIGGERS,
     tools: WEB_TOOLS,
-    // 上网无独立工作流块；工具注入门 = 关键词命中 或 TICK 心跳（与旧 selectTools 一致）。
+    // 上网无独立工作流块。Tick 先由主模型判断，再经 find_tool 按需加载，
+    // 不因为心跳本身预装联网能力。
     detect: (ctx) => hits(ctx.text, WEB_TRIGGERS),
-    toolWhen: (ctx) => hits(ctx.text, WEB_TRIGGERS) || ctx.isTick,
+    toolWhen: (ctx) => hits(ctx.text, WEB_TRIGGERS),
     context: null,
     prefeed: null,
   },
@@ -143,9 +155,8 @@ export const CAPABILITIES = [
     triggers: HOTSPOT_TRIGGERS,
     tools: HOTSPOT_TOOLS,
     detect: (ctx) => HOTSPOT_KEYWORD_RE.test(ctx.rawText || ''),
-    // 工具只在 TICK 广注入（awakening exploration 用）；关键词只递规则块，开不开由 Agent
-    // 经 find_tool 自决——与既定设计一致，不因关键词自动加载工具。
-    toolWhen: (ctx) => !!ctx.isTick,
+    // 面板工具不自动注入；无论用户轮还是 Tick，Agent 判断需要后经 find_tool 装载。
+    toolWhen: () => false,
     context: HOTSPOT_CONTEXT_BLOCK,
     prefeed: (ctx) => buildHotspotRuntimeContext(ctx.rawText || ''),
   },
@@ -160,6 +171,17 @@ export const CAPABILITIES = [
     toolWhen: () => false,
     context: WORLDCUP_CONTEXT_BLOCK,
     prefeed: (ctx) => buildWorldcupRuntimeContext(ctx.rawText || ''),
+  },
+  {
+    id: 'typhoon',
+    label: '台风监测面板',
+    summary: '打开台风实时路径、强度、风圈与预报路径面板（typhoon_mode）；数据来自中央气象台台风网。',
+    triggers: TYPHOON_TRIGGERS,
+    tools: TYPHOON_TOOLS,
+    detect: (ctx) => TYPHOON_KEYWORD_RE.test(ctx.rawText || ''),
+    toolWhen: () => false,
+    context: TYPHOON_CONTEXT_BLOCK,
+    prefeed: (ctx) => buildTyphoonRuntimeContext(ctx.rawText || ''),
   },
   {
     id: 'software-install',

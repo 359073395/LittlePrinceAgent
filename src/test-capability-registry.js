@@ -28,8 +28,8 @@ function ctx(rawText, isTick = false) {
 {
   const caps = listCapabilities()
   const ids = caps.map(c => c.id)
-  assert(['web', 'weather', 'hotspot', 'worldcup', 'software-install'].every(id => ids.includes(id)),
-    `1) listCapabilities 含五个 v1 能力 (got: ${ids.join(',')})`)
+  assert(['web', 'weather', 'hotspot', 'worldcup', 'typhoon', 'software-install'].every(id => ids.includes(id)),
+    `1) listCapabilities 含台风在内的 v1 能力 (got: ${ids.join(',')})`)
   assert(caps.every(c => c.label && c.summary), '1) 每个能力都有 label + summary（自感知用）')
 }
 
@@ -40,11 +40,9 @@ function ctx(rawText, isTick = false) {
   assert(has(t, 'web_search') && has(t, 'fetch_url'), `2a) web 关键词 → web 工具 (got: ${t.join(',')})`)
 }
 {
-  // web：TICK 也注入（与旧 selectTools `|| isTick` 一致）
+  // Tick 不因心跳身份自动预装业务能力；需要时由 find_tool 发现。
   const t = capabilityToolsFor(ctx('', true))
-  assert(has(t, 'web_search'), '2b) TICK → web 工具')
-  // hotspot 工具只在 TICK 注入
-  assert(has(t, 'hotspot_mode'), '2b) TICK → hotspot_mode')
+  assert(none(t, ['web_search', 'hotspot_mode']), '2b) TICK → 不自动注入 web/hotspot 工具')
 }
 {
   // hotspot 关键词但非 TICK → 不注入 hotspot 工具（只递规则块，工具靠 find_tool）
@@ -55,6 +53,11 @@ function ctx(rawText, isTick = false) {
   // worldcup 永不自动注入工具
   const t = capabilityToolsFor(ctx('世界杯比分怎么样'))
   assert(none(t, ['worldcup_mode']), `2d) 世界杯关键词不自动注入 worldcup_mode (got: ${t.join(',')})`)
+}
+{
+  // typhoon 和世界杯相同：规则块按关键词注入，控制工具由 Agent 经 find_tool 自决加载。
+  const t = capabilityToolsFor(ctx('台风路径怎么样'))
+  assert(none(t, ['typhoon_mode']), `2d2) 台风关键词不自动注入 typhoon_mode (got: ${t.join(',')})`)
 }
 {
   // software-install → install_software
@@ -75,6 +78,8 @@ function ctx(rawText, isTick = false) {
     '3b) 热点 → Hotspot Panel 块')
   assert(capabilityContextBlocks(ctx('世界杯赛况')).some(b => b.includes('World Cup Panel')),
     '3c) 世界杯 → World Cup Panel 块')
+  assert(capabilityContextBlocks(ctx('台风路径')).some(b => b.includes('Typhoon Monitoring Panel')),
+    '3c2) 台风 → Typhoon Monitoring Panel 块')
   assert(capabilityContextBlocks(ctx('安装微信')).some(b => b.includes('Software Install Workflow')),
     '3d) 安装 → Software Install Workflow 块')
   assert(capabilityContextBlocks(ctx('随便聊两句')).length === 0,
@@ -93,6 +98,7 @@ function ctx(rawText, isTick = false) {
 {
   assert(findCapabilitiesByQuery('看热点').some(c => c.id === 'hotspot'), '4b) "看热点" → 发现 hotspot')
   assert(findCapabilitiesByQuery('天气').some(c => c.id === 'weather'), '4c) "天气" → 发现 weather')
+  assert(findCapabilitiesByQuery('台风路径').some(c => c.id === 'typhoon'), '4c2) "台风路径" → 发现 typhoon')
   assert(findCapabilitiesByQuery('上网搜索').some(c => c.id === 'web'), '4d) "上网搜索" → 发现 web')
   assert(findCapabilitiesByQuery('').length === 0, '4e) 空 query → 无发现')
 }

@@ -7,6 +7,7 @@ import { ThoughtStream } from "./thought-stream.js";
 import { initVoicePanel } from "./voice-panel.js";
 import { initHotspot, toggleHotspot, setHotspotMode, moveVoicePanelToBody, restoreVoicePanel } from "./hotspot.js";
 import { initWorldcup, toggleWorldcup, setWorldcupMode } from "./worldcup.js";
+import { initTyphoon, toggleTyphoon, setTyphoonMode } from "./typhoon.js";
 import { enrichVisiblePersonCardFromText, initPersonCard, setPersonCardMode, showPersonCardByName } from "./person-card.js";
 import { initDocPanel, setDocPanelMode } from "./doc.js";
 import { initWechatPopup, showWechatPopup } from "./wechat-popup.js";
@@ -1491,6 +1492,9 @@ function handle({ type, data = {} }) {
     case "worldcup_mode":
       setWorldcupMode(!!data.active || data.action === "show" || data.action === "open", { source: "agent_event" });
       break;
+    case "typhoon_mode":
+      setTyphoonMode(!!data.active || data.action === "show" || data.action === "open", { source: "agent_event" });
+      break;
     case "doc_panel_mode":
       setDocPanelMode(!!data.active || data.action === "open", { topicId: data.topic || null, source: "agent_event" });
       break;
@@ -1521,78 +1525,8 @@ function handle({ type, data = {} }) {
       chat.deleteLastUserMsg();
       if (data.service === 'tts' && data.ttsText) playTTSReply(data.ttsText);
       break;
-    case "startup_self_check_started":
-      playJarvisStartupSound();
-      setTimeout(() => playTTSReply("系统启动中，正在运行自检"), 1500);
-      break;
     default:
       break;
-  }
-}
-
-// ── Jarvis-style startup self-check sound ────────────────────────────────────
-function playJarvisStartupSound() {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    if (ctx.state === "suspended") ctx.resume();
-    const t = ctx.currentTime;
-
-    // Layer 1: low-frequency mechanical hum (sawtooth, simulates power-on)
-    const drone = ctx.createOscillator();
-    const droneGain = ctx.createGain();
-    const droneFilter = ctx.createBiquadFilter();
-    drone.type = "sawtooth";
-    drone.frequency.setValueAtTime(50, t);
-    drone.frequency.linearRampToValueAtTime(90, t + 0.5);
-    droneFilter.type = "lowpass";
-    droneFilter.frequency.value = 350;
-    droneFilter.Q.value = 3;
-    droneGain.gain.setValueAtTime(0, t);
-    droneGain.gain.linearRampToValueAtTime(0.09, t + 0.06);
-    droneGain.gain.linearRampToValueAtTime(0.06, t + 0.4);
-    droneGain.gain.linearRampToValueAtTime(0, t + 0.65);
-    drone.connect(droneFilter);
-    droneFilter.connect(droneGain);
-    droneGain.connect(ctx.destination);
-    drone.start(t);
-    drone.stop(t + 0.7);
-
-    // Layer 2: system-online frequency sweep (sine, low to high)
-    const sweep = ctx.createOscillator();
-    const sweepGain = ctx.createGain();
-    sweep.type = "sine";
-    sweep.frequency.setValueAtTime(280, t + 0.12);
-    sweep.frequency.exponentialRampToValueAtTime(2800, t + 1.0);
-    sweepGain.gain.setValueAtTime(0, t + 0.12);
-    sweepGain.gain.linearRampToValueAtTime(0.13, t + 0.22);
-    sweepGain.gain.exponentialRampToValueAtTime(0.001, t + 1.05);
-    sweep.connect(sweepGain);
-    sweepGain.connect(ctx.destination);
-    sweep.start(t + 0.12);
-    sweep.stop(t + 1.1);
-
-    // Layer 3: three confirmation beeps (square wave, self-check passed)
-    [[880, 1.15], [1100, 1.28], [1320, 1.41]].forEach(([freq, bt]) => {
-      const beep = ctx.createOscillator();
-      const beepGain = ctx.createGain();
-      const beepFilter = ctx.createBiquadFilter();
-      beep.type = "square";
-      beep.frequency.value = freq;
-      beepFilter.type = "bandpass";
-      beepFilter.frequency.value = freq;
-      beepFilter.Q.value = 8;
-      beepGain.gain.setValueAtTime(0.14, t + bt);
-      beepGain.gain.exponentialRampToValueAtTime(0.001, t + bt + 0.075);
-      beep.connect(beepFilter);
-      beepFilter.connect(beepGain);
-      beepGain.connect(ctx.destination);
-      beep.start(t + bt);
-      beep.stop(t + bt + 0.09);
-    });
-
-    setTimeout(() => ctx.close().catch(() => {}), 2500);
-  } catch (_) {
-    // silently ignore if browser does not support AudioContext
   }
 }
 
@@ -2146,6 +2080,10 @@ chat = initChat({
       toggleWorldcup();
       return;
     }
+    if (document.body.classList.contains('typhoon-mode') && /关闭|退出|关掉|隐藏/.test(text)) {
+      toggleTyphoon();
+      return;
+    }
     if (document.body.classList.contains('person-card-mode') && /关闭|退出|关掉|隐藏/.test(text)) {
       setPersonCardMode(false, { source: 'chat_input' });
       return;
@@ -2155,6 +2093,9 @@ chat = initChat({
     }
     if (/世界杯/.test(text) && !document.body.classList.contains('worldcup-mode')) {
       toggleWorldcup();
+    }
+    if (/台风|热带气旋/.test(text) && !document.body.classList.contains('typhoon-mode')) {
+      toggleTyphoon();
     }
     const personQuery = extractPersonCardQuery(text);
     if (personQuery) {
@@ -2189,7 +2130,20 @@ function initTTSSettings() {
   const testBtn     = document.getElementById("tts-test-btn");
   const testStatus  = document.getElementById("tts-test-status");
   const fxToggle    = document.getElementById("tts-fx-toggle");
+  const doubaoKeyInput = document.getElementById("tts-doubao-key");
+  const doubaoKeyToggle = document.getElementById("tts-doubao-key-toggle");
   if (!providerSel) return;
+
+  let doubaoKeyVisible = false;
+  function setDoubaoKeyVisible(visible) {
+    doubaoKeyVisible = Boolean(visible);
+    if (doubaoKeyInput) doubaoKeyInput.type = doubaoKeyVisible ? "text" : "password";
+    if (doubaoKeyToggle) {
+      doubaoKeyToggle.setAttribute("aria-label", doubaoKeyVisible ? "隐藏 API Key" : "显示 API Key");
+      doubaoKeyToggle.title = doubaoKeyVisible ? "隐藏 API Key" : "显示 API Key";
+    }
+  }
+  doubaoKeyToggle?.addEventListener("click", () => setDoubaoKeyVisible(!doubaoKeyVisible));
 
   // 流式合成开关（默认开）：纯播放行为，存在 localStorage
   const streamingToggle = document.getElementById("tts-streaming-toggle");
@@ -2329,12 +2283,9 @@ function initTTSSettings() {
     activeTTSVoiceId = voiceSel?.value || tts?.ttsVoiceId || null;
     const appidEl = document.getElementById("tts-volcano-appid");
     if (appidEl && tts?.volcanoAppId?.value) appidEl.value = tts.volcanoAppId.value;
-    const doubaoAppIdEl = document.getElementById("tts-doubao-appid");
-    if (doubaoAppIdEl && tts?.doubaoAppId?.value) doubaoAppIdEl.value = tts.doubaoAppId.value;
+    if (doubaoKeyInput) doubaoKeyInput.value = typeof tts?.doubaoKey?.value === "string" ? tts.doubaoKey.value : "";
     const doubaoResourceEl = document.getElementById("tts-doubao-resource");
     if (doubaoResourceEl && tts?.doubaoResourceId) doubaoResourceEl.value = tts.doubaoResourceId;
-    const doubaoStyleEl = document.getElementById("tts-doubao-style");
-    if (doubaoStyleEl && tts?.doubaoStyle) doubaoStyleEl.value = tts.doubaoStyle;
     const rateEl = document.getElementById("tts-doubao-rate");
     if (rateEl) {
       const r = Number(tts?.doubaoSpeechRate || 0) || 0;
@@ -2361,14 +2312,8 @@ function initTTSSettings() {
       if (doubaoKey) ttsBody.doubaoKey = doubaoKey;
       const doubaoResource = document.getElementById("tts-doubao-resource")?.value?.trim();
       if (doubaoResource) ttsBody.doubaoResourceId = doubaoResource;
-      const doubaoStyleEl2 = document.getElementById("tts-doubao-style");
-      if (doubaoStyleEl2) ttsBody.doubaoStyle = doubaoStyleEl2.value.trim(); // 空＝清除（回中性）
       const rateEl2 = document.getElementById("tts-doubao-rate");
       if (rateEl2) ttsBody.doubaoSpeechRate = rateEl2.value;
-      const doubaoAppId = document.getElementById("tts-doubao-appid")?.value?.trim();
-      if (doubaoAppId) ttsBody.doubaoAppId = doubaoAppId;
-      const doubaoAccessKey = document.getElementById("tts-doubao-access-key")?.value?.trim();
-      if (doubaoAccessKey) ttsBody.doubaoAccessKey = doubaoAccessKey;
       const openaiKey = document.getElementById("tts-openai-key")?.value?.trim();
       if (openaiKey) ttsBody.openaiTtsKey = openaiKey;
       const baseURL = document.getElementById("tts-openai-baseurl")?.value?.trim();
@@ -2385,7 +2330,7 @@ function initTTSSettings() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(ttsBody),
       }).then(() => {
-        ["tts-minimax-key", "tts-doubao-key", "tts-doubao-access-key", "tts-openai-key", "tts-elevenlabs-key", "tts-volcano-token"].forEach(id => {
+        ["tts-minimax-key", "tts-openai-key", "tts-elevenlabs-key", "tts-volcano-token"].forEach(id => {
           const el = document.getElementById(id);
           if (el) el.value = "";
         });
@@ -2407,14 +2352,8 @@ function initTTSSettings() {
         if (doubaoKey) preBody.doubaoKey = doubaoKey;
         const doubaoResource = document.getElementById("tts-doubao-resource")?.value?.trim();
         if (doubaoResource) preBody.doubaoResourceId = doubaoResource;
-        const doubaoStyleEl3 = document.getElementById("tts-doubao-style");
-        if (doubaoStyleEl3) preBody.doubaoStyle = doubaoStyleEl3.value.trim();
         const rateEl3 = document.getElementById("tts-doubao-rate");
         if (rateEl3) preBody.doubaoSpeechRate = rateEl3.value;
-        const doubaoAppId = document.getElementById("tts-doubao-appid")?.value?.trim();
-        if (doubaoAppId) preBody.doubaoAppId = doubaoAppId;
-        const doubaoAccessKey = document.getElementById("tts-doubao-access-key")?.value?.trim();
-        if (doubaoAccessKey) preBody.doubaoAccessKey = doubaoAccessKey;
         const openaiKey = document.getElementById("tts-openai-key")?.value?.trim();
         if (openaiKey) preBody.openaiTtsKey = openaiKey;
         const elevenKey = document.getElementById("tts-elevenlabs-key")?.value?.trim();
@@ -2499,12 +2438,22 @@ function initTTSSettings() {
   const voiceOutputSelect    = document.getElementById("voice-output-select");
   const voiceRefreshOutputsBtn = document.getElementById("voice-refresh-outputs");
   const voiceOutputStatus    = document.getElementById("voice-output-status");
+  const volcAsrKeyInput      = document.getElementById("voice-volc-apikey");
+  const volcAsrKeyToggle     = document.getElementById("voice-volc-apikey-toggle");
+  const mapKeyInput          = document.getElementById("settings-amap-key");
+  const mapSecurityInput     = document.getElementById("settings-amap-security");
+  const saveMapBtn           = document.getElementById("settings-save-map");
+  const clearMapBtn          = document.getElementById("settings-clear-map");
+  const mapFeedback          = document.getElementById("settings-map-feedback");
 
   if (!settingsBtn || !overlay) return;
 
   let cachedProviders = null;
   let cachedLlm = null;
   let llmKeyVisible = false;
+  let volcAsrKeyVisible = false;
+  let volcAsrSaveTimer = null;
+  let volcAsrSaveRequest = 0;
   const agentNameRe = /^[一-龥A-Za-z0-9 _-]+$/;
   const CUSTOM_MODEL_VALUE = "__custom_model__";
 
@@ -2518,6 +2467,7 @@ function initTTSSettings() {
       if (tab === "social") loadSocialSettings();
       if (tab === "security") loadSecuritySettings();
       if (tab === "web-search") loadWebSearchSettings();
+      if (tab === "advanced") loadMapSettings();
       if (tab === "update") loadUpdateSettings();
     });
   });
@@ -2976,7 +2926,6 @@ function initTTSSettings() {
         provider: "volcengine",
         label: "火山豆包 ASR",
         fieldId: "voice-volc-apikey",
-        defaults: { "voice-volc-resourceid": "volc.bigasr.sauc.duration" },
       };
     }
     return null;
@@ -3145,6 +3094,120 @@ function initTTSSettings() {
     });
   }
 
+  async function loadMapSettings() {
+    const status = document.getElementById("settings-map-status");
+    const dot = document.getElementById("settings-map-status-dot");
+    try {
+      const data = await fetch(`${API}/settings/map`).then(r => r.json());
+      const map = data?.map || {};
+      if (status) {
+        status.textContent = map.configured
+          ? "高德地图 · 已配置"
+          : `高德地图 · Key ${map.keyConfigured ? "已配置" : "未配置"} / 安全密钥 ${map.securityConfigured ? "已配置" : "未配置"}`;
+      }
+      if (dot) {
+        dot.textContent = "●";
+        dot.className = `settings-config-dot ${map.configured ? "active" : "inactive"}`;
+      }
+    } catch {
+      if (status) status.textContent = "读取配置失败";
+      if (dot) dot.className = "settings-config-dot inactive";
+    }
+  }
+
+  if (saveMapBtn) {
+    saveMapBtn.addEventListener("click", async () => {
+      const jsKey = mapKeyInput?.value?.trim() || "";
+      const securityCode = mapSecurityInput?.value?.trim() || "";
+      if (!jsKey && !securityCode) {
+        showFeedback(mapFeedback, "请输入 Key 或安全密钥", true);
+        return;
+      }
+      saveMapBtn.disabled = true;
+      try {
+        const response = await fetch(`${API}/settings/map`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsKey, securityCode }),
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "保存失败");
+        if (mapKeyInput) mapKeyInput.value = "";
+        if (mapSecurityInput) mapSecurityInput.value = "";
+        showFeedback(mapFeedback, data.map?.configured ? "地图服务已启用" : "已保存，请补全配置");
+        loadMapSettings();
+      } catch (err) {
+        showFeedback(mapFeedback, err.message || "保存失败", true);
+      } finally {
+        saveMapBtn.disabled = false;
+      }
+    });
+  }
+
+  if (clearMapBtn) {
+    clearMapBtn.addEventListener("click", async () => {
+      clearMapBtn.disabled = true;
+      try {
+        const response = await fetch(`${API}/settings/map`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clear: true }),
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "清除失败");
+        if (mapKeyInput) mapKeyInput.value = "";
+        if (mapSecurityInput) mapSecurityInput.value = "";
+        showFeedback(mapFeedback, "地图配置已清除");
+        loadMapSettings();
+      } catch (err) {
+        showFeedback(mapFeedback, err.message || "清除失败", true);
+      } finally {
+        clearMapBtn.disabled = false;
+      }
+    });
+  }
+
+  function setVolcAsrKeyVisible(visible) {
+    volcAsrKeyVisible = Boolean(visible);
+    if (volcAsrKeyInput) volcAsrKeyInput.type = volcAsrKeyVisible ? "text" : "password";
+    if (volcAsrKeyToggle) {
+      volcAsrKeyToggle.setAttribute("aria-label", volcAsrKeyVisible ? "隐藏 API Key" : "显示 API Key");
+      volcAsrKeyToggle.title = volcAsrKeyVisible ? "隐藏 API Key" : "显示 API Key";
+    }
+  }
+
+  async function saveVolcAsrKeyAutomatically() {
+    if (!volcAsrKeyInput) return;
+    const apiKey = volcAsrKeyInput.value.trim();
+    const request = ++volcAsrSaveRequest;
+    try {
+      const resp = await fetch("http://127.0.0.1:3721/settings/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voiceProvider: "volcengine", volcAsrApiKey: apiKey }),
+      });
+      if (!resp.ok) throw new Error("保存失败");
+      if (request !== volcAsrSaveRequest) return;
+      volcAsrKeyInput.value = apiKey;
+      localStorage.setItem(VOICE_PROVIDER_KEY, "volcengine");
+      showFeedback(voiceFeedback, apiKey ? "已自动保存" : "已清除");
+    } catch {
+      if (request === volcAsrSaveRequest) showFeedback(voiceFeedback, "自动保存失败", true);
+    }
+  }
+
+  volcAsrKeyToggle?.addEventListener("click", () => {
+    setVolcAsrKeyVisible(!volcAsrKeyVisible);
+  });
+
+  volcAsrKeyInput?.addEventListener("input", () => {
+    if (volcAsrSaveTimer) clearTimeout(volcAsrSaveTimer);
+    volcAsrSaveTimer = setTimeout(() => {
+      volcAsrSaveTimer = null;
+      saveVolcAsrKeyAutomatically();
+    }, 500);
+  });
+
   voiceRefreshMicsBtn?.addEventListener("click", () => {
     loadMicrophoneDevices({ requestPermission: true });
   });
@@ -3178,6 +3241,8 @@ function initTTSSettings() {
         savedProvider = data.voice.voiceProvider;
         localStorage.setItem(VOICE_PROVIDER_KEY, savedProvider);
       }
+      const savedVolcAsrKey = data?.voice?.volcAsrApiKey?.value;
+      if (volcAsrKeyInput) volcAsrKeyInput.value = typeof savedVolcAsrKey === "string" ? savedVolcAsrKey : "";
     } catch {}
     if (voiceProviderSelect) voiceProviderSelect.value = savedProvider;
     applyVoiceProviderUI(savedProvider);
@@ -3226,12 +3291,6 @@ function initTTSSettings() {
       if (xunfeiApikey) body.xunfeiApiKey = xunfeiApikey;
       const volcApiKey = document.getElementById("voice-volc-apikey")?.value?.trim();
       if (volcApiKey) body.volcAsrApiKey = volcApiKey;
-      const volcResourceId = document.getElementById("voice-volc-resourceid")?.value?.trim();
-      if (volcResourceId) body.volcAsrResourceId = volcResourceId;
-      const volcAppKey = document.getElementById("voice-volc-appkey")?.value?.trim();
-      if (volcAppKey) body.volcAsrAppKey = volcAppKey;
-      const volcAccessKey = document.getElementById("voice-volc-accesskey")?.value?.trim();
-      if (volcAccessKey) body.volcAsrAccessKey = volcAccessKey;
 
       if (Object.keys(body).length > 0) {
         try {
@@ -3248,9 +3307,6 @@ function initTTSSettings() {
             "voice-tencent-sid",
             "voice-tencent-skey",
             "voice-xunfei-apikey",
-            "voice-volc-apikey",
-            "voice-volc-appkey",
-            "voice-volc-accesskey",
           ].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.value = "";
@@ -3738,6 +3794,7 @@ initHotspot().catch((err) => console.warn('[Hotspot] init failed:', err));
 
 // ── Worldcup mode ──
 initWorldcup().catch((err) => console.warn('[Worldcup] init failed:', err));
+initTyphoon();
 
 // ── Media modes (video / image) ──
 (function initMediaModes() {

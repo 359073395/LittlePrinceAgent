@@ -124,7 +124,7 @@ Function BailongmaValidateInstallDir
   ${GetRoot} "$INSTDIR" $R4
   ${DriveSpace} "$R4\" "/D=F /S=M" $R5
   ${if} $R5 < 600
-    MessageBox MB_ICONSTOP|MB_OK "目标磁盘可用空间不足，无法安全安装白龙马。$\r$\n$\r$\n所在磁盘：$R4$\r$\n当前可用：$R5 MB$\r$\n至少需要：600 MB$\r$\n$\r$\n请清理磁盘空间，或将白龙马安装到其他磁盘后重试。"
+    MessageBox MB_ICONSTOP|MB_OK "目标磁盘可用空间不足，无法安全安装小王子 Agent。$\r$\n$\r$\n所在磁盘：$R4$\r$\n当前可用：$R5 MB$\r$\n至少需要：600 MB$\r$\n$\r$\n请清理磁盘空间，或将小王子 Agent 安装到其他磁盘后重试。"
     Abort
   ${endIf}
 FunctionEnd
@@ -267,9 +267,10 @@ FunctionEnd
     Call BailongmaRescueForeignInstallRootItems
   ${endIf}
 
-  ; Native Node addons are ABI-bound to Electron. Clean old unpacked copies
-  ; before installing so upgrades cannot keep a stale better_sqlite3.node.
-  RMDir /r "$INSTDIR\resources\app.asar.unpacked\node_modules\better-sqlite3"
+  ; Do not delete native module directories in customInit. This hook runs before
+  ; the new payload has been fully extracted and validated; deleting here can
+  ; leave an otherwise working install broken if setup is cancelled or killed.
+  ; The repaired payload extraction in customInstall overwrites owned files.
 !macroend
 
 !endif
@@ -402,7 +403,7 @@ FunctionEnd
   ; 那种情况绝不能删数据，否则更新一次记忆全没——所以只在“真卸载”时弹窗。
   ; /SD IDNO 让静默卸载默认走“保留”，不打扰、不误删。
   ${ifNot} ${isUpdated}
-    MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除白龙马的全部用户数据？$\r$\n$\r$\n包括：对话与记忆数据库、配置（含 API Key）、沙盒文件、下载的音乐等。$\r$\n$\r$\n选择「是」将彻底清除且无法恢复；选择「否」保留数据，方便以后重装时继续使用。" /SD IDNO IDNO keepUserData
+    MessageBox MB_YESNO|MB_ICONQUESTION "是否同时删除小王子 Agent 的全部用户数据？$\r$\n$\r$\n包括：对话与记忆数据库、配置（含 API Key）、沙盒文件、下载的音乐等。$\r$\n$\r$\n选择「是」将彻底清除且无法恢复；选择「否」保留数据，方便以后重装时继续使用。" /SD IDNO IDNO keepUserData
       ; userData 目录 = %APPDATA%\<productName>，即 $APPDATA\小王子 Agent
       RMDir /r "$APPDATA\小王子 Agent"
     keepUserData:
